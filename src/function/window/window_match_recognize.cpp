@@ -3,6 +3,7 @@
 #include "duckdb/function/match_recognize.hpp"
 #include "duckdb/function/window/match_recognize_functions.hpp"
 #include "duckdb/function/window/window_shared_expressions.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 
@@ -26,12 +27,16 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 	Vector result_vec;
 };
 
+//	Column indexes into the result struct
+enum MatchRecognizeResult : idx_t { CLASSIFIER = 0, MATCH_NUMBER, IN_MATCH, IS_MATCH_START, MATCH_START, MATCH_END };
+
 LogicalType WindowMatchRecognizeExecutor::ResultType() {
-	return LogicalType::STRUCT({{"classifiers", LogicalType::LIST(LogicalType::VARCHAR)},
-	                            {"complete", LogicalType::BOOLEAN},
+	return LogicalType::STRUCT({{"classifier", LogicalType::VARCHAR},
+	                            {"match_number", LogicalType::UBIGINT},
+	                            {"in_match", LogicalType::BOOLEAN},
+	                            {"is_match_start", LogicalType::BOOLEAN},
 	                            {"match_start", LogicalType::UBIGINT},
-	                            {"match_end", LogicalType::UBIGINT},
-	                            {"skip_to", LogicalType::UBIGINT}});
+	                            {"match_end", LogicalType::UBIGINT}});
 }
 
 //===--------------------------------------------------------------------===//
@@ -39,14 +44,20 @@ LogicalType WindowMatchRecognizeExecutor::ResultType() {
 //===--------------------------------------------------------------------===//
 unique_ptr<FunctionData> WindowMatchRecognizeExecutor::Bind(BindWindowFunctionInput &input) {
 	auto &arguments = input.GetArguments();
-	if (arguments.size() != 2) {
-		throw BinderException("MATCH_RECOGNIZE takes a DEFINE struct and a pattern");
+	if (arguments.size() != 4) {
+		throw BinderException("MATCH_RECOGNIZE takes a DEFINE struct, an AFTER MATCH SKIP option and a pattern");
 	}
 
-	// the pattern is passed as the trailing argument - move it into the bind data so that it is not
-	// evaluated as a regular argument. The binder shrinks the argument list to match.
+	// only the DEFINE struct is evaluated per row - the rest is configuration that moves into the bind
+	// data, and the binder shrinks the argument list to match.
 	auto bind_data = make_uniq<MatchRecognizeFunctionData>();
-	bind_data->pattern = std::move(arguments.back());
+	bind_data->after_match = static_cast<MatchRecognizeAfterMatch>(
+	    arguments[1]->Cast<BoundConstantExpression>().GetValue().GetValue<uint8_t>());
+	auto &skip_variable = arguments[2]->Cast<BoundConstantExpression>().GetValue();
+	if (!skip_variable.IsNull()) {
+		bind_data->after_match_variable = skip_variable.GetValue<string>();
+	}
+	bind_data->pattern = std::move(arguments[3]);
 
 	auto &bound_function = input.GetBoundFunction();
 	bound_function.GetArguments().resize(1);
@@ -133,8 +144,11 @@ struct Match {
 
 // simplistic backtracking-based pattern executor
 // FIXME pretty naive this, and an allocation-fest.
+// Successful symbol matches record the matching variable at their row offset. Failed branches may leave
+// stale entries behind, but every offset a successful match covers is written by that match, so reading
+// the range of a successful match is well defined.
 static vector<Match> MatchPattern(const Expression &pattern, const DataChunk &input, const idx_t offset,
-                                  unordered_map<string, uint8_t *> &define_child_mapping) {
+                                  unordered_map<string, uint8_t *> &define_child_mapping, vector<string> &classifiers) {
 	if (offset >= input.size()) {
 		return {Match(false)};
 	}
@@ -148,7 +162,7 @@ static vector<Match> MatchPattern(const Expression &pattern, const DataChunk &in
 
 		while (token_idx < concatenation_expr.children.size()) {
 			auto &child_pattern = *concatenation_expr.children[token_idx];
-			auto res = MatchPattern(child_pattern, input, child_start_idx, define_child_mapping);
+			auto res = MatchPattern(child_pattern, input, child_start_idx, define_child_mapping, classifiers);
 			if (res.back().success) {
 				matches.insert(matches.end(), res.begin(), res.end());
 				child_start_idx = res.back().end_idx.GetIndex();
@@ -178,11 +192,11 @@ static vector<Match> MatchPattern(const Expression &pattern, const DataChunk &in
 	case ExpressionType::ALTERNATION: {
 		// ordered choice: the left alternative wins if it matches
 		auto &alternation_expr = pattern.Cast<BoundAlternationExpression>();
-		auto left = MatchPattern(*alternation_expr.child_left, input, offset, define_child_mapping);
+		auto left = MatchPattern(*alternation_expr.child_left, input, offset, define_child_mapping, classifiers);
 		if (left.back().success) {
 			return left;
 		}
-		return MatchPattern(*alternation_expr.child_right, input, offset, define_child_mapping);
+		return MatchPattern(*alternation_expr.child_right, input, offset, define_child_mapping, classifiers);
 	}
 	case ExpressionType::QUANTIFIER: {
 		auto &quantifier_expr = pattern.Cast<BoundQuantifierExpression>();
@@ -193,14 +207,15 @@ static vector<Match> MatchPattern(const Expression &pattern, const DataChunk &in
 		                      : input.size();
 		vector<Match> matches;
 		while (match_count < max_offset) {
-			auto res = MatchPattern(*quantifier_expr.child, input, child_start_idx, define_child_mapping);
+			auto res = MatchPattern(*quantifier_expr.child, input, child_start_idx, define_child_mapping, classifiers);
 			if (!res.back().success) {
 				break;
 			}
 			child_start_idx = res.back().end_idx.GetIndex();
 			match_count++;
+			// a repetition may only be given up if doing so still satisfies the minimum
 			auto is_optional =
-			    quantifier_expr.min_count.IsValid() ? match_count >= quantifier_expr.min_count.GetIndex() : true;
+			    quantifier_expr.min_count.IsValid() ? match_count > quantifier_expr.min_count.GetIndex() : true;
 			matches.emplace_back(Match(true, child_start_idx, is_optional));
 		}
 		if (!matches.empty() &&
@@ -213,11 +228,49 @@ static vector<Match> MatchPattern(const Expression &pattern, const DataChunk &in
 		// TODO cache those pointers in the map instead of the vector
 		auto symbol = pattern.GetAlias().GetIdentifierName();
 		D_ASSERT(define_child_mapping.find(symbol) != define_child_mapping.end());
-		return {Match(define_child_mapping[symbol][offset], offset + 1)};
+		if (!define_child_mapping[symbol][offset]) {
+			return {Match(false)};
+		}
+		classifiers[offset] = symbol;
+		return {Match(true, offset + 1)};
 	}
 	default:
 		throw InternalException("Unsupported pattern type");
 	}
+}
+
+//! Where to resume scanning after a match spanning [match_start, match_end]
+static idx_t SkipTo(const MatchRecognizeFunctionData &config, idx_t match_start, idx_t match_end,
+                    const vector<string> &classifiers) {
+	auto resume = match_end + 1;
+	switch (config.after_match) {
+	case MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_NEXT_ROW:
+		resume = match_start + 1;
+		break;
+	case MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_FIRST_VAR:
+	case MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_LAST_VAR: {
+		const auto first = config.after_match == MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_FIRST_VAR;
+		optional_idx target;
+		for (idx_t row = match_start; row <= match_end; row++) {
+			if (classifiers[row] != config.after_match_variable) {
+				continue;
+			}
+			target = row;
+			if (first) {
+				break;
+			}
+		}
+		if (target.IsValid()) {
+			resume = target.GetIndex();
+		}
+		break;
+	}
+	case MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_LAST_ROW:
+	case MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_DEFAULT:
+		break;
+	}
+	// never resume at or before the row the match started on, that would not terminate
+	return MaxValue(resume, match_start + 1);
 }
 
 // this gets called per partition
@@ -238,6 +291,9 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 	// we keep a map with symbol names to pointers
 	// TODO we could also put them into the boundref expression? maybe they're already there??
 	// figure out which define has which child offset
+
+	// the pattern variable that classified each row, indexed by row offset within the hash group
+	vector<string> classifiers(gstate.payload_count);
 
 	unordered_map<string, uint8_t *> define_child_mapping;
 	// the DEFINE struct is wherever expression sharing put it, which is not necessarily column 0
@@ -263,19 +319,32 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		// FIXME
 		FetchPartition(context.client, *collection->inputs, partition_chunk, partition_start, partition_end);
 
-		for (idx_t partition_idx = partition_start; partition_idx <= partition_end; partition_idx++) {
-			auto match = MatchPattern(*config.pattern, partition_chunk, partition_idx, define_child_mapping).back();
+		// scan the partition left to right, applying AFTER MATCH SKIP after every match. Rows that are
+		// not part of any match keep a NULL struct, which filters them out downstream.
+		auto &struct_entries = StructVector::GetEntries(gstate.result_vec);
+		idx_t match_number = 0;
+		auto row = partition_start;
+		while (row <= partition_end) {
+			auto match = MatchPattern(*config.pattern, partition_chunk, row, define_child_mapping, classifiers).back();
+			// a zero length match would never advance the scan
+			if (!match.success || !match.end_idx.IsValid() || match.end_idx.GetIndex() <= row) {
+				row++;
+				continue;
+			}
+			// a match can never reach beyond its own partition
+			const auto match_end = MinValue(match.end_idx.GetIndex() - 1, partition_end);
+			match_number++;
 
-			FlatVector::ValidityMutable(gstate.result_vec).SetValid(partition_idx);
-			auto &struct_entries = StructVector::GetEntries(gstate.result_vec);
-			// a failed match has no end index - the row is filtered out on the "complete" flag
-			const idx_t match_end =
-			    match.end_idx.IsValid() && match.end_idx.GetIndex() > 0 ? match.end_idx.GetIndex() - 1 : 0;
-			// first entry is list of classifiers, TODO
-			struct_entries[1].SetValue(partition_idx, Value::BOOLEAN(match.success));
-			struct_entries[2].SetValue(partition_idx, Value::UBIGINT(partition_idx));
-			struct_entries[3].SetValue(partition_idx, Value::UBIGINT(match_end));
-			struct_entries[4].SetValue(partition_idx, Value::UBIGINT(match_end));
+			for (idx_t match_row = row; match_row <= match_end; match_row++) {
+				FlatVector::ValidityMutable(gstate.result_vec).SetValid(match_row);
+				struct_entries[CLASSIFIER].SetValue(match_row, Value(MatchRecognizeSymbolName(classifiers[match_row])));
+				struct_entries[MATCH_NUMBER].SetValue(match_row, Value::UBIGINT(match_number));
+				struct_entries[IN_MATCH].SetValue(match_row, Value::BOOLEAN(true));
+				struct_entries[IS_MATCH_START].SetValue(match_row, Value::BOOLEAN(match_row == row));
+				struct_entries[MATCH_START].SetValue(match_row, Value::UBIGINT(row));
+				struct_entries[MATCH_END].SetValue(match_row, Value::UBIGINT(match_end));
+			}
+			row = SkipTo(config, row, match_end, classifiers);
 		}
 		partition_start = payload_idx;
 	}
@@ -290,11 +359,12 @@ void WindowMatchRecognizeExecutor::GetData(ExecutionContext &context, DataChunk 
 }
 
 WindowFunction MatchRecognizeFun::GetFunction() {
-	WindowFunction fun(Name, {LogicalType::ANY, LogicalType::ANY}, WindowMatchRecognizeExecutor::ResultType(),
-	                   ExpressionType::WINDOW_FUNCTION, WindowMatchRecognizeExecutor::Bind,
-	                   WindowMatchRecognizeExecutor::GetBounds, WindowMatchRecognizeExecutor::GetSharing,
-	                   WindowMatchRecognizeExecutor::GetGlobal, WindowMatchRecognizeExecutor::GetLocal, nullptr,
-	                   WindowMatchRecognizeExecutor::Finalize, WindowMatchRecognizeExecutor::GetData);
+	WindowFunction fun(Name, {LogicalType::ANY, LogicalType::UTINYINT, LogicalType::VARCHAR, LogicalType::ANY},
+	                   WindowMatchRecognizeExecutor::ResultType(), ExpressionType::WINDOW_FUNCTION,
+	                   WindowMatchRecognizeExecutor::Bind, WindowMatchRecognizeExecutor::GetBounds,
+	                   WindowMatchRecognizeExecutor::GetSharing, WindowMatchRecognizeExecutor::GetGlobal,
+	                   WindowMatchRecognizeExecutor::GetLocal, nullptr, WindowMatchRecognizeExecutor::Finalize,
+	                   WindowMatchRecognizeExecutor::GetData);
 	return fun;
 }
 

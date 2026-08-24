@@ -208,7 +208,6 @@ static const StaticFunctionDefinition function[] = {
 	DUCKDB_SCALAR_FUNCTION_SET_ALIAS(MultiplyFun),
 	DUCKDB_SCALAR_FUNCTION(NextvalFun),
 	DUCKDB_SCALAR_FUNCTION(NFCNormalizeFun),
-	DUCKDB_WINDOW_FUNCTION(NonOverlapIntervalsFun),
 	DUCKDB_SCALAR_FUNCTION(NotIlikeEscapeFun),
 	DUCKDB_SCALAR_FUNCTION(NotLikeEscapeFun),
 	DUCKDB_WINDOW_FUNCTION(NthValueFun),
