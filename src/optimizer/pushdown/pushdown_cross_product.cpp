@@ -8,7 +8,8 @@ using Filter = FilterPushdown::Filter;
 
 unique_ptr<LogicalOperator> FilterPushdown::PushdownCrossProduct(unique_ptr<LogicalOperator> op) {
 	D_ASSERT(op->children.size() > 1);
-	FilterPushdown left_pushdown(optimizer, convert_mark_joins), right_pushdown(optimizer, convert_mark_joins);
+	FilterPushdown left_pushdown(optimizer, convert_mark_joins, projection_mode);
+	FilterPushdown right_pushdown(optimizer, convert_mark_joins, projection_mode);
 	vector<unique_ptr<Expression>> join_expressions;
 	auto join_ref_type = JoinRefType::REGULAR;
 	switch (op->type) {
@@ -17,7 +18,7 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownCrossProduct(unique_ptr<Logi
 	default:
 		throw InternalException("Unsupported join type for cross product push down");
 	}
-	unordered_set<idx_t> left_bindings, right_bindings;
+	unordered_set<TableIndex> left_bindings, right_bindings;
 	if (!filters.empty()) {
 		// check to see into which side we should push the filters
 		// first get the LHS and RHS bindings

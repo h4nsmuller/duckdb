@@ -26,6 +26,7 @@ struct AlterTableInfo;
 struct CreateIndexInfo;
 struct CreateFunctionInfo;
 struct CreateCollationInfo;
+struct CreateCoordinateSystemInfo;
 struct CreateViewInfo;
 struct BoundCreateTableInfo;
 struct CreatePragmaFunctionInfo;
@@ -48,6 +49,16 @@ public:
 
 public:
 	unique_ptr<CreateInfo> GetInfo() const override;
+
+	//! The parent schema if this is a nested schema, or nullptr for a top-level schema
+	virtual optional_ptr<SchemaCatalogEntry> GetParentSchema() const {
+		return nullptr;
+	}
+
+	//! The full path of this schema (its parent chain outermost first, ending with this schema's own name)
+	vector<Identifier> GetSchemaPath() const;
+	//! The fully qualified name of an entry in this schema: [catalog, schema path..., entry_name]
+	QualifiedName GetQualifiedName(const Identifier &entry_name) const;
 
 	//! Scan the specified catalog set, invoking the callback method for every entry
 	virtual void Scan(ClientContext &context, CatalogType type,
@@ -80,6 +91,12 @@ public:
 	                                                        CreatePragmaFunctionInfo &info) = 0;
 	//! Create a collation within the given schema
 	virtual optional_ptr<CatalogEntry> CreateCollation(CatalogTransaction transaction, CreateCollationInfo &info) = 0;
+	//! Create a coordinate system within the given schema
+	virtual optional_ptr<CatalogEntry> CreateCoordinateSystem(CatalogTransaction transaction,
+	                                                          CreateCoordinateSystemInfo &info) {
+		throw NotImplementedException("Coordinate systems are not supported in schema %s", name);
+	}
+
 	//! Create a enum within the given schema
 	virtual optional_ptr<CatalogEntry> CreateType(CatalogTransaction transaction, CreateTypeInfo &info) = 0;
 
@@ -92,7 +109,7 @@ public:
 	                                                       const EntryLookupInfo &lookup_info);
 
 	DUCKDB_API optional_ptr<CatalogEntry> GetEntry(CatalogTransaction transaction, CatalogType type,
-	                                               const string &name);
+	                                               const Identifier &name);
 
 	//! Drops an entry from the schema
 	virtual void DropEntry(ClientContext &context, DropInfo &info) = 0;

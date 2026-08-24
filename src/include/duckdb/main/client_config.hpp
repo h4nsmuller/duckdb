@@ -10,13 +10,12 @@
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/identifier.hpp"
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/enums/output_type.hpp"
-#include "duckdb/common/enums/profiler_format.hpp"
 #include "duckdb/common/progress_bar/progress_bar.hpp"
 #include "duckdb/common/types/value.hpp"
-#include "duckdb/main/profiling_info.hpp"
-#include "duckdb/parser/expression/lambda_expression.hpp"
-#include "duckdb/main/query_profiler.hpp"
+#include "duckdb/common/enums/profiling_coverage.hpp"
 #include "duckdb/main/user_settings.hpp"
 
 namespace duckdb {
@@ -24,28 +23,26 @@ namespace duckdb {
 class ClientContext;
 class PhysicalResultCollector;
 class PreparedStatementData;
+struct CompiledGrammar;
 
-typedef std::function<PhysicalOperator &(ClientContext &context, PreparedStatementData &data)> get_result_collector_t;
+typedef std::function<unique_ptr<PhysicalOperator>(ClientContext &context, PreparedStatementData &data)>
+    get_result_collector_t;
 
 struct ClientConfig {
 	//! If the query profiler is enabled or not.
 	bool enable_profiler = false;
-	//! If detailed query profiling is enabled
-	bool enable_detailed_profiling = false;
 	//! The format to print query profiling information in (default: query_tree), if enabled.
-	ProfilerPrintFormat profiler_print_format = ProfilerPrintFormat::QUERY_TREE;
+	//! This is the profiler format name passed to QueryProfiler::CreateProfiler.
+	string profiler_print_format = "query_tree";
 	//! The file to save query profiling information to, instead of printing it to the console
 	//! (empty = print to console)
 	string profiler_save_location;
-	//! The custom settings for the profiler
-	//! (empty = use the default settings)
-	profiler_settings_t profiler_settings = MetricsUtils::GetDefaultMetrics();
-	//! The input format type of the profiler settings
-	LogicalTypeId profiler_settings_type = LogicalTypeId::VARCHAR;
-
-	//! Allows suppressing profiler output, even if enabled. We turn on the profiler on all test runs but don't want
-	//! to output anything
-	bool emit_profiler_output = true;
+	//! Glob patterns for tracked_metrics (controls which metrics are gathered and displayed).
+	//! Default "*" means all metrics are tracked.
+	vector<string> tracked_metrics = {"*"};
+	//! Settings that are passed to the renderer of the profiler output (e.g. 'maximum_render_width' for the text
+	//! renderer). Settings that are not recognized by the active renderer are ignored.
+	unordered_map<string, Value> profiling_renderer_settings;
 
 	//! system-wide progress bar disable.
 	const char *system_progress_bar_disable_reason = nullptr;
@@ -56,30 +53,18 @@ struct ClientConfig {
 	//! The wait time before showing the progress bar
 	int wait_time = 2000;
 
-	//! Whether or not aggressive query verification is enabled
-	bool query_verification_enabled = false;
-	//! Whether or not verification of external operators is enabled, used for testing
-	bool verify_external = false;
-	//! Whether or not verification of fetch row code is enabled, used for testing
-	bool verify_fetch_row = false;
-	//! Whether or not we should verify the serializer
-	bool verify_serializer = false;
-	//! Enable the running of optimizers
-	bool enable_optimizer = true;
-	//! Enable caching operators
-	bool enable_caching_operators = true;
 	//! Force parallelism of small tables, used for testing
 	bool verify_parallelism = false;
-	//! Force out-of-core computation for operators that support it, used for testing
-	bool force_external = false;
-	//! Force use of fetch row instead of scan, used for testing
-	bool force_fetch_row = false;
 	//! If this context should also try to use the available replacement scans
 	//! True by default
 	bool use_replacement_scans = true;
 
 	//! The maximum amount of memory to keep buffered in a streaming query result. Default: 1mb.
 	idx_t streaming_buffer_size = 1000000;
+
+	//! The maximum memory for query intermediates (sorts, hash tables) per connection (in bytes). Default: Global
+	//! memory limit.
+	optional_idx operator_memory_limit;
 
 	//! Callback to create a progress bar display
 	progress_bar_display_create_func_t display_create_func = nullptr;
@@ -92,25 +77,20 @@ struct ClientConfig {
 	LocalUserSettings user_settings;
 
 	//! Variables set by the user
-	case_insensitive_map_t<Value> user_variables;
+	identifier_map_t<Value> user_variables;
 
 	//! Function that is used to create the result collector for a materialized result.
 	get_result_collector_t get_result_collector = nullptr;
 
-	//! If HTTP logging is enabled or not.
-	bool enable_http_logging = true;
-
-	//! **DEPRECATED** The file to save query HTTP logging information to, instead of printing it to the console
-	//! (empty = output to the DuckDB logger)
-	string http_logging_output;
+	//! The compiled grammar active for the connection
+	shared_ptr<CompiledGrammar> cached_grammar;
 
 public:
 	static ClientConfig &GetConfig(ClientContext &context);
 	static const ClientConfig &GetConfig(const ClientContext &context);
 
-	bool AnyVerification() const;
-
 	void SetUserVariable(const String &name, Value value);
+	bool GetUserVariable(const Identifier &name, Value &result);
 	bool GetUserVariable(const string &name, Value &result);
 	void ResetUserVariable(const String &name);
 

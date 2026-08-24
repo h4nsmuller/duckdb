@@ -32,10 +32,15 @@ SourceResultType PhysicalTransaction::GetDataInternal(ExecutionContext &context,
 			if (info->modifier == TransactionModifierType::TRANSACTION_READ_ONLY) {
 				client.transaction.SetReadOnly();
 			}
+			client.transaction.SetInvalidationPolicy(info->invalidation_policy);
+			client.transaction.SetAutoRollback(info->auto_rollback);
 			if (Settings::Get<ImmediateTransactionModeSetting>(context.client)) {
 				// if immediate transaction mode is enabled then start all transactions immediately
 				auto databases = DatabaseManager::Get(client).GetDatabases(client);
 				for (auto &db : databases) {
+					if (ValidChecker::IsInvalidated(*db)) {
+						continue;
+					}
 					context.client.transaction.ActiveTransaction().GetTransaction(*db);
 				}
 			}
@@ -50,6 +55,12 @@ SourceResultType PhysicalTransaction::GetDataInternal(ExecutionContext &context,
 		} else {
 			// explicitly commit the current transaction
 			client.transaction.Commit();
+			// Suppress further interrupts for the remainder of this query.
+			// A committed transaction is irreversible. If a concurrent Interrupt()
+			// arrives after the physical commit, it must be silently discarded —
+			// otherwise the caller sees a failed COMMIT even though the data
+			// is already durably committed.
+			client.SuppressInterrupts();
 		}
 		break;
 	}

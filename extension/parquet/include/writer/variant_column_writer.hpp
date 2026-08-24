@@ -9,8 +9,10 @@
 #pragma once
 
 #include "struct_column_writer.hpp"
+#include "parquet_shredding.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/common/types/variant.hpp"
+#include "duckdb/function/scalar/nested_functions.hpp"
 #include "duckdb/function/scalar/variant_utils.hpp"
 
 namespace duckdb {
@@ -22,16 +24,20 @@ struct ArrayAnalyzeData;
 
 struct VariantAnalyzeData {
 public:
-	VariantAnalyzeData() {
-	}
+	VariantAnalyzeData();
+	~VariantAnalyzeData();
 
 public:
 	//! Map for every value what type it is
 	variant_type_map type_map = {};
+	uint32_t decimal_width;
+	uint32_t decimal_scale;
+	bool decimal_consistent = false;
+	idx_t total_count = 0;
+
 	//! Map for every decimal value what physical type it has
-	array<idx_t, 3> decimal_type_map = {};
-	unique_ptr<ObjectAnalyzeData> object_data = nullptr;
-	unique_ptr<ArrayAnalyzeData> array_data = nullptr;
+	unique_ptr<ObjectAnalyzeData> object_data;
+	unique_ptr<ArrayAnalyzeData> array_data;
 };
 
 struct ObjectAnalyzeData {
@@ -65,7 +71,7 @@ public:
 
 class VariantColumnWriter : public StructColumnWriter {
 public:
-	VariantColumnWriter(ParquetWriter &writer, ParquetColumnSchema &&column_schema, vector<string> schema_path_p,
+	VariantColumnWriter(ParquetWriter &writer, ParquetColumnSchema &&column_schema, vector<Identifier> schema_path_p,
 	                    vector<unique_ptr<ColumnWriter>> child_writers_p)
 	    : StructColumnWriter(writer, std::move(column_schema), std::move(schema_path_p), std::move(child_writers_p)) {
 	}
@@ -76,11 +82,12 @@ public:
 	unique_ptr<ParquetAnalyzeSchemaState> AnalyzeSchemaInit() override;
 	void AnalyzeSchema(ParquetAnalyzeSchemaState &state, Vector &input, idx_t count) override;
 	void AnalyzeSchemaFinalize(const ParquetAnalyzeSchemaState &state) override;
+	bool TryExportPreparedShreddingType(ShreddingType &result) const override;
 
 	bool HasTransform() override {
 		return true;
 	}
-	LogicalType TransformedType() override {
+	LogicalType TransformedType() const override {
 		child_list_t<LogicalType> children;
 		for (auto &writer : child_writers) {
 			auto &child_name = writer->Schema().name;
@@ -93,8 +100,10 @@ public:
 		vector<unique_ptr<Expression>> arguments;
 		arguments.push_back(unique_ptr_cast<BoundReferenceExpression, Expression>(std::move(expr)));
 
-		return make_uniq<BoundFunctionExpression>(TransformedType(), GetTransformFunction(), std::move(arguments),
-		                                          nullptr, false);
+		BoundScalarFunction bound_func(GetTransformFunction());
+		bound_func.SetReturnType(TransformedType());
+
+		return make_uniq<BoundFunctionExpression>(std::move(bound_func), std::move(arguments), nullptr);
 	}
 
 public:
@@ -104,6 +113,7 @@ public:
 private:
 	//! Whether the schema of the variant has been analyzed already
 	bool is_analyzed = false;
+	ShreddingType analyzed_shredding_type;
 };
 
 } // namespace duckdb

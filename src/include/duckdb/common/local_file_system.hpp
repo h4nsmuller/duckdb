@@ -18,6 +18,10 @@ public:
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
 	                                optional_ptr<FileOpener> opener = nullptr) override;
 
+	unique_ptr<MemoryMappedFile> MemoryMapFile(const OpenFileInfo &path, FileOpenFlags flags,
+	                                           const MMapOptions &options,
+	                                           optional_ptr<FileOpener> opener = nullptr) override;
+
 	//! Read exactly nr_bytes from the specified location in the file. Fails if nr_bytes could not be read. This is
 	//! equivalent to calling SetFilePointer(location) followed by calling Read().
 	void Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
@@ -29,6 +33,7 @@ public:
 	int64_t Read(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
 	//! Write nr_bytes from the buffer into the file, moving the file pointer forward by nr_bytes.
 	int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
+	FileWriteMode GetWriteMode(FileHandle &handle) override;
 	//! Excise a range of the file. The file-system is free to deallocate this
 	//! range (sparse file support). Reads to the range will succeed but will return
 	//! undefined data.
@@ -67,6 +72,11 @@ public:
 	//! Sync a file handle to disk
 	void FileSync(FileHandle &handle) override;
 
+	//! Checks if path is is an absolute path
+	bool IsPathAbsolute(const string &path) override;
+	string MakePathAbsolute(const string &input, optional_ptr<FileOpener> opener);
+	bool PathStartsWithDrive(const string &path);
+
 	bool CanHandleFile(const string &fpath) override {
 		//! Whether or not a sub-system can handle a specific file path
 		return false;
@@ -74,7 +84,7 @@ public:
 
 	//! Set the file pointer of a file handle to a specified location. Reads and writes will happen from this location
 	void Seek(FileHandle &handle, idx_t location) override;
-	//! Return the current seek posiiton in the file.
+	//! Return the current seek position in the file.
 	idx_t SeekPosition(FileHandle &handle) override;
 
 	//! Whether or not we can seek into the file
@@ -82,6 +92,10 @@ public:
 	//! Whether or not the FS handles plain files on disk. This is relevant for certain optimizations, as random reads
 	//! in a file on-disk are much cheaper than e.g. random reads in a file over the network
 	bool OnDiskFile(FileHandle &handle) override;
+
+	bool IsLocalFileSystem() const override {
+		return true;
+	}
 
 	std::string GetName() const override {
 		return "LocalFileSystem";
@@ -94,10 +108,9 @@ public:
 	//! Checks a file is private (checks for 600 on linux/macos, TODO: currently always returns true on windows)
 	static bool IsPrivateFile(const string &path_p, FileOpener *opener);
 
-	// returns a C-string of the path that trims any file:/ prefix
-	static const char *NormalizeLocalPath(const string &path);
-
 	vector<OpenFileInfo> FetchFileWithoutGlob(const string &path, optional_ptr<FileOpener> opener, bool absolute_path);
+
+	string CanonicalizePath(const string &path_p, optional_ptr<FileOpener> opener) override;
 
 protected:
 	bool ListFilesExtended(const string &directory, const std::function<void(OpenFileInfo &info)> &callback,
@@ -112,6 +125,11 @@ protected:
 	bool SupportsGlobExtended() const override {
 		return true;
 	}
+
+	bool TryCanonicalizeExistingPath(string &path_p);
+
+	string VersionTagFromMetadata(const FileMetadata &file_metadata);
+	void FillFileOptions(const FileMetadata &file_metadata, unordered_map<string, Value> &options);
 
 private:
 	//! Set the file pointer of a file handle to a specified location. Reads and writes will happen from this location

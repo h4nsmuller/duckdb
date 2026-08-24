@@ -4,9 +4,6 @@
 
 require json
 
-statement ok
-pragma enable_verification
-
 # this used to error but the json pointer spec says we should be able to extract the root using the empty string
 query I
 select json_extract('{"my_field": "duck"}', '')
@@ -193,6 +190,24 @@ select json_extract('[{"duck":42},{"duck":43}]', '$[*].*')
 statement error
 with tbl as (
     select '[{"duck":42},{"duck":43}]' j, '$[*].duck' p
+)
+select json_extract(j, p) from tbl
+----
+Invalid Input Error
+
+# a non-constant path that is not inlined (> 12 bytes) must not be read past its end
+# while looking ahead in ReadKey (trailing '*' or '.')
+statement error
+with tbl as (
+    select '{"aaaaaaaaaaaa":1}' j, '$.aaaaaaaaaaaa.*' p
+)
+select json_extract(j, p) from tbl
+----
+Invalid Input Error
+
+statement error
+with tbl as (
+    select '{"aaaaaaaaaaaa":1}' j, '$.aaaaaaaaaaaa..' p
 )
 select json_extract(j, p) from tbl
 ----

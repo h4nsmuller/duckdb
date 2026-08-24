@@ -1,9 +1,22 @@
 #include "reader/decimal_column_reader.hpp"
 
+#include <memory>
+#include <cmath>
+
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/helper.hpp"
+#include "duckdb/common/limits.hpp"
+#include "duckdb/common/types.hpp"
+#include "duckdb/common/unique_ptr.hpp"
+#include "parquet_types.h"
+
 namespace duckdb {
+class ParquetReader;
+struct hugeint_t;
 
 template <bool FIXED>
-static unique_ptr<ColumnReader> CreateDecimalReaderInternal(ParquetReader &reader, const ParquetColumnSchema &schema) {
+static unique_ptr<ColumnReader> CreateDecimalReaderInternal(const ParquetReader &reader,
+                                                            const ParquetColumnSchema &schema) {
 	switch (schema.type.InternalType()) {
 	case PhysicalType::INT16:
 		return make_uniq<DecimalColumnReader<int16_t, FIXED>>(reader, schema);
@@ -24,6 +37,10 @@ template <>
 double ParquetDecimalUtils::ReadDecimalValue(const_data_ptr_t pointer, idx_t size,
                                              const ParquetColumnSchema &schema_ele) {
 	double res = 0;
+	if (size == 0) {
+		// empty byte array - value is zero, and there is no sign byte to read
+		return res;
+	}
 	bool positive = (*pointer & 0x80) == 0;
 	for (idx_t i = 0; i < size; i += 8) {
 		auto byte_size = MinValue<idx_t>(sizeof(uint64_t), size - i);
@@ -45,7 +62,8 @@ double ParquetDecimalUtils::ReadDecimalValue(const_data_ptr_t pointer, idx_t siz
 	return res;
 }
 
-unique_ptr<ColumnReader> ParquetDecimalUtils::CreateReader(ParquetReader &reader, const ParquetColumnSchema &schema) {
+unique_ptr<ColumnReader> ParquetDecimalUtils::CreateReader(const ParquetReader &reader,
+                                                           const ParquetColumnSchema &schema) {
 	if (schema.parquet_type == Type::FIXED_LEN_BYTE_ARRAY) {
 		return CreateDecimalReaderInternal<true>(reader, schema);
 	} else {

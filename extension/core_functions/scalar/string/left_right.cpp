@@ -43,22 +43,27 @@ static string_t LeftScalarFunction(Vector &result, const string_t str, int64_t p
 
 template <class OP>
 static void LeftFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &str_vec = args.data[0];
-	auto &pos_vec = args.data[1];
+	const auto &str_vec = args.data[0];
+	const auto &pos_vec = args.data[1];
 
 	BinaryExecutor::Execute<string_t, int64_t, string_t>(
-	    str_vec, pos_vec, result, args.size(),
-	    [&](string_t str, int64_t pos) { return LeftScalarFunction<OP>(result, str, pos); });
+	    str_vec, pos_vec, result, [&](string_t str, int64_t pos) { return LeftScalarFunction<OP>(result, str, pos); });
 }
 
 ScalarFunction LeftFun::GetFunction() {
-	return ScalarFunction({LogicalType::VARCHAR, LogicalType::BIGINT}, LogicalType::VARCHAR,
-	                      LeftFunction<LeftRightUnicode>);
+	ScalarFunction function({LogicalType::VARCHAR, LogicalType::BIGINT}, LogicalType::VARCHAR,
+	                        LeftFunction<LeftRightUnicode>);
+	// throws if the resulting substring is out of the supported range
+	function.SetFallible();
+	return function;
 }
 
 ScalarFunction LeftGraphemeFun::GetFunction() {
-	return ScalarFunction({LogicalType::VARCHAR, LogicalType::BIGINT}, LogicalType::VARCHAR,
-	                      LeftFunction<LeftRightGrapheme>);
+	ScalarFunction function({LogicalType::VARCHAR, LogicalType::BIGINT}, LogicalType::VARCHAR,
+	                        LeftFunction<LeftRightGrapheme>);
+	// throws if the resulting substring is out of the supported range
+	function.SetFallible();
+	return function;
 }
 
 template <class OP>
@@ -80,21 +85,26 @@ static string_t RightScalarFunction(Vector &result, const string_t str, int64_t 
 
 template <class OP>
 static void RightFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &str_vec = args.data[0];
-	auto &pos_vec = args.data[1];
+	const auto &str_vec = args.data[0];
+	const auto &pos_vec = args.data[1];
 	BinaryExecutor::Execute<string_t, int64_t, string_t>(
-	    str_vec, pos_vec, result, args.size(),
-	    [&](string_t str, int64_t pos) { return RightScalarFunction<OP>(result, str, pos); });
+	    str_vec, pos_vec, result, [&](string_t str, int64_t pos) { return RightScalarFunction<OP>(result, str, pos); });
 }
 
 ScalarFunction RightFun::GetFunction() {
-	return ScalarFunction({LogicalType::VARCHAR, LogicalType::BIGINT}, LogicalType::VARCHAR,
-	                      RightFunction<LeftRightUnicode>);
+	ScalarFunction function({LogicalType::VARCHAR, LogicalType::BIGINT}, LogicalType::VARCHAR,
+	                        RightFunction<LeftRightUnicode>);
+	// throws if the resulting substring is out of the supported range
+	function.SetFallible();
+	return function;
 }
 
 ScalarFunction RightGraphemeFun::GetFunction() {
-	return ScalarFunction({LogicalType::VARCHAR, LogicalType::BIGINT}, LogicalType::VARCHAR,
-	                      RightFunction<LeftRightGrapheme>);
+	ScalarFunction function({LogicalType::VARCHAR, LogicalType::BIGINT}, LogicalType::VARCHAR,
+	                        RightFunction<LeftRightGrapheme>);
+	// throws if the resulting substring is out of the supported range
+	function.SetFallible();
+	return function;
 }
 
 } // namespace duckdb

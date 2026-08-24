@@ -6,8 +6,8 @@
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/types/vector.hpp"
-
-#include "yyjson.hpp"
+#include "duckdb/common/types/geometry_crs.hpp"
+#include "duckdb/common/json_document.hpp"
 
 namespace duckdb {
 
@@ -128,10 +128,10 @@ ArrowExtensionMetadata ArrowTypeExtension::GetInfo() const {
 	return extension_metadata;
 }
 
-unique_ptr<ArrowType> ArrowTypeExtension::GetType(const ArrowSchema &schema,
+unique_ptr<ArrowType> ArrowTypeExtension::GetType(ClientContext &context, const ArrowSchema &schema,
                                                   const ArrowSchemaMetadata &schema_metadata) const {
 	if (get_type) {
-		return get_type(schema, schema_metadata);
+		return get_type(context, schema, schema_metadata);
 	}
 	// FIXME: THis is not good
 	auto duckdb_type = type_extension->GetDuckDBType();
@@ -259,7 +259,8 @@ bool DBConfig::HasArrowExtension(ArrowExtensionMetadata info) const {
 }
 
 struct ArrowJson {
-	static unique_ptr<ArrowType> GetType(const ArrowSchema &schema, const ArrowSchemaMetadata &schema_metadata) {
+	static unique_ptr<ArrowType> GetType(ClientContext &context, const ArrowSchema &schema,
+	                                     const ArrowSchemaMetadata &schema_metadata) {
 		const auto format = string(schema.format);
 		if (format == "u") {
 			return make_uniq<ArrowType>(LogicalType::JSON(), make_uniq<ArrowStringInfo>(ArrowVariableSizeType::NORMAL));
@@ -279,7 +280,8 @@ struct ArrowJson {
 		root_holder.metadata_info.emplace_back(schema_metadata.SerializeMetadata());
 		schema.metadata = root_holder.metadata_info.back().get();
 		const auto options = context.GetClientProperties();
-		if (options.produce_arrow_string_view) {
+		// view layout only when string_view + >= 1.4; declare it to match.
+		if (options.produce_arrow_string_view && options.arrow_output_version >= ArrowFormatVersion::V1_4) {
 			schema.format = "vu";
 		} else {
 			if (options.arrow_offset_size == ArrowOffsetSize::LARGE) {
@@ -292,13 +294,16 @@ struct ArrowJson {
 };
 
 struct ArrowBit {
-	static unique_ptr<ArrowType> GetType(const ArrowSchema &schema, const ArrowSchemaMetadata &schema_metadata) {
+	static unique_ptr<ArrowType> GetType(ClientContext &context, const ArrowSchema &schema,
+	                                     const ArrowSchemaMetadata &schema_metadata) {
 		const auto format = string(schema.format);
 		if (format == "z") {
 			return make_uniq<ArrowType>(LogicalType::BIT, make_uniq<ArrowStringInfo>(ArrowVariableSizeType::NORMAL));
 		} else if (format == "Z") {
 			return make_uniq<ArrowType>(LogicalType::BIT,
 			                            make_uniq<ArrowStringInfo>(ArrowVariableSizeType::SUPER_SIZE));
+		} else if (format == "vz") {
+			return make_uniq<ArrowType>(LogicalType::BIT, make_uniq<ArrowStringInfo>(ArrowVariableSizeType::VIEW));
 		}
 		throw InvalidInputException("Arrow extension type \"%s\" not supported for BIT type", format.c_str());
 	}
@@ -310,7 +315,10 @@ struct ArrowBit {
 		root_holder.metadata_info.emplace_back(schema_metadata.SerializeMetadata());
 		schema.metadata = root_holder.metadata_info.back().get();
 		const auto options = context.GetClientProperties();
-		if (options.arrow_offset_size == ArrowOffsetSize::LARGE) {
+		if (options.arrow_output_version >= ArrowFormatVersion::V1_4) {
+			// >= 1.4 appends the binary view (4-buffer) layout; declare it to match.
+			schema.format = "vz";
+		} else if (options.arrow_offset_size == ArrowOffsetSize::LARGE) {
 			schema.format = "Z";
 		} else {
 			schema.format = "z";
@@ -319,13 +327,16 @@ struct ArrowBit {
 };
 
 struct ArrowBignum {
-	static unique_ptr<ArrowType> GetType(const ArrowSchema &schema, const ArrowSchemaMetadata &schema_metadata) {
+	static unique_ptr<ArrowType> GetType(ClientContext &context, const ArrowSchema &schema,
+	                                     const ArrowSchemaMetadata &schema_metadata) {
 		const auto format = string(schema.format);
 		if (format == "z") {
 			return make_uniq<ArrowType>(LogicalType::BIGNUM, make_uniq<ArrowStringInfo>(ArrowVariableSizeType::NORMAL));
 		} else if (format == "Z") {
 			return make_uniq<ArrowType>(LogicalType::BIGNUM,
 			                            make_uniq<ArrowStringInfo>(ArrowVariableSizeType::SUPER_SIZE));
+		} else if (format == "vz") {
+			return make_uniq<ArrowType>(LogicalType::BIGNUM, make_uniq<ArrowStringInfo>(ArrowVariableSizeType::VIEW));
 		}
 		throw InvalidInputException("Arrow extension type \"%s\" not supported for Bignum", format.c_str());
 	}
@@ -337,7 +348,10 @@ struct ArrowBignum {
 		root_holder.metadata_info.emplace_back(schema_metadata.SerializeMetadata());
 		schema.metadata = root_holder.metadata_info.back().get();
 		const auto options = context.GetClientProperties();
-		if (options.arrow_offset_size == ArrowOffsetSize::LARGE) {
+		if (options.arrow_output_version >= ArrowFormatVersion::V1_4) {
+			// >= 1.4 appends the binary view (4-buffer) layout; declare it to match.
+			schema.format = "vz";
+		} else if (options.arrow_offset_size == ArrowOffsetSize::LARGE) {
 			schema.format = "Z";
 		} else {
 			schema.format = "z";
@@ -347,77 +361,153 @@ struct ArrowBignum {
 
 struct ArrowBool8 {
 	static void ArrowToDuck(ClientContext &context, Vector &source, Vector &result, idx_t count) {
-		auto source_ptr = reinterpret_cast<int8_t *>(FlatVector::GetData(source));
-		auto result_ptr = reinterpret_cast<bool *>(FlatVector::GetData(result));
+		auto source_ptr = FlatVector::GetData<int8_t>(source);
+		auto result_data = FlatVector::Writer<bool>(result, count);
 		for (idx_t i = 0; i < count; i++) {
-			result_ptr[i] = source_ptr[i];
+			result_data.WriteValue(source_ptr[i]);
 		}
 	}
-	static void DuckToArrow(ClientContext &context, Vector &source, Vector &result, idx_t count) {
-		UnifiedVectorFormat format;
-		source.ToUnifiedFormat(count, format);
-		FlatVector::SetValidity(result, format.validity);
-		auto source_ptr = reinterpret_cast<bool *>(format.data);
-		auto result_ptr = reinterpret_cast<int8_t *>(FlatVector::GetData(result));
+	static void DuckToArrow(ClientContext &context, const Vector &source, Vector &result, idx_t count) {
+		auto entries = source.Values<bool>();
+		auto result_data = FlatVector::Writer<int8_t>(result, count);
 		for (idx_t i = 0; i < count; i++) {
-			if (format.validity.RowIsValid(i)) {
-				result_ptr[i] = static_cast<int8_t>(source_ptr[i]);
+			auto entry = entries[i];
+			if (entry.IsValid()) {
+				result_data.WriteValue(static_cast<int8_t>(entry.GetValue()));
+			} else {
+				result_data.WriteNull();
 			}
 		}
 	}
 };
 
 struct ArrowGeometry {
-	static unique_ptr<ArrowType> GetType(const ArrowSchema &schema, const ArrowSchemaMetadata &schema_metadata) {
+	static unique_ptr<ArrowType> GetType(ClientContext &context, const ArrowSchema &schema,
+	                                     const ArrowSchemaMetadata &schema_metadata) {
 		// Validate extension metadata. This metadata also contains a CRS, which we drop
 		// because the GEOMETRY type does not implement a CRS at the type level (yet).
 		const auto extension_metadata = schema_metadata.GetOption(ArrowSchemaMetadata::ARROW_METADATA_KEY);
+
+		unique_ptr<CoordinateReferenceSystem> duckdb_crs;
+
 		if (!extension_metadata.empty()) {
-			unique_ptr<duckdb_yyjson::yyjson_doc, void (*)(duckdb_yyjson::yyjson_doc *)> doc(
-			    duckdb_yyjson::yyjson_read(extension_metadata.data(), extension_metadata.size(),
-			                               duckdb_yyjson::YYJSON_READ_NOFLAG),
-			    duckdb_yyjson::yyjson_doc_free);
+			JSONParseError error;
+			auto doc = JSONDocument::TryParse(extension_metadata.data(), extension_metadata.size(), error);
 			if (!doc) {
 				throw SerializationException("Invalid JSON in GeoArrow metadata");
 			}
 
-			duckdb_yyjson::yyjson_val *val = yyjson_doc_get_root(doc.get());
-			if (!yyjson_is_obj(val)) {
+			auto val = doc->GetRoot();
+			if (!val.IsObject()) {
 				throw SerializationException("Invalid GeoArrow metadata: not a JSON object");
 			}
 
-			duckdb_yyjson::yyjson_val *edges = yyjson_obj_get(val, "edges");
-			if (edges && yyjson_is_str(edges) && std::strcmp(yyjson_get_str(edges), "planar") != 0) {
+			auto edges = val.GetMember("edges");
+			if (edges.IsString() && edges.GetString() != "planar") {
 				throw NotImplementedException("Can't import non-planar edges");
+			}
+
+			// Pick out the CRS if present
+			auto crs = val.GetMember("crs");
+			if (crs.IsString()) {
+				duckdb_crs = CoordinateReferenceSystem::TryIdentify(context, crs.GetString());
+			} else if (crs.IsObject()) {
+				// Stringify the object
+				duckdb_crs = CoordinateReferenceSystem::TryIdentify(context, crs.ToString(JSONWriteFlags::NONE));
 			}
 		}
 
+		// Create the geometry type, with or without CRS
+		auto geo_type = duckdb_crs ? LogicalType::GEOMETRY(*duckdb_crs) : LogicalType::GEOMETRY();
+
 		const auto format = string(schema.format);
 		if (format == "z") {
-			return make_uniq<ArrowType>(LogicalType::GEOMETRY(),
-			                            make_uniq<ArrowStringInfo>(ArrowVariableSizeType::NORMAL));
+			return make_uniq<ArrowType>(std::move(geo_type), make_uniq<ArrowStringInfo>(ArrowVariableSizeType::NORMAL));
 		}
 		if (format == "Z") {
-			return make_uniq<ArrowType>(LogicalType::GEOMETRY(),
+			return make_uniq<ArrowType>(std::move(geo_type),
 			                            make_uniq<ArrowStringInfo>(ArrowVariableSizeType::SUPER_SIZE));
 		}
 		if (format == "vz") {
-			return make_uniq<ArrowType>(LogicalType::GEOMETRY(),
-			                            make_uniq<ArrowStringInfo>(ArrowVariableSizeType::VIEW));
+			return make_uniq<ArrowType>(std::move(geo_type), make_uniq<ArrowStringInfo>(ArrowVariableSizeType::VIEW));
 		}
 		throw InvalidInputException("Arrow extension type \"%s\" not supported for geoarrow.wkb", format.c_str());
+	}
+
+	static void WriteCRS(JSONWriter &writer, JSONMutableValue &root, const CoordinateReferenceSystem &crs,
+	                     ClientContext &context) {
+		// Try to convert to preferred formats, in order
+		auto converted = CoordinateReferenceSystem::TryConvert(context, crs, CoordinateReferenceSystemType::PROJJSON);
+		if (!converted) {
+			converted = CoordinateReferenceSystem::TryConvert(context, crs, CoordinateReferenceSystemType::WKT2_2019);
+		}
+		if (!converted) {
+			converted = CoordinateReferenceSystem::TryConvert(context, crs, CoordinateReferenceSystemType::AUTH_CODE);
+		}
+		if (!converted) {
+			converted = CoordinateReferenceSystem::TryConvert(context, crs, CoordinateReferenceSystemType::SRID);
+		}
+		if (!converted) {
+			converted = nullptr;
+		}
+
+		const auto &crs_def = converted ? converted->GetDefinition() : crs.GetDefinition();
+		const auto &crs_type = converted ? converted->GetType() : crs.GetType();
+
+		switch (crs_type) {
+		case CoordinateReferenceSystemType::PROJJSON: {
+			JSONParseError error;
+			auto projjson_doc = JSONDocument::TryParse(crs_def.c_str(), crs_def.size(), error);
+			if (projjson_doc) {
+				root.AddString("crs_type", "projjson");
+				root.Add("crs", writer.CreateCopy(projjson_doc->GetRoot()));
+			} else {
+				throw SerializationException("Could not parse PROJJSON CRS for GeoArrow metadata");
+			}
+		} break;
+		case CoordinateReferenceSystemType::AUTH_CODE: {
+			root.AddString("crs_type", "authority_code");
+			root.AddString("crs", crs_def);
+		} break;
+		case CoordinateReferenceSystemType::SRID: {
+			root.AddString("crs_type", "srid");
+			root.AddString("crs", crs_def);
+		} break;
+		case CoordinateReferenceSystemType::WKT2_2019: {
+			root.AddString("crs_type", "wkt2:2019");
+			root.AddString("crs", crs_def);
+		} break;
+		default:
+			throw SerializationException("Could not serialize CRS of type %d for GeoArrow metadata",
+			                             static_cast<int>(crs.GetType()));
+		}
 	}
 
 	static void PopulateSchema(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &schema, const LogicalType &type,
 	                           ClientContext &context, const ArrowTypeExtension &extension) {
 		ArrowSchemaMetadata schema_metadata;
+
 		schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME, "geoarrow.wkb");
-		schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_METADATA_KEY, "{}");
+
+		// Make a CRS entry if the type has a CRS
+		JSONWriter writer;
+		auto root = writer.CreateObject();
+		writer.SetRoot(root);
+
+		if (GeoType::HasCRS(type)) {
+			WriteCRS(writer, root, GeoType::GetCRS(type), context);
+		}
+
+		schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_METADATA_KEY, writer.ToString(JSONWriteFlags::NONE));
+
 		root_holder.metadata_info.emplace_back(schema_metadata.SerializeMetadata());
 		schema.metadata = root_holder.metadata_info.back().get();
 
 		const auto options = context.GetClientProperties();
-		if (options.arrow_offset_size == ArrowOffsetSize::LARGE) {
+		if (options.arrow_output_version >= ArrowFormatVersion::V1_4) {
+			// >= 1.4 appends the binary view (4-buffer) layout; declare it to match.
+			schema.format = "vz";
+		} else if (options.arrow_offset_size == ArrowOffsetSize::LARGE) {
 			schema.format = "Z";
 		} else {
 			schema.format = "z";
@@ -428,8 +518,8 @@ struct ArrowGeometry {
 		Geometry::FromBinary(source, result, count, true);
 	}
 
-	static void DuckToArrow(ClientContext &context, Vector &source, Vector &result, idx_t count) {
-		Geometry::ToBinary(source, result, count);
+	static void DuckToArrow(ClientContext &context, const Vector &source, Vector &result, idx_t count) {
+		Geometry::ToBinary(source, result);
 	}
 };
 

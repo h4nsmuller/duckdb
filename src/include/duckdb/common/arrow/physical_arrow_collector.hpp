@@ -6,6 +6,7 @@
 #include "duckdb/common/types/batched_data_collection.hpp"
 #include "duckdb/common/map.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 
 namespace duckdb {
 
@@ -44,7 +45,7 @@ public:
 	}
 
 public:
-	static PhysicalOperator &Create(ClientContext &context, PreparedStatementData &data, idx_t batch_size);
+	static unique_ptr<PhysicalOperator> Create(ClientContext &context, PreparedStatementData &data, idx_t batch_size);
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	unique_ptr<QueryResult> GetResult(GlobalSinkState &state) const override;

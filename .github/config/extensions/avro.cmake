@@ -1,8 +1,10 @@
 if (NOT MINGW)
     duckdb_extension_load(avro
-            LOAD_TESTS DONT_LINK
+            LOAD_TESTS
             GIT_URL https://github.com/duckdb/duckdb-avro
-            GIT_TAG 93da8a19b41eb577add83d0552c6946a16e97c83
+            GIT_TAG 70f1766d8deb91cbf55e452d474755effc14a35b
+            APPLY_PATCHES
+	    SUBMODULES "third_party/avro-c"
             APPLY_PATCHES
     )
 endif()

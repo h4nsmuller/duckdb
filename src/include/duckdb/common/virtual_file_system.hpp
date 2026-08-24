@@ -11,7 +11,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/map.hpp"
 #include "duckdb/common/unordered_set.hpp"
-#include "duckdb/main/extension_helper.hpp"
+#include "duckdb/common/mutex.hpp"
 
 namespace duckdb {
 struct FileSystemRegistry;
@@ -27,6 +27,10 @@ public:
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Read(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
 	int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
+
+	unique_ptr<MemoryMappedFile> MemoryMapFile(const OpenFileInfo &path, FileOpenFlags flags,
+	                                           const MMapOptions &options,
+	                                           optional_ptr<FileOpener> opener = nullptr) override;
 
 	int64_t GetFileSize(FileHandle &handle) override;
 	timestamp_t GetLastModifiedTime(FileHandle &handle) override;
@@ -55,10 +59,12 @@ public:
 
 	void RegisterSubSystem(unique_ptr<FileSystem> fs) override;
 	void RegisterSubSystem(FileCompressionType compression_type, unique_ptr<FileSystem> fs) override;
-
+	void UnregisterSubSystem(const string &name) override;
 	unique_ptr<FileSystem> ExtractSubSystem(const string &name) override;
 
 	vector<string> ListSubSystems() override;
+
+	FileSystem &GetDefaultFileSystem();
 
 	std::string GetName() const override;
 
@@ -67,6 +73,8 @@ public:
 	bool IsDisabledForPath(const string &path) override;
 
 	string PathSeparator(const string &path) override;
+
+	string CanonicalizePath(const string &path_p, optional_ptr<FileOpener> opener) override;
 
 protected:
 	unique_ptr<FileHandle> OpenFileExtended(const OpenFileInfo &file, FileOpenFlags flags,
@@ -97,6 +105,7 @@ private:
 private:
 	mutex registry_lock;
 	shared_ptr<FileSystemRegistry> file_system_registry;
+	vector<unique_ptr<FileSystem>> unregistered_file_systems;
 };
 
 } // namespace duckdb

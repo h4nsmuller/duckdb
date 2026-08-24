@@ -3,6 +3,9 @@
 # group: [optimizer]
 
 statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
 SET default_null_order='nulls_first';
 
 require tpch
@@ -25,11 +28,23 @@ explain SELECT sum(l_extendedprice) / 7.0 AS avg_yearly FROM lineitem, part WHER
 ----
 logical_opt	<!REGEX>:.*SINGLE.*
 
+# Q 17: the selected delimiter domain should still restrict the inner aggregate input
+query II
+explain SELECT sum(l_extendedprice) / 7.0 AS avg_yearly FROM lineitem, part WHERE p_partkey = l_partkey AND p_brand = 'Brand#23' AND p_container = 'MED BOX' AND l_quantity < ( SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey);
+----
+logical_opt	<REGEX>:.*Groups: p_partkey.*COMPARISON_JOIN.*(l_partkey = p_partkey|p_partkey = l_partkey).*(DELIM_GET|CTE_SCAN).*
+
+# Q 17: the generated delimiter CTE should not preserve unused columns from the lineitem input
+query II
+explain SELECT sum(l_extendedprice) / 7.0 AS avg_yearly FROM lineitem, part WHERE p_partkey = l_partkey AND p_brand = 'Brand#23' AND p_container = 'MED BOX' AND l_quantity < ( SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey);
+----
+logical_opt	<!REGEX>:.*l_orderkey.*
+
 # Q 17: if we remove the filters """ p_brand = 'Brand#23' AND p_container = 'MED BOX' """ we can remove the whole DELIM join
 query II
 explain SELECT sum(l_extendedprice) / 7.0 AS avg_yearly FROM lineitem, part WHERE p_partkey = l_partkey AND l_quantity < (SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey);
 ----
-logical_opt	<!REGEX>:.*DELIM_JOIN.*
+logical_opt	<!REGEX>:(.*DELIM_JOIN.*)|(.*CTE Name:.*__duckdb_delim.*)
 
 
 # Q 20: join with JoinType::SINGLE (created when pushing down dependent joins) is converted to LEFT
@@ -37,6 +52,50 @@ query II
 explain SELECT s_name, s_address FROM supplier, nation WHERE s_suppkey IN ( SELECT ps_suppkey FROM partsupp WHERE ps_partkey IN ( SELECT p_partkey FROM part WHERE p_name LIKE 'forest%') AND ps_availqty > ( SELECT 0.5 * sum(l_quantity) FROM lineitem WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND l_shipdate >= CAST('1994-01-01' AS date) AND l_shipdate < CAST('1995-01-01' AS date))) AND s_nationkey = n_nationkey AND n_name = 'CANADA' ORDER BY s_name;
 ----
 logical_opt	<!REGEX>:.*SINGLE.*
+
+# Q 20: both correlated keys from the selected partsupp domain restrict lineitem before aggregation
+query II
+explain SELECT s_name, s_address FROM supplier, nation WHERE s_suppkey IN ( SELECT ps_suppkey FROM partsupp WHERE ps_partkey IN ( SELECT p_partkey FROM part WHERE p_name LIKE 'forest%') AND ps_availqty > ( SELECT 0.5 * sum(l_quantity) FROM lineitem WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND l_shipdate >= CAST('1994-01-01' AS date) AND l_shipdate < CAST('1995-01-01' AS date))) AND s_nationkey = n_nationkey AND n_name = 'CANADA' ORDER BY s_name;
+----
+logical_opt	<REGEX>:.*Groups: ps_suppkey, ps_partkey.*Join Type: SEMI.*l_partkey = ps_partkey.*l_suppkey = ps_suppkey.*(DELIM_GET|CTE_SCAN).*
+
+# Reduced SQLStorm 6064: a pair-dependent predicate below a reused window CTE remains in the
+# normal decorrelation pipeline and exposes both join keys to the optimizer. MARK is retained
+# when column liveness cannot prove that conversion to SEMI is safe.
+statement ok
+CREATE TABLE storm_posts(id INTEGER, owner_user_id INTEGER, post_type_id INTEGER, title VARCHAR, creation_date DATE, score INTEGER);
+
+statement ok
+CREATE TABLE storm_comments(id INTEGER, post_id INTEGER);
+
+statement ok
+CREATE TABLE storm_votes(id INTEGER, post_id INTEGER);
+
+statement ok
+CREATE TABLE storm_badges(user_id INTEGER, class INTEGER);
+
+query II
+EXPLAIN WITH ranked_posts AS (
+	SELECT p.id AS post_id, p.title, p.creation_date, p.score,
+	       count(c.id) AS comment_count, count(DISTINCT v.id) AS vote_count,
+	       rank() OVER (ORDER BY p.creation_date DESC) AS post_rank
+	FROM storm_posts p
+	LEFT JOIN storm_comments c ON p.id = c.post_id
+	LEFT JOIN storm_votes v ON p.id = v.post_id
+	WHERE p.post_type_id = 1
+	GROUP BY p.id, p.title, p.creation_date, p.score
+), top_posts AS (
+	SELECT rp.post_id, coalesce(sum(b.class), 0) AS total_badges
+	FROM ranked_posts rp
+	LEFT JOIN storm_badges b ON b.user_id IN (
+		SELECT owner_user_id FROM storm_posts WHERE id = rp.post_id
+	)
+	WHERE rp.post_rank <= 10
+	GROUP BY rp.post_id
+)
+SELECT * FROM top_posts ORDER BY post_id;
+----
+logical_opt	<REGEX>:.*Join Type: (MARK|SEMI).*post_id.*post_id.*user_id = #0.*
 
 statement ok
 CREATE TABLE integers(i INTEGER, j integer)
@@ -181,3 +240,31 @@ NULL	0
 1	1
 2	1
 3	0
+
+# CTE delimiter rewrite: marker-only EXISTS joins can be converted to a RIGHT_SEMI join if the RHS key is
+# null-rejected and the filtered LHS can act as a runtime-filter build side.
+statement ok
+SET delim_join_as_cte=true;
+
+query II
+EXPLAIN SELECT x FROM range(1000000) o(x) WHERE x < 10000 AND EXISTS (SELECT 1 FROM range(10000000) l(y) WHERE y = x AND y > 0);
+----
+logical_opt	<REGEX>:.*Join Type: RIGHT_SEMI.*x = x.*
+
+# Q 22: the selected delimiter domain should still restrict the NOT EXISTS evidence side
+query II
+EXPLAIN SELECT cntrycode, count(*) AS numcust, sum(c_acctbal) AS totacctbal FROM (SELECT substring(c_phone FROM 1 FOR 2) AS cntrycode, c_acctbal FROM customer WHERE substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17') AND c_acctbal > (SELECT avg(c_acctbal) FROM customer WHERE c_acctbal > 0.00 AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')) AND NOT EXISTS (SELECT * FROM orders WHERE o_custkey = c_custkey)) AS custsale GROUP BY cntrycode ORDER BY cntrycode;
+----
+logical_opt	<REGEX>:.*__duckdb_delim.*Join Type: MARK.*Join Type: (SEMI|RIGHT_SEMI).*o_custkey = c_custkey.*
+
+# Delimiter CTE fanout should stay runnable with grouped build-side consumers
+query I
+SELECT count(*) FROM (SELECT x FROM range(200000) c(x) WHERE x < 150000 AND NOT EXISTS (SELECT 1 FROM range(1000000) o(y) WHERE y = x)) t;
+----
+0
+
+# Q 21: nested EXISTS/NOT EXISTS domains should still fully decorrelate
+query II
+EXPLAIN SELECT s_name, count(*) AS numwait FROM supplier, lineitem l1, orders, nation WHERE s_suppkey = l1.l_suppkey AND o_orderkey = l1.l_orderkey AND o_orderstatus = 'F' AND l1.l_receiptdate > l1.l_commitdate AND EXISTS (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey) AND NOT EXISTS (SELECT * FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey AND l3.l_suppkey <> l1.l_suppkey AND l3.l_receiptdate > l3.l_commitdate) AND s_nationkey = n_nationkey AND n_name = 'SAUDI ARABIA' GROUP BY s_name ORDER BY numwait DESC, s_name LIMIT 100;
+----
+logical_opt	<!REGEX>:.*Join Type: MARK.*

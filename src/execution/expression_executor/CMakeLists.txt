@@ -1,9 +1,7 @@
 add_library_unity(
   duckdb_expression_executor
   OBJECT
-  execute_between.cpp
   execute_case.cpp
-  execute_cast.cpp
   execute_comparison.cpp
   execute_conjunction.cpp
   execute_constant.cpp

@@ -14,34 +14,38 @@
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
 
 namespace duckdb {
 
 class BoundIndex;
 class PhysicalOperator;
+class PhysicalPlanGenerator;
+class DataChunk;
+struct CreateIndexInfo;
 class LogicalCreateIndex;
 enum class IndexConstraintType : uint8_t;
 class Expression;
 class TableIOManager;
 class AttachedDatabase;
 struct IndexStorageInfo;
+class ClientContext;
 
 struct CreateIndexInput {
+	ClientContext &context;
 	TableIOManager &table_io_manager;
 	AttachedDatabase &db;
 	IndexConstraintType constraint_type;
-	const string &name;
+	const Identifier &name;
 	const vector<column_t> &column_ids;
 	const vector<unique_ptr<Expression>> &unbound_expressions;
 	const IndexStorageInfo &storage_info;
 	const case_insensitive_map_t<Value> &options;
 
-	CreateIndexInput(TableIOManager &table_io_manager, AttachedDatabase &db, IndexConstraintType constraint_type,
-	                 const string &name, const vector<column_t> &column_ids,
+	CreateIndexInput(ClientContext &context, TableIOManager &table_io_manager, AttachedDatabase &db,
+	                 IndexConstraintType constraint_type, const Identifier &name, const vector<column_t> &column_ids,
 	                 const vector<unique_ptr<Expression>> &unbound_expressions, const IndexStorageInfo &storage_info,
 	                 const case_insensitive_map_t<Value> &options)
-	    : table_io_manager(table_io_manager), db(db), constraint_type(constraint_type), name(name),
+	    : context(context), table_io_manager(table_io_manager), db(db), constraint_type(constraint_type), name(name),
 	      column_ids(column_ids), unbound_expressions(unbound_expressions), storage_info(storage_info),
 	      options(options) {};
 };

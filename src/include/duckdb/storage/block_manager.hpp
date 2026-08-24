@@ -12,6 +12,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/query_context.hpp"
 #include "duckdb/storage/block.hpp"
 #include "duckdb/storage/storage_info.hpp"
 
@@ -20,14 +21,13 @@ namespace duckdb {
 class BlockHandle;
 class BufferHandle;
 class BufferManager;
-class ClientContext;
 class DatabaseInstance;
 class MetadataManager;
 
 enum class ConvertToPersistentMode { DESTRUCTIVE, THREAD_SAFE };
 
-//! BlockManager is an abstract representation to manage blocks on DuckDB. When writing or reading blocks, the
-//! BlockManager creates and accesses blocks. The concrete types implement specific block storage strategies.
+//! BlockManager is an abstract representation to manage blocks. When writing or reading blocks, the
+//! BlockManager creates and accesses them. The concrete types implement specific block storage strategies.
 class BlockManager {
 public:
 	BlockManager() = delete;
@@ -55,7 +55,7 @@ public:
 	//! Returns whether or not a specified block is the root block
 	virtual bool IsRootBlock(MetaBlockPointer root) = 0;
 	//! Mark a block as included in the next checkpoint
-	virtual void MarkBlockACheckpointed(block_id_t block_id) = 0;
+	virtual void MarkBlockAsCheckpointed(block_id_t block_id) = 0;
 	//! Mark a block as "used"; either the block is removed from the free list, or the reference count is incremented
 	virtual void MarkBlockAsUsed(block_id_t block_id) = 0;
 	//! Mark a block as "modified"; modified blocks are added to the free list after a checkpoint (i.e. their data is
@@ -70,7 +70,7 @@ public:
 	virtual void Read(QueryContext context, Block &block) = 0;
 
 	//! Read the content of the block from disk
-	virtual void ReadBlocks(FileBuffer &buffer, block_id_t start_block, idx_t block_count) = 0;
+	virtual void ReadBlocks(QueryContext context, FileBuffer &buffer, block_id_t start_block, idx_t block_count) = 0;
 	//! Writes the block to disk.
 	virtual void Write(FileBuffer &block, block_id_t block_id) = 0;
 	virtual void Write(QueryContext context, FileBuffer &block, block_id_t block_id);
@@ -114,7 +114,7 @@ public:
 	                                            shared_ptr<BlockHandle> old_block,
 	                                            ConvertToPersistentMode mode = ConvertToPersistentMode::DESTRUCTIVE);
 
-	void UnregisterBlock(BlockHandle &block);
+	void UnregisterPersistentBlock(BlockHandle &block);
 	//! UnregisterBlock, only accepts non-temporary block ids
 	virtual void UnregisterBlock(block_id_t id);
 
@@ -168,6 +168,7 @@ public:
 
 protected:
 	bool BlockIsRegistered(block_id_t block_id);
+	shared_ptr<BlockHandle> TryGetBlock(block_id_t block_id);
 
 public:
 	template <class TARGET>
@@ -182,6 +183,8 @@ public:
 	}
 
 protected:
+	//! A flag to be flipped in the destructor of the subclass, which is called first.
+	//! Relevant for some Windows edge cases.
 	bool in_destruction = false;
 
 private:

@@ -20,6 +20,7 @@
 #include "duckdb/storage/table_storage_info.hpp"
 
 namespace duckdb {
+class BoundIndex;
 
 class ClientContext;
 class TableIOManager;
@@ -59,7 +60,7 @@ enum class DeltaIndexType {
 //! The index is an abstract base class that serves as the basis for indexes
 class BoundIndex : public Index {
 public:
-	BoundIndex(const string &name, const string &index_type, IndexConstraintType index_constraint_type,
+	BoundIndex(const Identifier &name, const string &index_type, IndexConstraintType index_constraint_type,
 	           const vector<column_t> &column_ids, TableIOManager &table_io_manager,
 	           const vector<unique_ptr<Expression>> &unbound_expressions, AttachedDatabase &db);
 
@@ -69,7 +70,7 @@ public:
 	vector<LogicalType> logical_types;
 
 	//! The name of the index
-	string name;
+	Identifier name;
 	//! The index type (ART, B+-tree, Skip-List, ...)
 	string index_type;
 	//! The index constraint type
@@ -97,7 +98,7 @@ public:
 	const string &GetIndexType() const override {
 		return index_type;
 	}
-	const string &GetIndexName() const override {
+	const Identifier &GetIndexName() const override {
 		return name;
 	}
 	IndexConstraintType GetConstraintType() const override {
@@ -121,10 +122,11 @@ public:
 	//! Verifies the constraint for a chunk of data.
 	virtual void VerifyConstraint(DataChunk &chunk, IndexAppendInfo &info, ConflictManager &manager);
 
-	//! Deletes all data from the index. The lock obtained from InitializeLock must be held
-	virtual void CommitDrop(IndexLock &index_lock) = 0;
-	//! Deletes all data from the index
-	void CommitDrop() override;
+	//! Resets all index storage, clearing the index entirely. The lock obtained from InitializeLock must be held.
+	virtual void ResetStorage(IndexLock &index_lock) = 0;
+	//! Obtains a lock and calls ResetStorage while holding that lock.
+	void ResetStorage() override;
+
 	//! Delete a chunk of entries from the index. The lock obtained from InitializeLock must be held.
 	//! Returns the amount of rows successfully deleted from the index.
 	//! If either deleted_sel or non_deleted_sel are provided the exact rows that were (not) deleted are written there
@@ -206,7 +208,7 @@ public:
 
 	//! Replay index insert and delete operations buffered during WAL replay.
 	//! table_types has the physical types of the table in the order they appear, not logical (no generated columns).
-	//! mapped_column_ids contains the sorted order of Indexed physical column ID's (see unbound_index.hpp comments).
+	//! mapped_column_ids maps each buffered data column to its physical table column.
 	void ApplyBufferedReplays(const vector<LogicalType> &table_types, BufferedIndexReplays &buffered_replays,
 	                          const vector<StorageIndex> &mapped_column_ids);
 

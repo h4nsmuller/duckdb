@@ -1,5 +1,6 @@
 #include "duckdb/execution/operator/set/physical_union.hpp"
 
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/parallel/thread_context.hpp"
@@ -46,7 +47,7 @@ void PhysicalUnion::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipelin
 		order_matters = true;
 	}
 	if (sink) {
-		if (sink->SinkOrderDependent()) {
+		if (Settings::Get<PreserveInsertionOrderSetting>(current.GetClientContext()) && sink->SinkOrderDependent()) {
 			order_matters = true;
 		}
 		auto partition_info = sink->RequiredPartitionInfo();
@@ -79,7 +80,9 @@ void PhysicalUnion::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipelin
 		if (order_matters || can_saturate_threads) {
 			// we add dependencies if order matters: union_pipeline comes after all pipelines created by building
 			// current
-			dependencies = meta_pipeline.AddDependenciesFrom(union_pipeline, union_pipeline, false);
+			auto dependency_type =
+			    order_matters ? MetaPipelineDependencyType::REQUIRED : MetaPipelineDependencyType::OPTIONAL_DEPENDENCY;
+			dependencies = meta_pipeline.AddDependenciesFrom(union_pipeline, union_pipeline, false, dependency_type);
 			// we also add dependencies if the LHS child can saturate all available threads
 			// in that case, we recursively make all RHS children depend on the LHS.
 			// This prevents breadth-first plan evaluation
@@ -87,6 +90,8 @@ void PhysicalUnion::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipelin
 				last_child_ptr = meta_pipeline.GetLastChild();
 			}
 		}
+		// Assign proper batch index to the union pipeline
+		meta_pipeline.AssignNextBatchIndex(union_pipeline);
 		// build the union pipeline
 		children[i].get().BuildPipelines(union_pipeline, meta_pipeline);
 
@@ -94,9 +99,6 @@ void PhysicalUnion::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipelin
 			// the pointer was set, set up the dependencies
 			meta_pipeline.AddRecursiveDependencies(dependencies, *last_child_ptr);
 		}
-		// Assign proper batch index to the union pipeline
-		// This needs to happen after the pipelines have been built because unions can be nested
-		meta_pipeline.AssignNextBatchIndex(union_pipeline);
 	}
 }
 

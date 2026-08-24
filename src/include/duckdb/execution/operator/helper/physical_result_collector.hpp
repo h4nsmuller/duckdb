@@ -29,10 +29,10 @@ public:
 	StatementProperties properties;
 	QueryResultMemoryType memory_type;
 	PhysicalOperator &plan;
-	vector<string> names;
+	vector<Identifier> names;
 
 public:
-	static PhysicalOperator &GetResultCollector(ClientContext &context, PreparedStatementData &data);
+	static unique_ptr<PhysicalOperator> GetResultCollector(ClientContext &context, PreparedStatementData &data);
 
 public:
 	//! The final method used to fetch the query result from this operator
