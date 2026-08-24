@@ -50,6 +50,7 @@ void DuckDBKeywordHelper::InitializeKeywordMaps() { // Renamed for clarity
 	reserved_keyword_map.insert("lateral");
 	reserved_keyword_map.insert("leading");
 	reserved_keyword_map.insert("limit");
+	reserved_keyword_map.insert("match_recognize");
 	reserved_keyword_map.insert("not");
 	reserved_keyword_map.insert("null");
 	reserved_keyword_map.insert("offset");
@@ -149,6 +150,7 @@ void DuckDBKeywordHelper::InitializeKeywordMaps() { // Renamed for clarity
 	unreserved_keyword_map.insert("declare");
 	unreserved_keyword_map.insert("defaults");
 	unreserved_keyword_map.insert("deferred");
+	unreserved_keyword_map.insert("define");
 	unreserved_keyword_map.insert("definer");
 	unreserved_keyword_map.insert("delete");
 	unreserved_keyword_map.insert("delimiter");
@@ -243,6 +245,7 @@ void DuckDBKeywordHelper::InitializeKeywordMaps() { // Renamed for clarity
 	unreserved_keyword_map.insert("matched");
 	unreserved_keyword_map.insert("materialized");
 	unreserved_keyword_map.insert("maxvalue");
+	unreserved_keyword_map.insert("measures");
 	unreserved_keyword_map.insert("merge");
 	unreserved_keyword_map.insert("method");
 	unreserved_keyword_map.insert("microsecond");
@@ -273,6 +276,7 @@ void DuckDBKeywordHelper::InitializeKeywordMaps() { // Renamed for clarity
 	unreserved_keyword_map.insert("off");
 	unreserved_keyword_map.insert("oids");
 	unreserved_keyword_map.insert("old");
+	unreserved_keyword_map.insert("one");
 	unreserved_keyword_map.insert("operator");
 	unreserved_keyword_map.insert("option");
 	unreserved_keyword_map.insert("options");
@@ -289,6 +293,9 @@ void DuckDBKeywordHelper::InitializeKeywordMaps() { // Renamed for clarity
 	unreserved_keyword_map.insert("partitioned");
 	unreserved_keyword_map.insert("passing");
 	unreserved_keyword_map.insert("password");
+	unreserved_keyword_map.insert("past");
+	unreserved_keyword_map.insert("pattern");
+	unreserved_keyword_map.insert("per");
 	unreserved_keyword_map.insert("percent");
 	unreserved_keyword_map.insert("persistent");
 	unreserved_keyword_map.insert("plans");

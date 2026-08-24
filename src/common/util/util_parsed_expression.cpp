@@ -158,6 +158,28 @@ ConstChildrenView ParsedExpression::Children() const {
 		}
 		break;
 	}
+	case ExpressionClass::PATTERN: {
+		switch (GetExpressionType()) {
+		case ExpressionType::ALTERNATION: {
+			auto &cast_expr = Cast<AlternationExpression>();
+			result.Append(*cast_expr.child_left);
+			result.Append(*cast_expr.child_right);
+			break;
+		}
+		case ExpressionType::CONCATENATION:
+			for (auto &child : Cast<ConcatenationExpression>().children) {
+				result.Append(*child);
+			}
+			break;
+		case ExpressionType::QUANTIFIER:
+			result.Append(*Cast<QuantifiedExpression>().child);
+			break;
+		default:
+			throw NotImplementedException("Unimplemented pattern expression type %s",
+			                              ExpressionTypeToString(GetExpressionType()));
+		}
+		break;
+	}
 	case ExpressionClass::BOUND_EXPRESSION:
 	case ExpressionClass::COLUMN_REF:
 	case ExpressionClass::LAMBDA_REF:
@@ -289,6 +311,28 @@ ChildrenView ParsedExpression::ChildrenMutable() {
 		auto &cast_expr = Cast<TypeExpression>();
 		for (auto &child : cast_expr.GetChildren()) {
 			result.Append(child);
+		}
+		break;
+	}
+	case ExpressionClass::PATTERN: {
+		switch (GetExpressionType()) {
+		case ExpressionType::ALTERNATION: {
+			auto &cast_expr = Cast<AlternationExpression>();
+			result.Append(cast_expr.child_left);
+			result.Append(cast_expr.child_right);
+			break;
+		}
+		case ExpressionType::CONCATENATION:
+			for (auto &child : Cast<ConcatenationExpression>().children) {
+				result.Append(child);
+			}
+			break;
+		case ExpressionType::QUANTIFIER:
+			result.Append(Cast<QuantifiedExpression>().child);
+			break;
+		default:
+			throw NotImplementedException("Unimplemented pattern expression type %s",
+			                              ExpressionTypeToString(GetExpressionType()));
 		}
 		break;
 	}

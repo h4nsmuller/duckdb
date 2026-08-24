@@ -31,6 +31,18 @@ enum class MatchRecognizeAfterMatch : uint8_t {
 	MATCH_RECOGNIZE_AFTER_MATCH_LAST_VAR = 5   /* AFTER MATCH SKIP TO LAST var */
 };
 
+//! A PATTERN quantifier - an unset bound means "unbounded" in that direction
+struct MatchRecognizeQuantifier {
+	optional_idx min_count;
+	optional_idx max_count;
+};
+
+//! An AFTER MATCH SKIP clause, with the target variable for the TO FIRST/LAST forms
+struct MatchRecognizeAfterMatchClause {
+	MatchRecognizeAfterMatch after_match = MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_DEFAULT;
+	string variable;
+};
+
 struct MatchRecognizeConfig {
 	vector<unique_ptr<ParsedExpression>> partition_expressions;
 	vector<OrderByNode> order_by_expressions;

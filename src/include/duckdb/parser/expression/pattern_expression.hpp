@@ -9,6 +9,8 @@
 #pragma once
 
 #include "duckdb/common/exception/parser_exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/to_string.hpp"
 #include "duckdb/parser/parsed_expression.hpp"
 
 namespace duckdb {
@@ -27,14 +29,14 @@ public:
 	    : PatternExpression(ExpressionType::CONCATENATION), children(std::move(children_p)) {
 	}
 
-	string ToString() const {
+	string ToString() const override {
 		return "(" +
 		       StringUtil::Join(children, children.size(), " ",
 		                        [](const unique_ptr<ParsedExpression> &expr) { return expr->ToString(); }) +
 		       ")";
 	}
 
-	unique_ptr<ParsedExpression> Copy() const {
+	unique_ptr<ParsedExpression> Copy() const override {
 		vector<unique_ptr<ParsedExpression>> new_children;
 		for (auto &child : children) {
 			new_children.push_back(child->Copy());
@@ -69,11 +71,11 @@ public:
 		                          max_count.IsValid() ? to_string(max_count.GetIndex()) : "");
 	}
 
-	string ToString() const {
+	string ToString() const override {
 		return StringUtil::Format("%s%s", child->ToString(), QuantifierString(min_count, max_count));
 	}
 
-	unique_ptr<ParsedExpression> Copy() const {
+	unique_ptr<ParsedExpression> Copy() const override {
 		return make_uniq<QuantifiedExpression>(child->Copy(), min_count, max_count);
 	}
 	unique_ptr<ParsedExpression> child;
@@ -89,32 +91,16 @@ public:
 	      child_right(std::move(child_right_p)) {
 	}
 
-	string ToString() const {
+	string ToString() const override {
 		return StringUtil::Format("(%s)|(%s)", child_left->ToString(), child_right->ToString());
 	}
 
-	unique_ptr<ParsedExpression> Copy() const {
+	unique_ptr<ParsedExpression> Copy() const override {
 		return make_uniq<AlternationExpression>(child_left->Copy(), child_right->Copy());
 	}
 	// TODO should this be a child list too?
 	unique_ptr<ParsedExpression> child_left;
 	unique_ptr<ParsedExpression> child_right;
 };
-
-static std::pair<optional_idx, optional_idx> ParseQuantifier(int min_count_in, int max_count_in) {
-	optional_idx min_count;
-	optional_idx max_count;
-
-	if (min_count_in >= 0) {
-		min_count = NumericCast<idx_t>(min_count_in);
-	}
-	if (max_count_in >= 0) {
-		max_count = NumericCast<idx_t>(max_count_in);
-	}
-	if (min_count.IsValid() && max_count.IsValid() && min_count.GetIndex() > max_count.GetIndex()) {
-		throw ParserException("Min count cannot be larger than max count");
-	}
-	return std::pair<optional_idx, optional_idx>(min_count, max_count);
-}
 
 } // namespace duckdb

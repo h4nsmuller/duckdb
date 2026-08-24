@@ -14,6 +14,8 @@ first_value	[expr]	[ANY]	window
 lag	['expr[', 'n[', 'default]]']	[T, BIGINT, ANY]	window
 last_value	[expr]	[ANY]	window
 lead	['expr[', 'n[', 'default]]']	[T, BIGINT, ANY]	window
+match_recognize	[defines, pattern]	[ANY, ANY]	window
+non_overlap_intervals	[low, high, inclusive]	[UBIGINT, UBIGINT, BOOLEAN]	window
 nth_value	[expr, n]	[ANY, BIGINT]	window
 ntile	[num_buckets]	[BIGINT]	window
 percent_rank	[]	[]	window

@@ -363,6 +363,16 @@ Expression:
   by_value: true
   rules:
     - Expression
+    - MeasuresElement
+    - DefineElement
+    - PatternClause
+    - RowPattern
+    - RowPatternTerm
+    - RowPatternAlternative
+    - RowPatternFactor
+    - RowPatternPrimary
+    - RowPatternGroup
+    - RowPatternLabel
     - ColumnDefaultExpr
     - SingleExpression
     - BaseExpression
@@ -567,6 +577,8 @@ TableRef:
     - TableUnpivotClauseBody
     - TablePivotClause
     - TablePivotClauseBody
+    - TableMatchRecognizeClause
+    - MatchRecognizeBody
     - InnerTableRef
     - TableFunction
     - TableFunctionLateralOpt
@@ -605,6 +617,8 @@ ExpressionList:
   by_value: true
   rules:
     - TypeModifiers
+    - MeasuresClause
+    - DefineClause
     - IndirectionList
     - BoundedListExpression
     - SliceBound
@@ -1572,6 +1586,39 @@ BinaryExpressionTail:
 # Overrides: rules with unique or complex return types that don't share a
 # category with other rules. Typically pair<>, map<>, or one-off structs.
 # ---------------------------------------------------------------------------
+
+MatchRecognizeRows:
+  type: "MatchRecognizeRows"
+  by_value: true
+  rules:
+    - RowsPerMatch
+    - OneRowPerMatch
+    - AllRowsPerMatch
+
+MatchRecognizeAfterMatchClause:
+  type: "MatchRecognizeAfterMatchClause"
+  by_value: true
+  rules:
+    - AfterMatchSkip
+    - AfterMatchSkipTarget
+    - SkipToNextRow
+    - SkipPastLastRow
+    - SkipToFirstVar
+    - SkipToLastVar
+
+MatchRecognizeQuantifier:
+  type: "MatchRecognizeQuantifier"
+  by_value: true
+  rules:
+    - RowPatternQuantifier
+    - QuantifierStar
+    - QuantifierPlus
+    - QuantifierRange
+    - QuantifierBounds
+    - QuantifierMinMax
+    - QuantifierMin
+    - QuantifierMax
+    - QuantifierExact
 
 overrides:
   # common.gram

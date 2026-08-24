@@ -1,0 +1,40 @@
+TableMatchRecognizeClause <- 'MATCH_RECOGNIZE' Parens(MatchRecognizeBody) TableAlias?
+MatchRecognizeBody <- WindowPartition? OrderByClause? MeasuresClause RowsPerMatch? AfterMatchSkip? PatternClause DefineClause
+
+MeasuresClause <- 'MEASURES' List(MeasuresElement)
+MeasuresElement <- Expression 'AS' ColLabelOrString
+
+RowsPerMatch <- OneRowPerMatch / AllRowsPerMatch
+OneRowPerMatch <- 'ONE' 'ROW' 'PER' 'MATCH'
+AllRowsPerMatch <- 'ALL' 'ROWS' 'PER' 'MATCH'
+
+AfterMatchSkip <- 'AFTER' 'MATCH' 'SKIP' AfterMatchSkipTarget
+AfterMatchSkipTarget <- SkipToNextRow / SkipPastLastRow / SkipToFirstVar / SkipToLastVar
+SkipToNextRow <- 'TO' 'NEXT' 'ROW'
+SkipPastLastRow <- 'PAST' 'LAST' 'ROW'
+SkipToFirstVar <- 'TO' 'FIRST' ColLabelOrString
+SkipToLastVar <- 'TO' 'LAST' ColLabelOrString
+
+PatternClause <- 'PATTERN' Parens(RowPattern)
+
+# alternation binds loosest, then concatenation, then quantifiers
+RowPattern <- RowPatternTerm RowPatternAlternative*
+RowPatternAlternative <- '|' RowPatternTerm
+RowPatternTerm <- RowPatternFactor+
+RowPatternFactor <- RowPatternPrimary RowPatternQuantifier?
+RowPatternPrimary <- RowPatternGroup / RowPatternLabel
+RowPatternGroup <- Parens(RowPattern)
+RowPatternLabel <- ColLabelOrString
+
+RowPatternQuantifier <- QuantifierStar / QuantifierPlus / QuantifierRange
+QuantifierStar <- '*'
+QuantifierPlus <- '+'
+QuantifierRange <- '{' QuantifierBounds '}'
+QuantifierBounds <- QuantifierMinMax / QuantifierMin / QuantifierMax / QuantifierExact
+QuantifierMinMax <- NumberLiteral ',' NumberLiteral
+QuantifierMin <- NumberLiteral ','
+QuantifierMax <- ',' NumberLiteral
+QuantifierExact <- NumberLiteral
+
+DefineClause <- 'DEFINE' List(DefineElement)
+DefineElement <- ColLabelOrString 'AS' Expression
