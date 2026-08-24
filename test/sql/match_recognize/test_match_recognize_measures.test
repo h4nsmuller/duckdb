@@ -201,11 +201,71 @@ SELECT i, cl FROM ev MATCH_RECOGNIZE(
 4	A
 5	B
 
-# MATCH_NUMBER() cannot work in DEFINE: the condition decides which rows form a match, so it is
-# evaluated before the match it would be numbered by exists
-statement error
-SELECT 1 FROM ev MATCH_RECOGNIZE(
+# MATCH_NUMBER() inside DEFINE
+# The conditions are evaluated by the matcher, so they can see the match being assembled. A condition
+# that stops holding once enough matches were found bounds how many are reported.
+
+statement ok
+create table q(i integer);
+
+statement ok
+insert into q values (1),(2),(3),(4),(5),(6);
+
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
     ORDER BY i MEASURES i AS x PATTERN (A) DEFINE A as MATCH_NUMBER()=1
-)
+) ORDER BY i
 ----
-<REGEX>:Not implemented Error.*MATCH_NUMBER\(\) is not supported in DEFINE.*
+1
+
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A) DEFINE A as MATCH_NUMBER()<=2
+) ORDER BY i
+----
+1
+2
+
+# it composes with conditions over the input
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A) DEFINE A as i%2=1 AND MATCH_NUMBER()<=2
+) ORDER BY i
+----
+1
+3
+
+# a multi row pattern is bounded the same way
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A A) DEFINE A as MATCH_NUMBER()<=2
+) ORDER BY i
+----
+1
+3
+
+# DEFINE and MEASURES agree on the number
+query II
+SELECT i, mn FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES MATCH_NUMBER() AS mn PATTERN (A) DEFINE A as MATCH_NUMBER()<=2
+) ORDER BY i
+----
+1	1
+2	2
+
+statement ok
+create table mp(p integer, i integer);
+
+statement ok
+insert into mp values (1,1),(1,2),(1,3),(2,1),(2,2),(2,3);
+
+# numbering restarts per partition, so each partition reports its own first two matches
+query II
+SELECT p, i FROM mp MATCH_RECOGNIZE(
+    PARTITION BY p ORDER BY i MEASURES i AS x PATTERN (A) DEFINE A as MATCH_NUMBER()<=2
+) ORDER BY p, i
+----
+1	1
+1	2
+2	1
+2	2

@@ -1,7 +1,7 @@
 [
     {
         "name": "match_recognize",
-        "parameters": "defines,after_match,after_match_variable,pattern",
+        "parameters": "columns,conditions,pattern,symbols,after_match_variable,after_match",
         "description": "Internal window function implementing row pattern matching for MATCH_RECOGNIZE",
         "example": "MATCH_RECOGNIZE(PATTERN (A B) DEFINE A AS x > 0, B AS y > 0)",
         "categories": "",

@@ -3,7 +3,10 @@
 #include "duckdb/function/match_recognize.hpp"
 #include "duckdb/function/window/match_recognize_functions.hpp"
 #include "duckdb/function/window/window_shared_expressions.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 
@@ -42,22 +45,59 @@ LogicalType WindowMatchRecognizeExecutor::ResultType() {
 //===--------------------------------------------------------------------===//
 // Binding
 //===--------------------------------------------------------------------===//
+//! Point a condition's column references at the window's argument list
+static void RebindToArguments(unique_ptr<Expression> &expr, const expression_map_t<idx_t> &argument_index,
+                              idx_t match_number_index, bool &reads_match_number) {
+	if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		auto entry = argument_index.find(*expr);
+		if (entry == argument_index.end()) {
+			throw BinderException("A DEFINE condition may only reference columns of the MATCH_RECOGNIZE input");
+		}
+		if (entry->second == match_number_index) {
+			reads_match_number = true;
+		}
+		expr = make_uniq<BoundReferenceExpression>(expr->GetReturnType(), entry->second);
+		return;
+	}
+	ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
+		RebindToArguments(child, argument_index, match_number_index, reads_match_number);
+	});
+}
+
 unique_ptr<FunctionData> WindowMatchRecognizeExecutor::Bind(BindWindowFunctionInput &input) {
 	auto &arguments = input.GetArguments();
-	if (arguments.size() != 4) {
-		throw BinderException("MATCH_RECOGNIZE takes a DEFINE struct, an AFTER MATCH SKIP option and a pattern");
+	if (arguments.size() != 6) {
+		throw BinderException("MATCH_RECOGNIZE expects its columns, conditions, pattern and configuration");
 	}
 
-	// only the DEFINE struct is evaluated per row - the rest is configuration that moves into the bind
-	// data, and the binder shrinks the argument list to match.
 	auto bind_data = make_uniq<MatchRecognizeFunctionData>();
 	bind_data->after_match = static_cast<MatchRecognizeAfterMatch>(
-	    arguments[1]->Cast<BoundConstantExpression>().GetValue().GetValue<uint8_t>());
-	auto &skip_variable = arguments[2]->Cast<BoundConstantExpression>().GetValue();
+	    arguments[5]->Cast<BoundConstantExpression>().GetValue().GetValue<uint8_t>());
+	auto &skip_variable = arguments[4]->Cast<BoundConstantExpression>().GetValue();
 	if (!skip_variable.IsNull()) {
 		bind_data->after_match_variable = skip_variable.GetValue<string>();
 	}
-	bind_data->pattern = std::move(arguments[3]);
+	for (auto &symbol : ListValue::GetChildren(arguments[3]->Cast<BoundConstantExpression>().GetValue())) {
+		bind_data->symbols.push_back(symbol.GetValue<string>());
+	}
+	bind_data->pattern = std::move(arguments[2]);
+
+	// the columns are packed in argument order, which is the order the conditions address them in
+	expression_map_t<idx_t> argument_index;
+	auto &column_pack = arguments[0]->Cast<BoundFunctionExpression>();
+	for (idx_t i = 0; i < column_pack.GetChildren().size(); i++) {
+		argument_index[*column_pack.GetChildren()[i]] = i;
+	}
+
+	// the conditions are only packed so that they get bound; they are evaluated by the matcher
+	auto &condition_pack = arguments[1]->Cast<BoundFunctionExpression>();
+	for (auto &condition : condition_pack.GetChildrenMutable()) {
+		RebindToArguments(condition, argument_index, 0, bind_data->depends_on_match_number);
+		bind_data->conditions.push_back(std::move(condition));
+	}
+	if (bind_data->conditions.size() != bind_data->symbols.size()) {
+		throw BinderException("MATCH_RECOGNIZE has a condition for every pattern symbol");
+	}
 
 	auto &bound_function = input.GetBoundFunction();
 	bound_function.GetArguments().resize(1);
@@ -224,9 +264,9 @@ static vector<Match> MatchPattern(const Expression &pattern, const DataChunk &in
 		}
 		return {Match(false)};
 	}
-	case ExpressionType::BOUND_COLUMN_REF: {
+	case ExpressionType::VALUE_CONSTANT: {
 		// TODO cache those pointers in the map instead of the vector
-		auto symbol = pattern.GetAlias().GetIdentifierName();
+		auto symbol = pattern.Cast<BoundConstantExpression>().GetValue().GetValue<string>();
 		D_ASSERT(define_child_mapping.find(symbol) != define_child_mapping.end());
 		if (!define_child_mapping[symbol][offset]) {
 			return {Match(false)};
@@ -288,24 +328,70 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 	// TODO this should probably be kept elsewhere
 	DataChunk partition_chunk;
 	partition_chunk.Initialize(context.client, collection->inputs->Types(), gstate.payload_count);
-	// we keep a map with symbol names to pointers
-	// TODO we could also put them into the boundref expression? maybe they're already there??
-	// figure out which define has which child offset
 
 	// the pattern variable that classified each row, indexed by row offset within the hash group
 	vector<string> classifiers(gstate.payload_count);
 
-	unordered_map<string, uint8_t *> define_child_mapping;
-	// the DEFINE struct is wherever expression sharing put it, which is not necessarily column 0
-	const auto defines_idx = gstate.executor.child_idx[0];
-	auto defines_struct_child = partition_chunk.GetTypes()[defines_idx];
-	for (idx_t struct_child_idx = 0; struct_child_idx < StructType::GetChildCount(defines_struct_child);
-	     struct_child_idx++) {
-		auto &child_vector = StructVector::GetEntries(partition_chunk.data[defines_idx])[struct_child_idx];
-		D_ASSERT(child_vector.GetVectorType() == VectorType::FLAT_VECTOR);
-		define_child_mapping[StructType::GetChildName(defines_struct_child, struct_child_idx).GetIdentifierName()] =
-		    FlatVector::GetDataMutable<uint8_t>(child_vector);
+	// The conditions reference the window arguments; expression sharing decided where those landed in
+	// the collection, so rebind them against it before evaluating.
+	const auto columns_idx = gstate.executor.child_idx[0];
+	vector<LogicalType> condition_types;
+	vector<unique_ptr<Expression>> conditions;
+	for (auto &condition : config.conditions) {
+		auto copied = condition->Copy();
+		condition_types.push_back(copied->GetReturnType());
+		conditions.push_back(std::move(copied));
 	}
+	// the conditions address the fields of the packed column struct, and MATCH_NUMBER() is field 0
+	const idx_t match_number_idx = 0;
+
+	// one boolean per symbol per row, refreshed whenever the match number changes
+	vector<vector<uint8_t>> condition_values(conditions.size(), vector<uint8_t>(gstate.payload_count, 0));
+	unordered_map<string, uint8_t *> define_child_mapping;
+	for (idx_t i = 0; i < conditions.size(); i++) {
+		define_child_mapping[config.symbols[i]] = condition_values[i].data();
+	}
+
+	ExpressionExecutor condition_executor(context.client, conditions);
+	DataChunk condition_result;
+	if (!conditions.empty()) {
+		condition_result.Initialize(context.client, condition_types);
+	}
+
+	//	Evaluate every condition over [begin, end] with MATCH_NUMBER() bound to match_number
+	auto evaluate_conditions = [&](idx_t begin, idx_t end, idx_t match_number) {
+		if (conditions.empty() || begin > end) {
+			return;
+		}
+		auto &columns = StructVector::GetEntries(partition_chunk.data[columns_idx]);
+		vector<LogicalType> column_types;
+		for (auto &column : columns) {
+			column_types.push_back(column.GetType());
+		}
+		for (idx_t offset = begin; offset <= end; offset += STANDARD_VECTOR_SIZE) {
+			const auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, end - offset + 1);
+			DataChunk slice;
+			slice.InitializeEmpty(column_types);
+			for (idx_t col = 0; col < columns.size(); col++) {
+				slice.data[col].Slice(columns[col], offset, offset + count);
+			}
+			slice.SetCardinality(count);
+			slice.data[match_number_idx].Reference(Value::UBIGINT(match_number), count_t(count));
+
+			condition_result.Reset();
+			condition_executor.Execute(slice, condition_result);
+			for (idx_t i = 0; i < conditions.size(); i++) {
+				UnifiedVectorFormat condition_data;
+				condition_result.data[i].ToUnifiedFormat(count, condition_data);
+				auto values = UnifiedVectorFormat::GetData<bool>(condition_data);
+				for (idx_t row = 0; row < count; row++) {
+					const auto row_idx = condition_data.sel->get_index(row);
+					condition_values[i][offset + row] =
+					    condition_data.validity.RowIsValid(row_idx) && values[row_idx] ? 1 : 0;
+				}
+			}
+		}
+	};
 
 	// iterate over entire input, but there can be many partitions in the input
 	for (idx_t payload_idx = 1; payload_idx <= gstate.payload_count; payload_idx++) {
@@ -323,6 +409,7 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		// not part of any match keep a NULL struct, which filters them out downstream.
 		auto &struct_entries = StructVector::GetEntries(gstate.result_vec);
 		idx_t match_number = 0;
+		evaluate_conditions(partition_start, partition_end, match_number + 1);
 		auto row = partition_start;
 		while (row <= partition_end) {
 			auto match = MatchPattern(*config.pattern, partition_chunk, row, define_child_mapping, classifiers).back();
@@ -345,6 +432,10 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 				struct_entries[MATCH_END].SetValue(match_row, Value::UBIGINT(match_end));
 			}
 			row = SkipTo(config, row, match_end, classifiers);
+			if (config.depends_on_match_number) {
+				// the conditions can see the match number, so the next match sees different rows
+				evaluate_conditions(row, partition_end, match_number + 1);
+			}
 		}
 		partition_start = payload_idx;
 	}
@@ -359,7 +450,11 @@ void WindowMatchRecognizeExecutor::GetData(ExecutionContext &context, DataChunk 
 }
 
 WindowFunction MatchRecognizeFun::GetFunction() {
-	WindowFunction fun(Name, {LogicalType::ANY, LogicalType::UTINYINT, LogicalType::VARCHAR, LogicalType::ANY},
+	// the argument list is variable: match number column, condition columns, conditions, pattern and
+	// the configuration constants
+	WindowFunction fun(Name,
+	                   {LogicalType::ANY, LogicalType::ANY, LogicalType::ANY, LogicalType::LIST(LogicalType::VARCHAR),
+	                    LogicalType::VARCHAR, LogicalType::UTINYINT},
 	                   WindowMatchRecognizeExecutor::ResultType(), ExpressionType::WINDOW_FUNCTION,
 	                   WindowMatchRecognizeExecutor::Bind, WindowMatchRecognizeExecutor::GetBounds,
 	                   WindowMatchRecognizeExecutor::GetSharing, WindowMatchRecognizeExecutor::GetGlobal,
