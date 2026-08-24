@@ -1,10 +1,12 @@
 #include "duckdb/execution/operator/join/physical_asof_join.hpp"
 
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/row_operations/row_operations.hpp"
 #include "duckdb/common/sorting/sort_strategy.hpp"
 #include "duckdb/common/sorting/sort_key.hpp"
 #include "duckdb/common/sorting/sorted_run.hpp"
 #include "duckdb/common/types/row/block_iterator.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/execution/operator/join/outer_join_marker.hpp"
 #include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -21,15 +23,16 @@ PhysicalAsOfJoin::PhysicalAsOfJoin(PhysicalPlan &physical_plan, LogicalCompariso
 	// Convert the conditions partitions and sorts
 	for (auto &cond : conditions) {
 		D_ASSERT(cond.IsComparison());
-		D_ASSERT(cond.GetLHS().return_type == cond.GetRHS().return_type);
-		join_key_types.push_back(cond.GetLHS().return_type);
+		D_ASSERT(cond.GetLHS().GetReturnType() == cond.GetRHS().GetReturnType());
+		join_key_types.push_back(cond.GetLHS().GetReturnType());
+		const auto join_key_idx = join_key_types.size() - 1;
 
 		auto left_cond = cond.LeftReference()->Copy();
 		auto right_cond = cond.RightReference()->Copy();
 		switch (cond.GetComparisonType()) {
 		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
 		case ExpressionType::COMPARE_GREATERTHAN:
-			null_sensitive.emplace_back(lhs_orders.size());
+			null_sensitive.emplace_back(join_key_idx);
 			lhs_orders.emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST, std::move(left_cond));
 			rhs_orders.emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST, std::move(right_cond));
 			comparison_type = cond.GetComparisonType();
@@ -37,13 +40,13 @@ PhysicalAsOfJoin::PhysicalAsOfJoin(PhysicalPlan &physical_plan, LogicalCompariso
 		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
 		case ExpressionType::COMPARE_LESSTHAN:
 			//	Always put NULLS LAST so they can be ignored.
-			null_sensitive.emplace_back(lhs_orders.size());
+			null_sensitive.emplace_back(join_key_idx);
 			lhs_orders.emplace_back(OrderType::DESCENDING, OrderByNullType::NULLS_LAST, std::move(left_cond));
 			rhs_orders.emplace_back(OrderType::DESCENDING, OrderByNullType::NULLS_LAST, std::move(right_cond));
 			comparison_type = cond.GetComparisonType();
 			break;
 		case ExpressionType::COMPARE_EQUAL:
-			null_sensitive.emplace_back(lhs_orders.size());
+			null_sensitive.emplace_back(join_key_idx);
 			DUCKDB_EXPLICIT_FALLTHROUGH;
 		case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
 			lhs_partitions.emplace_back(std::move(left_cond));
@@ -60,14 +63,7 @@ PhysicalAsOfJoin::PhysicalAsOfJoin(PhysicalPlan &physical_plan, LogicalCompariso
 	children.push_back(right);
 
 	//	Fill out the right projection map.
-	right_projection_map = op.right_projection_map;
-	if (right_projection_map.empty()) {
-		const auto right_count = children[1].get().GetTypes().size();
-		right_projection_map.reserve(right_count);
-		for (column_t i = 0; i < right_count; ++i) {
-			right_projection_map.emplace_back(i);
-		}
-	}
+	right_projection_map = FillProjectionMap(children[1].get(), op.right_projection_map);
 }
 
 //===--------------------------------------------------------------------===//
@@ -244,16 +240,18 @@ private:
 		using BLOCK_ITERATOR = block_iterator_t<ExternalBlockIteratorState, SORT_KEY>;
 		BLOCK_ITERATOR itr(block_state, chunk_idx, 0);
 
-		const auto sort_keys = FlatVector::GetData<SORT_KEY *>(sort_key_pointers);
 		const auto result_count = NextSize();
-		for (idx_t i = 0; i < result_count; ++i) {
-			const auto idx = block_state.GetIndex(chunk_idx, i);
-			sort_keys[i] = &itr[idx];
+		{
+			auto writer = FlatVector::Writer<SORT_KEY *>(sort_key_pointers, result_count);
+			for (idx_t i = 0; i < result_count; ++i) {
+				const auto idx = block_state.GetIndex(chunk_idx, i);
+				writer.WriteValue(&itr[idx]);
+			}
 		}
 
 		// Scan
 		scan_chunk.Reset();
-		scan_state.Scan(sorted_run, sort_key_pointers, result_count, scan_chunk);
+		scan_state.Scan(sorted_run, sort_key_pointers, scan_chunk);
 		return scan_chunk.size() > 0;
 	}
 
@@ -279,33 +277,12 @@ AsOfPayloadScanner::AsOfPayloadScanner(const SortedRun &sorted_run, const SortSt
 	scan_chunk.Initialize(sorted_run.context, sort_strategy.payload_types);
 	const auto sort_key_type = sorted_run.key_data->GetLayout().GetSortKeyType();
 	switch (sort_key_type) {
-	case SortKeyType::NO_PAYLOAD_FIXED_8:
-		scan_func = &AsOfPayloadScanner::TemplatedScan<SortKeyType::NO_PAYLOAD_FIXED_8>;
+#define DUCKDB_SORT_KEY_CASE(SORT_KEY_TYPE)                                                                            \
+	case SortKeyType::SORT_KEY_TYPE:                                                                                   \
+		scan_func = &AsOfPayloadScanner::TemplatedScan<SortKeyType::SORT_KEY_TYPE>;                                    \
 		break;
-	case SortKeyType::NO_PAYLOAD_FIXED_16:
-		scan_func = &AsOfPayloadScanner::TemplatedScan<SortKeyType::NO_PAYLOAD_FIXED_16>;
-		break;
-	case SortKeyType::NO_PAYLOAD_FIXED_24:
-		scan_func = &AsOfPayloadScanner::TemplatedScan<SortKeyType::NO_PAYLOAD_FIXED_24>;
-		break;
-	case SortKeyType::NO_PAYLOAD_FIXED_32:
-		scan_func = &AsOfPayloadScanner::TemplatedScan<SortKeyType::NO_PAYLOAD_FIXED_32>;
-		break;
-	case SortKeyType::NO_PAYLOAD_VARIABLE_32:
-		scan_func = &AsOfPayloadScanner::TemplatedScan<SortKeyType::NO_PAYLOAD_VARIABLE_32>;
-		break;
-	case SortKeyType::PAYLOAD_FIXED_16:
-		scan_func = &AsOfPayloadScanner::TemplatedScan<SortKeyType::PAYLOAD_FIXED_16>;
-		break;
-	case SortKeyType::PAYLOAD_FIXED_24:
-		scan_func = &AsOfPayloadScanner::TemplatedScan<SortKeyType::PAYLOAD_FIXED_24>;
-		break;
-	case SortKeyType::PAYLOAD_FIXED_32:
-		scan_func = &AsOfPayloadScanner::TemplatedScan<SortKeyType::PAYLOAD_FIXED_32>;
-		break;
-	case SortKeyType::PAYLOAD_VARIABLE_32:
-		scan_func = &AsOfPayloadScanner::TemplatedScan<SortKeyType::PAYLOAD_VARIABLE_32>;
-		break;
+		DUCKDB_FOR_EACH_SORT_KEY_TYPE(DUCKDB_SORT_KEY_CASE)
+#undef DUCKDB_SORT_KEY_CASE
 	default:
 		throw NotImplementedException("AsOfPayloadScanner for %s", EnumUtil::ToString(sort_key_type));
 	}
@@ -696,7 +673,7 @@ void AsOfGlobalSourceState::CreateTaskList(ClientContext &client) {
 
 	//	Schedule the largest group on as many threads as possible
 	auto &ts = TaskScheduler::GetScheduler(client);
-	const auto threads = NumericCast<idx_t>(ts.NumberOfThreads());
+	const auto threads = ts.NumberOfThreads();
 
 	const auto per_thread = AsOfHashGroup::BinValue(max_block.first, threads);
 	if (!per_thread) {
@@ -754,14 +731,25 @@ struct SortKeyPrefixComparison {
 			auto lhs_width = col.size;
 			auto rhs_width = col.size;
 			int cmp = 1;
+			const auto has_null =
+			    col.type != SortKeyPrefixComparisonType::NESTED &&
+			    (CreateSortKeyHelpers::IsNullSortKey(const_data_ptr_cast(lhs_ptr), modifiers.null_type) ||
+			     CreateSortKeyHelpers::IsNullSortKey(const_data_ptr_cast(rhs_ptr), modifiers.null_type));
+			if (has_null) {
+				lhs_width = 1;
+				rhs_width = 1;
+			}
+
 			switch (col.type) {
 			case SortKeyPrefixComparisonType::FIXED:
 				cmp = memcmp(lhs_ptr, rhs_ptr, lhs_width);
 				break;
 			case SortKeyPrefixComparisonType::VARCHAR:
-				//	Include first null byte.
-				lhs_width = 1 + strlen(lhs_ptr);
-				rhs_width = 1 + strlen(rhs_ptr);
+				if (!has_null) {
+					//	Include first null byte.
+					lhs_width = 1 + strlen(lhs_ptr);
+					rhs_width = 1 + strlen(rhs_ptr);
+				}
 				cmp = memcmp(lhs_ptr, rhs_ptr, MinValue<idx_t>(lhs_width, rhs_width));
 				break;
 			case SortKeyPrefixComparisonType::NESTED:
@@ -918,7 +906,7 @@ AsOfProbeBuffer::AsOfProbeBuffer(ClientContext &client, const PhysicalAsOfJoin &
 	vector<LogicalType> prefix_types;
 	for (idx_t i = 0; i < op.conditions.size() - 1; ++i) {
 		const auto &cond = op.conditions[i];
-		const auto &type = cond.GetLHS().return_type;
+		const auto &type = cond.GetLHS().GetReturnType();
 		prefix_types.emplace_back(type);
 		SortKeyPrefixComparisonColumn col;
 		col.size = DConstants::INVALID_INDEX;
@@ -965,33 +953,12 @@ void AsOfProbeBuffer::BeginLeftScan(TaskPtr task_p) {
 	//	Set up function pointer for sort type
 	const auto sort_key_type = left_group->key_data->GetLayout().GetSortKeyType();
 	switch (sort_key_type) {
-	case SortKeyType::NO_PAYLOAD_FIXED_8:
-		resolve_join_func = &AsOfProbeBuffer::ResolveJoin<SortKeyType::NO_PAYLOAD_FIXED_8>;
+#define DUCKDB_SORT_KEY_CASE(SORT_KEY_TYPE)                                                                            \
+	case SortKeyType::SORT_KEY_TYPE:                                                                                   \
+		resolve_join_func = &AsOfProbeBuffer::ResolveJoin<SortKeyType::SORT_KEY_TYPE>;                                 \
 		break;
-	case SortKeyType::NO_PAYLOAD_FIXED_16:
-		resolve_join_func = &AsOfProbeBuffer::ResolveJoin<SortKeyType::NO_PAYLOAD_FIXED_16>;
-		break;
-	case SortKeyType::NO_PAYLOAD_FIXED_24:
-		resolve_join_func = &AsOfProbeBuffer::ResolveJoin<SortKeyType::NO_PAYLOAD_FIXED_24>;
-		break;
-	case SortKeyType::NO_PAYLOAD_FIXED_32:
-		resolve_join_func = &AsOfProbeBuffer::ResolveJoin<SortKeyType::NO_PAYLOAD_FIXED_32>;
-		break;
-	case SortKeyType::NO_PAYLOAD_VARIABLE_32:
-		resolve_join_func = &AsOfProbeBuffer::ResolveJoin<SortKeyType::NO_PAYLOAD_VARIABLE_32>;
-		break;
-	case SortKeyType::PAYLOAD_FIXED_16:
-		resolve_join_func = &AsOfProbeBuffer::ResolveJoin<SortKeyType::PAYLOAD_FIXED_16>;
-		break;
-	case SortKeyType::PAYLOAD_FIXED_24:
-		resolve_join_func = &AsOfProbeBuffer::ResolveJoin<SortKeyType::PAYLOAD_FIXED_24>;
-		break;
-	case SortKeyType::PAYLOAD_FIXED_32:
-		resolve_join_func = &AsOfProbeBuffer::ResolveJoin<SortKeyType::PAYLOAD_FIXED_32>;
-		break;
-	case SortKeyType::PAYLOAD_VARIABLE_32:
-		resolve_join_func = &AsOfProbeBuffer::ResolveJoin<SortKeyType::PAYLOAD_VARIABLE_32>;
-		break;
+		DUCKDB_FOR_EACH_SORT_KEY_TYPE(DUCKDB_SORT_KEY_CASE)
+#undef DUCKDB_SORT_KEY_CASE
 	default:
 		throw NotImplementedException("Unsupported comparison type for ASOF join");
 	}
@@ -1025,23 +992,20 @@ void AsOfProbeBuffer::ScanLeft() {
 	//	Compute the join keys
 	lhs_keys.Reset();
 	lhs_executor.Execute(lhs_payload, lhs_keys);
-	lhs_keys.Flatten();
 
-	//	Combine the NULLs
+	// Combine the NULLs
 	const auto count = lhs_payload.size();
 	lhs_valid_mask.Reset();
 	for (auto col_idx : op.null_sensitive) {
-		auto &col = lhs_keys.data[col_idx];
-		UnifiedVectorFormat unified;
-		col.ToUnifiedFormat(count, unified);
-		lhs_valid_mask.Combine(unified.validity, count);
+		const auto &col = lhs_keys.data[col_idx];
+		lhs_valid_mask.Combine(col, count);
 	}
 
 	// Filter out NULL matches
-	if (!lhs_valid_mask.AllValid()) {
-		const auto count = lhs_match_count;
+	if (lhs_valid_mask.CanHaveNull()) {
+		const auto match_count = lhs_match_count;
 		lhs_match_count = 0;
-		for (idx_t i = 0; i < count; ++i) {
+		for (idx_t i = 0; i < match_count; ++i) {
 			const auto idx = lhs_match_sel.get_index(i);
 			if (lhs_valid_mask.RowIsValidUnsafe(idx)) {
 				lhs_match_sel.set_index(lhs_match_count++, idx);
@@ -1183,7 +1147,7 @@ void AsOfProbeBuffer::ResolveComplexJoin(ExecutionContext &context, DataChunk &c
 		// Skip to the range containing the match
 		if (match_pos >= rhs_scanner->Scanned()) {
 			if (rhs_match_count) {
-				rhs_input.Append(rhs_payload, false, &rhs_match_sel, rhs_match_count);
+				rhs_input.Append(rhs_payload, rhs_match_sel, rhs_match_count);
 				rhs_match_count = 0;
 			}
 			rhs_payload.Reset();
@@ -1194,7 +1158,7 @@ void AsOfProbeBuffer::ResolveComplexJoin(ExecutionContext &context, DataChunk &c
 		const auto source_offset = match_pos - rhs_scanner->Base();
 		rhs_match_sel.set_index(rhs_match_count++, source_offset);
 	}
-	rhs_input.Append(rhs_payload, false, &rhs_match_sel, rhs_match_count);
+	rhs_input.Append(rhs_payload, rhs_match_sel, rhs_match_count);
 
 	//	Slice the left payload into the result
 	for (column_t i = 0; i < lhs_payload.ColumnCount(); ++i) {
@@ -1204,11 +1168,10 @@ void AsOfProbeBuffer::ResolveComplexJoin(ExecutionContext &context, DataChunk &c
 	//	Reference the projected right payload into the result
 	for (column_t col_idx = 0; col_idx < op.right_projection_map.size(); ++col_idx) {
 		const auto rhs_idx = op.right_projection_map[col_idx];
-		auto &source = rhs_input.data[rhs_idx];
+		const auto &source = rhs_input.data[rhs_idx];
 		auto &target = chunk.data[lhs_payload.ColumnCount() + col_idx];
 		target.Reference(source);
 	}
-	chunk.SetCardinality(lhs_match_count);
 
 	//	Update the match masks for the rows we ended up with
 	left_outer.Reset();
@@ -1452,7 +1415,7 @@ bool AsOfLocalSourceState::TryAssignTask() {
 }
 
 bool AsOfGlobalSourceState::TryNextTask(TaskPtr &task, Task &task_local) {
-	auto guard = Lock();
+	annotated_lock_guard<annotated_mutex> guard(lock);
 	FinishTask(task);
 
 	if (!HasMoreTasks()) {
@@ -1464,7 +1427,7 @@ bool AsOfGlobalSourceState::TryNextTask(TaskPtr &task, Task &task_local) {
 	for (const auto &group_idx : active_groups) {
 		auto &asof_group = asof_groups[group_idx];
 		if (asof_group->TryPrepareNextStage()) {
-			UnblockTasks(guard);
+			UnblockTasks();
 		}
 		if (asof_group->TryNextTask(task_local)) {
 			task = task_local;
@@ -1480,7 +1443,7 @@ bool AsOfGlobalSourceState::TryNextTask(TaskPtr &task, Task &task_local) {
 
 		auto &asof_group = asof_groups[group_idx];
 		if (asof_group->TryPrepareNextStage()) {
-			UnblockTasks(guard);
+			UnblockTasks();
 		}
 		if (!asof_group->TryNextTask(task_local)) {
 			//	Group has no tasks (empty?)
@@ -1592,13 +1555,14 @@ SourceResultType PhysicalAsOfJoin::GetDataInternal(ExecutionContext &context, Da
 				throw;
 			}
 		} else {
-			auto guard = gsource.Lock();
+			annotated_lock_guard<annotated_mutex> guard(gsource.lock);
 			if (!gsource.HasMoreTasks()) {
-				gsource.UnblockTasks(guard);
+				gsource.UnblockTasks();
+				break;
 			} else {
 				// there are more tasks available, but we can't execute them yet
 				// block the source
-				return gsource.BlockSource(guard, input.interrupt_state);
+				return gsource.BlockSource(input.interrupt_state);
 			}
 		}
 	}
@@ -1628,14 +1592,12 @@ void AsOfLocalSourceState::ExecuteRightTask(ExecutionContext &context, DataChunk
 		const auto &op = gsource.op;
 		const idx_t left_column_count = op.children[0].get().GetTypes().size();
 		for (idx_t col_idx = 0; col_idx < left_column_count; ++col_idx) {
-			chunk.data[col_idx].SetVectorType(VectorType::CONSTANT_VECTOR);
-			ConstantVector::SetNull(chunk.data[col_idx], true);
+			ConstantVector::SetNull(chunk.data[col_idx], count_t(result_count));
 		}
 		for (idx_t col_idx = 0; col_idx < op.right_projection_map.size(); ++col_idx) {
 			const auto rhs_idx = op.right_projection_map[col_idx];
 			chunk.data[left_column_count + col_idx].Slice(rhs_chunk.data[rhs_idx], rsel, result_count);
 		}
-		chunk.SetCardinality(result_count);
 		return;
 	}
 

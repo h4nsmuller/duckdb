@@ -4,6 +4,7 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/helper/physical_limit.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 
 namespace duckdb {
 
@@ -175,6 +176,7 @@ InsertionOrderPreservingMap<string> PhysicalLimitPercent::ParamsToString() const
 			result["Offset"] = to_string(offset);
 		}
 	}
+	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;
 }
 

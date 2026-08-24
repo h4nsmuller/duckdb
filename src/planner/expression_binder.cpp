@@ -7,60 +7,19 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/main/client_config.hpp"
-#include "duckdb/function/scalar/nested_functions.hpp"
 #include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
-
-unique_ptr<Expression> CreateBoundStructExtract(ClientContext &context, unique_ptr<Expression> expr, string key) {
-	vector<unique_ptr<Expression>> arguments;
-	arguments.push_back(std::move(expr));
-	arguments.push_back(make_uniq<BoundConstantExpression>(Value(key)));
-	auto extract_function = GetKeyExtractFunction();
-	auto bind_info = extract_function.bind(context, extract_function, arguments);
-	auto return_type = extract_function.GetReturnType();
-	auto result = make_uniq<BoundFunctionExpression>(return_type, std::move(extract_function), std::move(arguments),
-	                                                 std::move(bind_info));
-	result->SetAlias(std::move(key));
-	return std::move(result);
-}
-
-unique_ptr<Expression> CreateBoundStructExtractIndex(ClientContext &context, unique_ptr<Expression> expr, idx_t key) {
-	vector<unique_ptr<Expression>> arguments;
-	arguments.push_back(std::move(expr));
-	arguments.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(int64_t(key))));
-	auto extract_function = GetIndexExtractFunction();
-	auto bind_info = extract_function.bind(context, extract_function, arguments);
-	auto return_type = extract_function.GetReturnType();
-	auto result = make_uniq<BoundFunctionExpression>(return_type, std::move(extract_function), std::move(arguments),
-	                                                 std::move(bind_info));
-	result->SetAlias("element" + to_string(key));
-	return std::move(result);
-}
 
 void ExpressionBinder::SetCatalogLookupCallback(catalog_entry_callback_t callback) {
 	binder.SetCatalogLookupCallback(std::move(callback));
 }
 
-ExpressionBinder::ExpressionBinder(Binder &binder, ClientContext &context, bool replace_binder)
-    : binder(binder), context(context) {
+ExpressionBinder::ExpressionBinder(Binder &binder, ClientContext &context) : binder(binder), context(context) {
 	InitializeStackCheck();
-	if (replace_binder) {
-		stored_binder = &binder.GetActiveBinder();
-		binder.SetActiveBinder(*this);
-	} else {
-		binder.PushExpressionBinder(*this);
-	}
 }
 
 ExpressionBinder::~ExpressionBinder() {
-	if (binder.HasActiveBinder()) {
-		if (stored_binder) {
-			binder.SetActiveBinder(*stored_binder);
-		} else {
-			binder.PopExpressionBinder();
-		}
-	}
 }
 
 void ExpressionBinder::InitializeStackCheck() {
@@ -110,7 +69,7 @@ BindResult ExpressionBinder::BindExpression(unique_ptr<ParsedExpression> &expr, 
 		return BindExpression(expr_ref.Cast<TypeExpression>(), depth);
 	case ExpressionClass::FUNCTION: {
 		auto &function = expr_ref.Cast<FunctionExpression>();
-		if (IsUnnestFunction(function.function_name)) {
+		if (IsUnnestFunction(function.FunctionName())) {
 			// special case, not in catalog
 			return BindUnnest(function, depth, root_expression);
 		}
@@ -119,7 +78,7 @@ BindResult ExpressionBinder::BindExpression(unique_ptr<ParsedExpression> &expr, 
 	}
 	case ExpressionClass::LAMBDA: {
 		const vector<LogicalType> function_child_types;
-		return BindExpression(expr_ref.Cast<LambdaExpression>(), depth, function_child_types, nullptr);
+		return BindExpression(expr_ref.Cast<LambdaExpression>(), depth, function_child_types, nullptr, nullptr);
 	}
 	case ExpressionClass::OPERATOR:
 		return BindExpression(expr_ref.Cast<OperatorExpression>(), depth);
@@ -138,6 +97,32 @@ BindResult ExpressionBinder::BindExpression(unique_ptr<ParsedExpression> &expr, 
 		    NotImplementedException("Unimplemented expression class in ExpressionBinder::BindExpression: %s",
 		                            EnumUtil::ToString(expr_ref.GetExpressionClass())));
 	}
+}
+
+//! Reconstruct the source location from an error's extra info (prefers "location" so the length is kept)
+static QueryLocation ExtractLocation(const unordered_map<string, string> &info) {
+	auto pos_entry = info.find("position");
+	if (pos_entry == info.end()) {
+		return QueryLocation();
+	}
+	uint64_t start;
+	if (!TryCast::Operation<string_t, uint64_t>(string_t(pos_entry->second), start)) {
+		return QueryLocation();
+	}
+	uint64_t length = 0;
+	auto location_entry = info.find("location");
+	if (location_entry != info.end()) {
+		// value is formatted as "[start,length]"
+		auto comma = location_entry->second.find(',');
+		if (comma != string::npos) {
+			auto len_str = location_entry->second.substr(comma + 1);
+			if (!len_str.empty() && len_str.back() == ']') {
+				len_str.pop_back();
+			}
+			TryCast::Operation<string_t, uint64_t>(string_t(len_str), length);
+		}
+	}
+	return QueryLocation(start, length);
 }
 
 static bool CombineMissingColumns(ErrorData &current, ErrorData new_error) {
@@ -201,19 +186,14 @@ static bool CombineMissingColumns(ErrorData &current, ErrorData new_error) {
 	}
 	// get a new top-n
 	auto top_candidates = StringUtil::TopNStrings(scores);
-	// get query location
-	QueryErrorContext context;
-	current_entry = current_info.find("position");
-	new_entry = new_info.find("position");
-	uint64_t position;
-	if (current_entry != current_info.end() &&
-	    TryCast::Operation<string_t, uint64_t>(current_entry->second, position)) {
-		context = QueryErrorContext(position);
-	} else if (new_entry != new_info.end() && TryCast::Operation<string_t, uint64_t>(new_entry->second, position)) {
-		context = QueryErrorContext(position);
+	// get query location (prefer the current error's location, fall back to the new error's)
+	auto location = ExtractLocation(current_info);
+	if (!location.IsValid()) {
+		location = ExtractLocation(new_info);
 	}
+	QueryErrorContext context(location);
 	// generate a new (combined) error
-	current = BinderException::ColumnNotFound(column_name, top_candidates, context);
+	current = BinderException::ColumnNotFound(Identifier(column_name), StringsToIdentifiers(top_candidates), context);
 	return true;
 }
 
@@ -234,8 +214,6 @@ BindResult ExpressionBinder::BindCorrelatedColumns(unique_ptr<ParsedExpression> 
 	// make a copy of the set of binders, so we can restore it later
 	auto binders = active_binders;
 	auto bind_error = std::move(error_message);
-	// we already failed with the current binder
-	active_binders.pop_back();
 	idx_t depth = 1;
 	while (!active_binders.empty()) {
 		auto &next_binder = active_binders.back().get();
@@ -265,7 +243,7 @@ void ExpressionBinder::BindChild(unique_ptr<ParsedExpression> &expr, idx_t depth
 void ExpressionBinder::ExtractCorrelatedExpressions(Binder &binder, Expression &expr) {
 	if (expr.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 		auto &bound_colref = expr.Cast<BoundColumnRefExpression>();
-		if (bound_colref.depth > 0) {
+		if (bound_colref.Depth() > 0) {
 			binder.AddCorrelatedColumn(CorrelatedColumnInfo(bound_colref));
 		}
 	}
@@ -278,7 +256,8 @@ bool ExpressionBinder::ContainsType(const LogicalType &type, LogicalTypeId targe
 		return true;
 	}
 	switch (type.id()) {
-	case LogicalTypeId::STRUCT: {
+	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::TUPLE: {
 		auto child_count = StructType::GetChildCount(type);
 		for (idx_t i = 0; i < child_count; i++) {
 			if (ContainsType(StructType::GetChildType(type, i), target)) {
@@ -311,13 +290,15 @@ LogicalType ExpressionBinder::ExchangeType(const LogicalType &type, LogicalTypeI
 		return new_type;
 	}
 	switch (type.id()) {
-	case LogicalTypeId::STRUCT: {
+	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::TUPLE: {
 		// we make a copy of the child types of the struct here
 		auto child_types = StructType::GetChildTypes(type);
 		for (auto &child_type : child_types) {
 			child_type.second = ExchangeType(child_type.second, target, new_type);
 		}
-		return LogicalType::STRUCT(child_types);
+		return type.id() == LogicalTypeId::TUPLE ? LogicalType::TUPLE(std::move(child_types))
+		                                         : LogicalType::STRUCT(std::move(child_types));
 	}
 	case LogicalTypeId::UNION: {
 		auto member_types = UnionType::CopyMemberTypes(type);
@@ -369,20 +350,20 @@ unique_ptr<Expression> ExpressionBinder::Bind(unique_ptr<ParsedExpression> &expr
 		// the binder has a specific target type: add a cast to that type
 		result = BoundCastExpression::AddCastToType(context, std::move(result), target_type);
 	} else {
-		if (!binder.can_contain_nulls) {
+		if (!binder.CanContainNulls()) {
 			// SQL NULL type is only used internally in the binder
 			// cast to INTEGER if we encounter it outside of the binder
-			if (ContainsNullType(result->return_type)) {
-				auto exchanged_type = ExchangeNullType(result->return_type);
+			if (ContainsNullType(result->GetReturnType())) {
+				auto exchanged_type = ExchangeNullType(result->GetReturnType());
 				result = BoundCastExpression::AddCastToType(context, std::move(result), exchanged_type);
 			}
 		}
-		if (result->return_type.id() == LogicalTypeId::UNKNOWN) {
+		if (result->GetReturnType().id() == LogicalTypeId::UNKNOWN) {
 			throw ParameterNotResolvedException();
 		}
 	}
 	if (result_type) {
-		*result_type = result->return_type;
+		*result_type = result->GetReturnType();
 	}
 	return result;
 }
@@ -435,7 +416,7 @@ BindResult ExpressionBinder::BindUnsupportedExpression(ParsedExpression &expr, i
 	return BindResult(BinderException::Unsupported(expr, message));
 }
 
-bool ExpressionBinder::IsUnnestFunction(const string &function_name) {
+bool ExpressionBinder::IsUnnestFunction(const Identifier &function_name) {
 	return function_name == "unnest" || function_name == "unlist";
 }
 
@@ -444,8 +425,8 @@ bool ExpressionBinder::IsPotentialAlias(const ColumnRefExpression &colref) {
 	if (!colref.IsQualified()) {
 		return true;
 	}
-	if (colref.column_names.size() == 2) {
-		return StringUtil::CIEquals(colref.GetTableName(), "alias");
+	if (colref.ColumnNames().size() == 2) {
+		return colref.ColumnNames()[0] == "alias";
 	}
 	return false;
 }

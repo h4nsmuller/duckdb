@@ -9,24 +9,19 @@
 #pragma once
 
 #include "duckdb/function/window/window_executor.hpp"
+#include "duckdb/function/window_function.hpp"
 
 namespace duckdb {
 
-class WindowNonOverlapIntervalsExecutor : public WindowExecutor {
-public:
-	WindowNonOverlapIntervalsExecutor(BoundWindowExpression &wexpr, WindowSharedExpressions &shared);
-
-	unique_ptr<GlobalSinkState> GetGlobalState(ClientContext &client, const idx_t payload_count,
-	                                           const ValidityMask &partition_mask,
-	                                           const ValidityMask &order_mask) const override;
-
-	column_t low_idx = DConstants::INVALID_INDEX;
-	column_t high_idx = DConstants::INVALID_INDEX;
-	column_t inclusive_idx = DConstants::INVALID_INDEX;
-
-protected:
-	void EvaluateInternal(ExecutionContext &context, DataChunk &eval_chunk, Vector &result, idx_t count, idx_t row_idx,
-	                      OperatorSinkInput &sink) const override;
+struct WindowNonOverlapIntervalsExecutor {
+	static void GetBounds(WindowBoundsSet &required, const BoundWindowExpression &wexpr);
+	static void GetSharing(WindowExecutor &executor, WindowSharedExpressions &shared);
+	static unique_ptr<GlobalSinkState> GetGlobal(ClientContext &client, const WindowExecutor &executor,
+	                                             const idx_t payload_count, const ValidityMask &partition_mask,
+	                                             const ValidityMask &order_mask);
+	static unique_ptr<LocalSinkState> GetLocal(ExecutionContext &context, const GlobalSinkState &gstate);
+	static void GetData(ExecutionContext &context, DataChunk &eval_chunk, DataChunk &bounds, Vector &result,
+	                    idx_t row_idx, OperatorSinkInput &sink);
 };
 
 } // namespace duckdb

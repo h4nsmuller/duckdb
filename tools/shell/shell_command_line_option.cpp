@@ -1,5 +1,6 @@
 #include "shell_state.hpp"
 #include "shell_highlight.hpp"
+#include "terminal.hpp"
 
 namespace duckdb_shell {
 
@@ -27,7 +28,7 @@ MetadataResult ToggleCSVMode(ShellState &state, const vector<string> &args) {
 }
 
 MetadataResult EnableBail(ShellState &state, const vector<string> &args) {
-	state.bail_on_error = true;
+	state.bail = BailOnError::BAIL_ON_ERROR;
 	return MetadataResult::SUCCESS;
 }
 
@@ -87,7 +88,7 @@ MetadataResult LaunchUI(ShellState &state, const vector<string> &args) {
 	// run the UI command
 	auto rc = state.RunInitialCommand((char *)state.ui_command.c_str(), true);
 	if (rc != 0) {
-		exit(rc);
+		ShellState::Exit(rc);
 		return MetadataResult::EXIT;
 	}
 	return MetadataResult::SUCCESS;
@@ -102,8 +103,7 @@ MetadataResult SetNewlineSeparator(ShellState &state, const vector<string> &args
 MetadataResult SetStorageVersion(ShellState &state, const vector<string> &args) {
 	auto &storage_version = args[1];
 	try {
-		state.config.options.serialization_compatibility =
-		    duckdb::SerializationCompatibility::FromString(storage_version);
+		state.config.options.storage_compatibility = duckdb::StorageCompatibility::FromString(storage_version);
 	} catch (std::exception &ex) {
 		duckdb::ErrorData error(ex);
 		state.PrintF(PrintOutput::STDERR, "%s: Error: unknown argument (%s) for '-storage-version': %s\n",
@@ -113,21 +113,31 @@ MetadataResult SetStorageVersion(ShellState &state, const vector<string> &args) 
 	return MetadataResult::SUCCESS;
 }
 
+template <HighlightMode mode>
+MetadataResult SetColorScheme(ShellState &state, const vector<string> &args) {
+	state.highlight_mode = mode;
+	ShellHighlight highlight(state);
+	highlight.ToggleMode(mode);
+	return MetadataResult::SUCCESS;
+}
+
 MetadataResult ProcessFile(ShellState &state, const vector<string> &args) {
 	state.readStdin = false;
-	auto old_bail = state.bail_on_error;
-	state.bail_on_error = true;
 	auto &file = args[1];
 	if (!state.ProcessFile(file)) {
-		exit(1);
+		ShellState::Exit(1);
 		return MetadataResult::EXIT;
 	}
-	state.bail_on_error = old_bail;
 	return MetadataResult::SUCCESS;
 }
 
 MetadataResult SetInitFile(ShellState &state, const vector<string> &args) {
 	state.initFile = args[1];
+	return MetadataResult::SUCCESS;
+}
+
+MetadataResult SkipInit(ShellState &state, const vector<string> &args) {
+	state.run_init = false;
 	return MetadataResult::SUCCESS;
 }
 
@@ -137,13 +147,65 @@ MetadataResult RunCommand(ShellState &state, const vector<string> &args) {
 		state.readStdin = false;
 	}
 	// Always bail if -c or -s fail
-	bool bail = state.bail_on_error || EXIT;
+	bool bail = true;
+	if (state.bail != BailOnError::AUTOMATIC) {
+		bail = state.bail == BailOnError::BAIL_ON_ERROR;
+	}
 	auto &cmd = args[1];
 	auto rc = state.RunInitialCommand(cmd.c_str(), bail);
 	if (rc != 0) {
-		exit(rc);
+		ShellState::Exit(rc);
 		return MetadataResult::EXIT;
 	}
+	return MetadataResult::SUCCESS;
+}
+
+MetadataResult RunManual(ShellState &state, const vector<string> &args) {
+	// show the manual page and exit; unlike -c we keep interactive detection so the output stays colored
+	state.readStdin = false;
+	if (state.DisplayManual(args) == MetadataResult::FAIL) {
+		ShellState::Exit(1);
+		return MetadataResult::EXIT;
+	}
+	return MetadataResult::SUCCESS;
+}
+
+MetadataResult FormatStdin(ShellState &state, const vector<string> &args) {
+	state.readStdin = false;
+
+	if (duckdb::Terminal::IsAtty()) {
+		state.PrintF(PrintOutput::STDERR,
+		             "%s: Error: -format requires SQL input on stdin (e.g. echo 'SELECT 1' | duckdb -format)\n",
+		             state.program_name);
+		return MetadataResult::FAIL;
+	}
+
+	// Read all of stdin into a string.
+	string sql = state.ReadFileContents(stdin);
+
+	auto result = state.FormatSQL(sql);
+	if (result != MetadataResult::SUCCESS) {
+		return result;
+	}
+
+	// Write formatted SQL to stdout, with syntax highlighting if stdout is a terminal.
+	state.HighlightSQL(sql);
+	state.Print(PrintOutput::STDOUT, sql);
+	return MetadataResult::SUCCESS;
+}
+
+MetadataResult FormatFile(ShellState &state, const vector<string> &args) {
+	state.readStdin = false;
+	const string &filename = args[1];
+
+	string sql = state.ReadFileContents(filename);
+
+	auto result = state.FormatSQL(sql);
+	if (result != MetadataResult::SUCCESS) {
+		return result;
+	}
+	state.HighlightSQL(sql);
+	state.Print(PrintOutput::STDOUT, sql);
 	return MetadataResult::SUCCESS;
 }
 
@@ -156,18 +218,28 @@ static const CommandLineOption command_line_options[] = {
     {"cmd", 1, "COMMAND", nullptr, RunCommand<false>, "run \"COMMAND\" before reading stdin"},
     {"csv", 0, "", nullptr, ToggleCSVMode, "set output mode to 'csv'"},
     {"c", 1, "COMMAND", EnableBatch, RunCommand<true>, "run \"COMMAND\" and exit"},
+    {"dark-mode", 0, "", SetColorScheme<HighlightMode::DARK_MODE>, SetColorScheme<HighlightMode::DARK_MODE>,
+     "use dark mode colors"},
     {"echo", 0, "", nullptr, EnableEcho, "print commands before execution"},
     {"f", 1, "FILENAME", EnableBatch, ProcessFile, "read/process named file and exit"},
+    {"format", 0, "", EnableBatch, FormatStdin, "format SQL from stdin, writing result to stdout"},
+    {"format-file", 1, "FILENAME", EnableBatch, FormatFile, "format SQL in file, writing result to stdout"},
     {"init", 1, "FILENAME", SetInitFile, nullptr, "read/process named file"},
     {"header", 0, "", nullptr, ToggleHeader<true>, "turn headers on"},
-    {"help", 0, "", EnableBatch, PrintHelpAndExit, "show this message"},
+    {"h", 0, "", EnableBatch, PrintHelpAndExit, "show help message"},
+    {"help", 0, "", EnableBatch, PrintHelpAndExit, "show help message"},
     {"html", 0, "", nullptr, ToggleOutputMode<RenderMode::HTML>, "set output mode to HTML"},
     {"interactive", 0, "", nullptr, DisableBatch, "force interactive I/O"},
     {"json", 0, "", nullptr, ToggleOutputMode<RenderMode::JSON>, "set output mode to 'json'"},
+    {"jsonlines", 0, "", nullptr, ToggleOutputMode<RenderMode::JSONLINES>, "set output mode to 'jsonlines'"},
+    {"light-mode", 0, "", SetColorScheme<HighlightMode::LIGHT_MODE>, SetColorScheme<HighlightMode::LIGHT_MODE>,
+     "use light mode colors"},
     {"line", 0, "", nullptr, ToggleOutputMode<RenderMode::LINE>, "set output mode to 'line'"},
     {"list", 0, "", nullptr, ToggleOutputMode<RenderMode::LIST>, "set output mode to 'list'"},
+    {"manual", 1, "FUNCTION", nullptr, RunManual, "show the manual page for a SQL function and exit"},
     {"markdown", 0, "", nullptr, ToggleOutputMode<RenderMode::MARKDOWN>, "set output mode to 'markdown'"},
     {"newline", 1, "SEP", nullptr, SetNewlineSeparator, "set output row separator. Default: '\\n'"},
+    {"no-init", 0, "", SkipInit, nullptr, "skip processing the init file"},
     {"no-stdin", 0, "", nullptr, DisableStdin, "exit after processing options instead of reading stdin"},
     {"noheader", 0, "", nullptr, ToggleHeader<false>, "turn headers off"},
     {"nullvalue", 1, "TEXT", nullptr, ShellState::SetNullValue, "set text string for NULL values. Default 'NULL'"},
@@ -272,7 +344,7 @@ void ShellState::PrintUsage() {
 		}
 		PrintF("%s%s\n", spaces.c_str(), option.description.c_str());
 	}
-	exit(0);
+	ShellState::Exit(0);
 }
 
 } // namespace duckdb_shell

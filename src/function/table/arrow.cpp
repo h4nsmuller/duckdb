@@ -15,10 +15,11 @@
 #include "utf8proc_wrapper.hpp"
 #include "duckdb/common/extra_type_info.hpp"
 #include "duckdb/common/arrow/schema_metadata.hpp"
+#include "duckdb/main/settings.hpp"
 
 namespace duckdb {
 
-void ArrowTableFunction::PopulateArrowTableSchema(DBConfig &config, ArrowTableSchema &arrow_table,
+void ArrowTableFunction::PopulateArrowTableSchema(ClientContext &context, ArrowTableSchema &arrow_table,
                                                   const ArrowSchema &arrow_schema) {
 	vector<string> names;
 	// We first gather the column names and deduplicate them
@@ -41,14 +42,14 @@ void ArrowTableFunction::PopulateArrowTableSchema(DBConfig &config, ArrowTableSc
 		if (!schema.release) {
 			throw InvalidInputException("arrow_scan: released schema passed");
 		}
-		auto arrow_type = ArrowType::GetArrowLogicalType(config, schema);
+		auto arrow_type = ArrowType::GetArrowLogicalType(context, schema);
 		arrow_table.AddColumn(col_idx, std::move(arrow_type), names[col_idx]);
 	}
 }
 
 unique_ptr<FunctionData> ArrowTableFunction::ArrowScanBindDumb(ClientContext &context, TableFunctionBindInput &input,
                                                                vector<LogicalType> &return_types,
-                                                               vector<string> &names) {
+                                                               vector<Identifier> &names) {
 	auto bind_data = ArrowScanBind(context, input, return_types, names);
 	auto &arrow_bind_data = bind_data->Cast<ArrowScanFunctionData>();
 	arrow_bind_data.projection_pushdown_enabled = false;
@@ -56,7 +57,8 @@ unique_ptr<FunctionData> ArrowTableFunction::ArrowScanBindDumb(ClientContext &co
 }
 
 unique_ptr<FunctionData> ArrowTableFunction::ArrowScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                                           vector<LogicalType> &return_types,
+                                                           vector<Identifier> &names) {
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
 		throw BinderException("arrow_scan: pointers cannot be null");
 	}
@@ -78,8 +80,8 @@ unique_ptr<FunctionData> ArrowTableFunction::ArrowScanBind(ClientContext &contex
 
 	auto &data = *res;
 	stream_factory_get_schema(reinterpret_cast<ArrowArrayStream *>(stream_factory_ptr), data.schema_root.arrow_schema);
-	PopulateArrowTableSchema(DBConfig::GetConfig(context), res->arrow_table, data.schema_root.arrow_schema);
-	names = res->arrow_table.GetNames();
+	PopulateArrowTableSchema(context, res->arrow_table, data.schema_root.arrow_schema);
+	names = StringsToIdentifiers(res->arrow_table.GetNames());
 	return_types = res->arrow_table.GetTypes();
 	res->all_types = return_types;
 	if (return_types.empty()) {
@@ -199,15 +201,15 @@ void ArrowTableFunction::ArrowScanFunction(ClientContext &context, TableFunction
 	data.lines_read += output_size;
 	if (global_state.CanRemoveFilterColumns()) {
 		state.all_columns.Reset();
-		state.all_columns.SetCardinality(output_size);
+		state.all_columns.SetChildCardinality(output_size);
 		ArrowToDuckDB(state, data.arrow_table.GetColumns(), state.all_columns);
 		output.ReferenceColumns(state.all_columns, global_state.projection_ids);
 	} else {
-		output.SetCardinality(output_size);
+		output.SetChildCardinality(output_size);
 		ArrowToDuckDB(state, data.arrow_table.GetColumns(), output);
 	}
 
-	output.Verify();
+	output.Verify(context);
 	state.chunk_offset += output.size();
 }
 
@@ -240,6 +242,7 @@ static bool CanPushdown(const ArrowType &type) {
 	case LogicalTypeId::TIMESTAMP_NS:
 	case LogicalTypeId::TIMESTAMP_SEC:
 	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::TIMESTAMP_TZ_NS:
 	case LogicalTypeId::UTINYINT:
 	case LogicalTypeId::USMALLINT:
 	case LogicalTypeId::UINTEGER:
@@ -263,7 +266,8 @@ static bool CanPushdown(const ArrowType &type) {
 			return false;
 		}
 	}
-	case LogicalTypeId::STRUCT: {
+	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::TUPLE: {
 		const auto &struct_info = type.GetTypeInfo<ArrowStructInfo>();
 		for (idx_t i = 0; i < struct_info.ChildCount(); i++) {
 			if (!CanPushdown(struct_info.GetChild(i))) {
@@ -276,10 +280,57 @@ static bool CanPushdown(const ArrowType &type) {
 		return false;
 	}
 }
+static bool HasViewType(const ArrowType &type) {
+	auto duck_type = type.GetDuckType();
+	switch (duck_type.id()) {
+	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::BLOB:
+		return type.GetTypeInfo<ArrowStringInfo>().GetSizeType() == ArrowVariableSizeType::VIEW;
+	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::TUPLE:
+	case LogicalTypeId::UNION: {
+		const auto &struct_info = type.GetTypeInfo<ArrowStructInfo>();
+		for (idx_t i = 0; i < struct_info.ChildCount(); i++) {
+			if (HasViewType(struct_info.GetChild(i))) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::MAP: {
+		const auto &list_info = type.GetTypeInfo<ArrowListInfo>();
+		return HasViewType(list_info.GetChild());
+	}
+	case LogicalTypeId::ARRAY: {
+		const auto &array_info = type.GetTypeInfo<ArrowArrayInfo>();
+		return HasViewType(array_info.GetChild());
+	}
+	default:
+		return false;
+	}
+}
+
+static bool TableHasViewTypes(const arrow_column_map_t &column_info) {
+	for (const auto &col : column_info) {
+		if (HasViewType(*col.second)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool ArrowTableFunction::ArrowPushdownType(const FunctionData &bind_data, idx_t col_idx) {
 	auto &arrow_bind_data = bind_data.Cast<ArrowScanFunctionData>();
 	const auto &column_info = arrow_bind_data.arrow_table.GetColumns();
-	auto column_type = column_info.at(col_idx);
+	// PyArrow's array_filter kernel doesn't support string_view/binary_view types.
+	// The filter is applied to ALL columns in a record batch, so if any column has a
+	// view type, we must disable filter pushdown for the entire table.
+	// See https://github.com/duckdb/duckdb-python/issues/227
+	if (TableHasViewTypes(column_info)) {
+		return false;
+	}
+	const auto column_type = column_info.at(col_idx);
 	return CanPushdown(*column_type);
 }
 
@@ -292,6 +343,7 @@ void ArrowTableFunction::RegisterFunction(BuiltinFunctions &set) {
 	arrow.filter_pushdown = true;
 	arrow.filter_prune = true;
 	arrow.supports_pushdown_type = ArrowPushdownType;
+	arrow.parallelism = TableFunctionParallelism::SEQUENTIAL;
 	set.AddFunction(arrow);
 
 	TableFunction arrow_dumb("arrow_scan_dumb", {LogicalType::POINTER, LogicalType::POINTER, LogicalType::POINTER},
@@ -301,6 +353,7 @@ void ArrowTableFunction::RegisterFunction(BuiltinFunctions &set) {
 	arrow_dumb.projection_pushdown = false;
 	arrow_dumb.filter_pushdown = false;
 	arrow_dumb.filter_prune = false;
+	arrow_dumb.parallelism = TableFunctionParallelism::SEQUENTIAL;
 	set.AddFunction(arrow_dumb);
 }
 

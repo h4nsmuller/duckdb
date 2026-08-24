@@ -106,6 +106,34 @@ public:
 		GetFileSystem().MoveFile(source, target, GetOpener());
 	}
 
+	bool DirectoryExists(const string &directory) {
+		return DirectoryExists(directory, nullptr);
+	}
+	void CreateDirectory(const string &directory) {
+		CreateDirectory(directory, nullptr);
+	}
+	void RemoveDirectory(const string &directory) {
+		RemoveDirectory(directory, nullptr);
+	}
+	void MoveFile(const string &source, const string &target) {
+		MoveFile(source, target, nullptr);
+	}
+	bool FileExists(const string &filename) {
+		return FileExists(filename, nullptr);
+	}
+	bool IsPipe(const string &filename) {
+		return IsPipe(filename, nullptr);
+	}
+	void RemoveFile(const string &filename) {
+		RemoveFile(filename, nullptr);
+	}
+	bool TryRemoveFile(const string &filename) {
+		return TryRemoveFile(filename, nullptr);
+	}
+	void RemoveFiles(const vector<string> &filenames) {
+		RemoveFiles(filenames, nullptr);
+	}
+
 	string GetHomeDirectory() override {
 		return FileSystem::GetHomeDirectory(GetOpener());
 	}
@@ -166,6 +194,14 @@ public:
 		GetFileSystem().RegisterSubSystem(compression_type, std::move(fs));
 	}
 
+	void UnregisterSubSystem(const string &name) override {
+		GetFileSystem().UnregisterSubSystem(name);
+	}
+
+	unique_ptr<FileSystem> ExtractSubSystem(const string &name) override {
+		return GetFileSystem().ExtractSubSystem(name);
+	}
+
 	void SetDisabledFileSystems(const vector<string> &names) override {
 		GetFileSystem().SetDisabledFileSystems(names);
 	}
@@ -197,6 +233,12 @@ protected:
 		return true;
 	}
 
+public:
+	unique_ptr<MemoryMappedFile> MemoryMapFile(const OpenFileInfo &path, FileOpenFlags flags,
+	                                           const MMapOptions &options,
+	                                           optional_ptr<FileOpener> opener = nullptr) override;
+
+protected:
 	bool ListFilesExtended(const string &directory, const std::function<void(OpenFileInfo &info)> &callback,
 	                       optional_ptr<FileOpener> opener) override {
 		VerifyNoOpener(opener);
@@ -217,6 +259,11 @@ protected:
 
 	bool SupportsGlobExtended() const override {
 		return true;
+	}
+
+	string CanonicalizePath(const string &path_p, optional_ptr<FileOpener> opener = nullptr) override {
+		VerifyNoOpener(opener);
+		return GetFileSystem().CanonicalizePath(path_p, GetOpener());
 	}
 
 private:

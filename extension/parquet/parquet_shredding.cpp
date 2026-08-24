@@ -1,10 +1,16 @@
 #include "parquet_shredding.hpp"
+
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
 #include "duckdb/common/exception/binder_exception.hpp"
-#include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/helper.hpp"
 
 namespace duckdb {
+class ClientContext;
 
-ChildShreddingTypes::ChildShreddingTypes() : types(make_uniq<case_insensitive_map_t<ShreddingType>>()) {
+ChildShreddingTypes::ChildShreddingTypes() : types(make_uniq<unordered_map<string, ShreddingType>>()) {
 }
 
 ChildShreddingTypes ChildShreddingTypes::Copy() const {
@@ -19,6 +25,43 @@ ShreddingType::ShreddingType() : set(false) {
 }
 
 ShreddingType::ShreddingType(const LogicalType &type) : set(true), type(type) {
+}
+
+bool ShreddingType::operator==(const ShreddingType &other) const {
+	if (set != other.set) {
+		return false;
+	}
+	if (!set) {
+		return true;
+	}
+	if (type != other.type) {
+		return false;
+	}
+	if (!children.types && !other.children.types) {
+		return true;
+	}
+	if (!children.types || !other.children.types) {
+		return false;
+	}
+	auto &a_children = *children.types;
+	auto &b_children = *other.children.types;
+	if (a_children.size() != b_children.size()) {
+		return false;
+	}
+	for (auto a_it = a_children.begin(); a_it != a_children.end(); ++a_it) {
+		auto &a_name = a_it->first;
+		auto b_it = b_children.find(a_name);
+		if (b_it == b_children.end()) {
+			return false;
+		}
+
+		auto &a_child = a_it->second;
+		auto &b_child = b_it->second;
+		if (!(a_child == b_child)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 ShreddingType ShreddingType::Copy() const {
@@ -56,12 +99,12 @@ static ShreddingType ConvertShreddingTypeRecursive(const LogicalType &type) {
 	throw BinderException("VARIANT can only be shredded on LIST/STRUCT/ANY/non-nested type, not %s", type.ToString());
 }
 
-void ShreddingType::AddChild(const string &name, ShreddingType &&child) {
+void ShreddingType::AddChild(const Identifier &name, ShreddingType &&child) {
 	children.types->emplace(name, std::move(child));
 }
 
-optional_ptr<const ShreddingType> ShreddingType::GetChild(const string &name) const {
-	auto it = children.types->find(name);
+optional_ptr<const ShreddingType> ShreddingType::GetChild(const Identifier &name) const {
+	auto it = children.types->find(name.GetIdentifierName());
 	if (it == children.types->end()) {
 		return nullptr;
 	}

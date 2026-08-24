@@ -2,18 +2,57 @@
 
 namespace duckdb {
 
-EncryptionState::EncryptionState(EncryptionTypes::CipherType cipher_p, idx_t key_len_p)
-    : cipher(cipher_p), key_len(key_len_p) {
+idx_t CryptoHash::GetDigestSize(CryptoHashFunction function) {
+	switch (function) {
+	case CryptoHashFunction::MD5:
+		return 16;
+	case CryptoHashFunction::SHA1:
+		return 20;
+	case CryptoHashFunction::SHA256:
+		return 32;
+	default:
+		throw InternalException("Unsupported crypto hash function");
+	}
+}
+
+idx_t CryptoHash::GetHexDigestSize(CryptoHashFunction function) {
+	return GetDigestSize(function) * 2;
+}
+
+void CryptoHash::ToHex(const_data_ptr_t input, idx_t input_len, char *output) {
+	static constexpr char HEX_CODES[] = "0123456789abcdef";
+	for (idx_t input_idx = 0, output_idx = 0; input_idx < input_len; input_idx++) {
+		auto byte = input[input_idx];
+		output[output_idx++] = HEX_CODES[(byte >> 4) & 0xf];
+		output[output_idx++] = HEX_CODES[byte & 0xf];
+	}
+}
+
+CryptoHashState::CryptoHashState(CryptoHashFunction function_p) : function(function_p) {
+}
+
+CryptoHashState::~CryptoHashState() {
+}
+
+void CryptoHashState::HashHex(const_data_ptr_t input, idx_t input_len, char *output) {
+	auto digest_size = CryptoHash::GetDigestSize(function);
+	data_t digest[CryptoHash::MAX_DIGEST_SIZE];
+	D_ASSERT(digest_size <= CryptoHash::MAX_DIGEST_SIZE);
+	Hash(input, input_len, digest);
+	CryptoHash::ToHex(digest, digest_size, output);
+}
+
+EncryptionState::EncryptionState(unique_ptr<EncryptionStateMetadata> metadata_p) : metadata(std::move(metadata_p)) {
 }
 
 EncryptionState::~EncryptionState() {
 }
 
-void EncryptionState::InitializeEncryption(const_data_ptr_t, idx_t, const_data_ptr_t, idx_t, const_data_ptr_t, idx_t) {
+void EncryptionState::InitializeEncryption(EncryptionNonce &nonce, const_data_ptr_t, const_data_ptr_t, idx_t) {
 	throw NotImplementedException("EncryptionState Abstract Class is called");
 }
 
-void EncryptionState::InitializeDecryption(const_data_ptr_t, idx_t, const_data_ptr_t, idx_t, const_data_ptr_t, idx_t) {
+void EncryptionState::InitializeDecryption(EncryptionNonce &nonce, const_data_ptr_t, const_data_ptr_t, idx_t) {
 	throw NotImplementedException("EncryptionState Abstract Class is called");
 }
 
@@ -29,66 +68,46 @@ void EncryptionState::GenerateRandomData(data_ptr_t, idx_t) {
 	throw NotImplementedException("EncryptionState Abstract Class is called");
 }
 
-static constexpr EncryptionTypes::EncryptionVersion MAX_VERSION = EncryptionTypes::V0_1;
-
-string EncryptionTypes::CipherToString(CipherType cipher_p) {
-	switch (cipher_p) {
-	case GCM:
-		return "GCM";
-	case CTR:
-		return "CTR";
-	case CBC:
-		return "CBC";
-	default:
-		return "INVALID";
-	}
+void EncryptionUtil::Hash(CryptoHashFunction, const_data_ptr_t, idx_t, data_ptr_t) const {
+	throw NotImplementedException("EncryptionUtil does not implement hashing");
 }
 
-EncryptionTypes::CipherType EncryptionTypes::StringToCipher(const string &encryption_cipher_p) {
-	auto encryption_cipher = StringUtil::Upper(encryption_cipher_p);
-	if (encryption_cipher == "GCM") {
-		return GCM;
-	}
-	if (encryption_cipher == "CTR") {
-		return CTR;
-	}
-	if (encryption_cipher == "CBC") {
-		throw NotImplementedException("CBC encryption is disabled");
-	}
-	return INVALID;
+void EncryptionUtil::HashHex(CryptoHashFunction function, const_data_ptr_t input, idx_t input_len, char *output) const {
+	auto digest_size = CryptoHash::GetDigestSize(function);
+	data_t digest[CryptoHash::MAX_DIGEST_SIZE];
+	D_ASSERT(digest_size <= CryptoHash::MAX_DIGEST_SIZE);
+	Hash(function, input, input_len, digest);
+	CryptoHash::ToHex(digest, digest_size, output);
 }
 
-EncryptionTypes::EncryptionVersion EncryptionTypes::StringToVersion(const string &encryption_version_p) {
-	if (encryption_version_p == "v0") {
-		return V0_0;
-	} else if (encryption_version_p == "v1") {
-		return V0_1;
-	} else {
-		throw NotImplementedException("No encryption version higher then v%d is supported yet in this DuckDB version",
-		                              MAX_VERSION);
+class EncryptionUtilCryptoHashState : public CryptoHashState {
+public:
+	EncryptionUtilCryptoHashState(const EncryptionUtil &encryption_util_p, CryptoHashFunction function)
+	    : CryptoHashState(function), encryption_util(encryption_util_p) {
 	}
+
+	void Hash(const_data_ptr_t input, idx_t input_len, data_ptr_t output) override {
+		encryption_util.Hash(GetFunction(), input, input_len, output);
+	}
+
+private:
+	const EncryptionUtil &encryption_util;
+};
+
+unique_ptr<CryptoHashState> EncryptionUtil::CreateHashState(CryptoHashFunction function) const {
+	return make_uniq<EncryptionUtilCryptoHashState>(*this, function);
 }
 
-string EncryptionTypes::KDFToString(KeyDerivationFunction kdf_p) {
-	switch (kdf_p) {
-	case SHA256:
-		return "SHA256";
-	case PBKDF2:
-		return "PBKDF2";
-	default:
-		return "DEFAULT";
-	}
+void EncryptionUtil::Hmac(CryptoHashFunction, const_data_ptr_t, idx_t, const_data_ptr_t, idx_t, data_ptr_t) const {
+	throw NotImplementedException("EncryptionUtil does not implement HMAC");
 }
 
-EncryptionTypes::KeyDerivationFunction EncryptionTypes::StringToKDF(const string &key_derivation_function_p) {
-	auto key_derivation_function = StringUtil::Upper(key_derivation_function_p);
-	if (key_derivation_function == "SHA256") {
-		return SHA256;
-	}
-	if (key_derivation_function == "PBKDF2") {
-		return PBKDF2;
-	}
-	return DEFAULT;
+bool EncryptionUtil::SupportsHash(CryptoHashFunction) const {
+	return false;
+}
+
+bool EncryptionUtil::SupportsHmac(CryptoHashFunction) const {
+	return false;
 }
 
 } // namespace duckdb

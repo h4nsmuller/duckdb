@@ -1,3 +1,5 @@
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/catalog/default/default_types.hpp"
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -7,6 +9,8 @@
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/array.hpp"
+#include "duckdb/common/types/geometry_crs.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 
 namespace duckdb {
@@ -27,8 +31,12 @@ LogicalType BindDecimalType(BindLogicalTypeInput &input) {
 		if (width_value.IsNull()) {
 			throw BinderException("DECIMAL type width cannot be NULL");
 		}
-		if (width_value.DefaultTryCastAs(LogicalTypeId::UTINYINT)) {
-			width = width_value.GetValueUnsafe<uint8_t>();
+		if (!width_value.type().IsIntegral()) {
+			throw BinderException("DECIMAL type width must be an integral type");
+		}
+		auto cast_width = width_value.DefaultTryCastAs(LogicalTypeId::UTINYINT);
+		if (cast_width) {
+			width = cast_width->GetValueUnsafe<uint8_t>();
 			scale = 0; // reset scale to 0 if only width is provided
 		} else {
 			throw BinderException("DECIMAL type width must be between 1 and %d", Decimal::MAX_WIDTH_DECIMAL);
@@ -40,10 +48,14 @@ LogicalType BindDecimalType(BindLogicalTypeInput &input) {
 		if (scale_value.IsNull()) {
 			throw BinderException("DECIMAL type scale cannot be NULL");
 		}
-		if (scale_value.DefaultTryCastAs(LogicalTypeId::UTINYINT)) {
-			scale = scale_value.GetValueUnsafe<uint8_t>();
+		if (!scale_value.type().IsIntegral()) {
+			throw BinderException("DECIMAL type scale must be an integral type");
+		}
+		auto cast_scale = scale_value.DefaultTryCastAs(LogicalTypeId::UTINYINT);
+		if (cast_scale) {
+			scale = cast_scale->GetValueUnsafe<uint8_t>();
 		} else {
-			throw BinderException("DECIMAL type scale must be between 0 and %d", Decimal::MAX_WIDTH_DECIMAL - 1);
+			throw BinderException("DECIMAL type scale must be between 0 and %d", Decimal::MAX_WIDTH_DECIMAL);
 		}
 	}
 
@@ -80,8 +92,9 @@ LogicalType BindTimestampType(BindLogicalTypeInput &input) {
 		throw BinderException("TIMESTAMP type precision cannot be NULL");
 	}
 	uint8_t precision;
-	if (precision_value.DefaultTryCastAs(LogicalTypeId::UTINYINT)) {
-		precision = precision_value.GetValueUnsafe<uint8_t>();
+	auto cast_precision = precision_value.DefaultTryCastAs(LogicalTypeId::UTINYINT);
+	if (cast_precision) {
+		precision = cast_precision->GetValueUnsafe<uint8_t>();
 	} else {
 		throw BinderException("TIMESTAMP type precision must be between 0 and 9");
 	}
@@ -168,7 +181,7 @@ LogicalType BindEnumType(BindLogicalTypeInput &input) {
 	}
 
 	Vector enum_vector(LogicalType::VARCHAR, NumericCast<idx_t>(arguments.size()));
-	auto string_data = FlatVector::GetData<string_t>(enum_vector);
+	auto string_data = FlatVector::Writer<string_t>(enum_vector, arguments.size());
 
 	for (idx_t arg_idx = 0; arg_idx < arguments.size(); arg_idx++) {
 		auto &arg = arguments[arg_idx];
@@ -185,7 +198,7 @@ LogicalType BindEnumType(BindLogicalTypeInput &input) {
 			throw BinderException("ENUM type arguments cannot be NULL (argument %d is NULL)", arg_idx + 1);
 		}
 
-		string_data[arg_idx] = StringVector::AddString(enum_vector, StringValue::Get(arg.GetValue()));
+		string_data.WriteValue(string_t(StringValue::Get(arg.GetValue())));
 	}
 
 	return LogicalType::ENUM(enum_vector, NumericCast<idx_t>(arguments.size()));
@@ -234,11 +247,12 @@ LogicalType BindArrayType(BindLogicalTypeInput &input) {
 	if (!size_val.type().IsIntegral()) {
 		throw BinderException("ARRAY type size modifier must be an integral type");
 	}
-	if (!size_val.DefaultTryCastAs(LogicalTypeId::BIGINT)) {
+	auto cast_size = size_val.DefaultTryCastAs(LogicalTypeId::BIGINT);
+	if (!cast_size) {
 		throw BinderException("ARRAY type size modifier must be a BIGINT");
 	}
 
-	auto array_size = size_val.GetValueUnsafe<int64_t>();
+	auto array_size = cast_size->GetValueUnsafe<int64_t>();
 
 	if (array_size < 1) {
 		throw BinderException("ARRAY type size must be at least 1");
@@ -257,58 +271,53 @@ LogicalType BindArrayType(BindLogicalTypeInput &input) {
 LogicalType BindStructType(BindLogicalTypeInput &input) {
 	auto &arguments = input.modifiers;
 
-	if (arguments.empty()) {
-		throw BinderException("STRUCT type requires at least one child type");
-	}
+	identifier_set_t name_collision_set;
+	child_list_t<LogicalType> children;
+	children.reserve(arguments.size());
 
-	auto all_name = true;
-	auto all_anon = true;
 	for (auto &arg : arguments) {
-		if (arg.HasName()) {
-			all_anon = false;
-		} else {
-			all_name = false;
+		if (!arg.HasName()) {
+			throw BinderException("STRUCT type arguments must have names");
 		}
-
-		// Also check if all arguments are types
 		if (arg.GetValue().type() != LogicalTypeId::TYPE) {
 			throw BinderException("STRUCT type arguments must be types");
 		}
-
-		// And not null!
 		if (arg.GetValue().IsNull()) {
 			throw BinderException("STRUCT type arguments cannot be NULL");
 		}
-	}
 
-	if (!all_name && !all_anon) {
-		throw BinderException("STRUCT type arguments must either all have names or all be anonymous");
-	}
-
-	if (all_anon) {
-		// Unnamed struct case
-		child_list_t<LogicalType> children;
-		for (auto &arg : arguments) {
-			children.emplace_back("", TypeValue::GetType(arg.GetValue()));
+		auto name = Identifier(arg.GetName());
+		if (name_collision_set.find(name) != name_collision_set.end()) {
+			throw BinderException("Duplicate STRUCT type argument name \"%s\"", name);
 		}
-		return LogicalType::STRUCT(std::move(children));
-	}
 
-	// Named struct case
-	D_ASSERT(all_name);
-	child_list_t<LogicalType> children;
-	case_insensitive_set_t name_collision_set;
-
-	for (auto &arg : arguments) {
-		auto &child_name = arg.GetName();
-		if (name_collision_set.find(child_name) != name_collision_set.end()) {
-			throw BinderException("Duplicate STRUCT type argument name \"%s\"", child_name);
-		}
-		name_collision_set.insert(child_name);
-		children.emplace_back(child_name, TypeValue::GetType(arg.GetValue()));
+		children.emplace_back(std::move(name), TypeValue::GetType(arg.GetValue()));
 	}
 
 	return LogicalType::STRUCT(std::move(children));
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+// TUPLE Type
+//----------------------------------------------------------------------------------------------------------------------
+LogicalType BindTupleType(BindLogicalTypeInput &input) {
+	auto &arguments = input.modifiers;
+
+	vector<LogicalType> children;
+	children.reserve(arguments.size());
+	for (auto &arg : arguments) {
+		if (arg.HasName()) {
+			throw BinderException("TUPLE type arguments cannot have names - use STRUCT for named fields");
+		}
+		if (arg.GetValue().type() != LogicalTypeId::TYPE) {
+			throw BinderException("TUPLE type arguments must be types");
+		}
+		if (arg.GetValue().IsNull()) {
+			throw BinderException("TUPLE type arguments cannot be NULL");
+		}
+		children.push_back(TypeValue::GetType(arg.GetValue()));
+	}
+	return LogicalType::TUPLE(std::move(children));
 }
 
 //----------------------------------------------------------------------------------------------------------------------
@@ -355,7 +364,7 @@ LogicalType BindUnionType(BindLogicalTypeInput &input) {
 	}
 
 	child_list_t<LogicalType> children;
-	case_insensitive_set_t name_collision_set;
+	identifier_set_t name_collision_set;
 
 	for (auto &arg : arguments) {
 		if (!arg.HasName()) {
@@ -371,11 +380,11 @@ LogicalType BindUnionType(BindLogicalTypeInput &input) {
 		auto &entry_name = arg.GetName();
 		auto entry_type = TypeValue::GetType(arg.GetValue());
 
-		if (name_collision_set.find(entry_name) != name_collision_set.end()) {
+		if (name_collision_set.find(Identifier(entry_name)) != name_collision_set.end()) {
 			throw BinderException("Duplicate UNION type member name \"%s\"", entry_name);
 		}
 
-		name_collision_set.insert(entry_name);
+		name_collision_set.insert(Identifier(entry_name));
 		children.emplace_back(entry_name, entry_type);
 	}
 
@@ -423,7 +432,28 @@ LogicalType BindGeometryType(BindLogicalTypeInput &input) {
 	// FIXME: Use extension/ClientContext to expand incomplete/shorthand CRS definitions
 	auto &crs = StringValue::Get(crs_value);
 
-	return LogicalType::GEOMETRY(crs);
+	if (!input.context) {
+		throw BinderException("Cannot create GEOMETRY type with coordinate system without a connection");
+	}
+
+	const auto crs_result = CoordinateReferenceSystem::TryIdentify(*input.context, crs);
+	if (!crs_result) {
+		if (Settings::Get<IgnoreUnknownCrsSetting>(*input.context)) {
+			// Ignored by user configuration - return generic GEOMETRY type
+			return LogicalType::GEOMETRY();
+		}
+
+		throw BinderException(
+		    "Encountered unrecognized coordinate system '%s' when trying to create GEOMETRY type\n"
+		    "The coordinate system definition may be incomplete or invalid. Your options are as follows:\n"
+		    "* Load an extension that can identify this coordinate system\n"
+		    "* Provide a full coordinate system definition in e.g. \"PROJJSON\" or \"WKT2\" format\n"
+		    "* Set the 'ignore_unknown_crs' configuration option to drop the coordinate system from the resulting "
+		    "geometry type and make this error go away",
+		    crs);
+	}
+
+	return LogicalType::GEOMETRY(crs_result->GetDefinition());
 }
 
 //----------------------------------------------------------------------------------------------------------------------
@@ -436,7 +466,7 @@ struct DefaultType {
 	bind_logical_type_function_t bind_function;
 };
 
-using builtin_type_array = std::array<DefaultType, 81>;
+using builtin_type_array = std::array<DefaultType, 83>;
 
 const builtin_type_array BUILTIN_TYPES = {{{"decimal", LogicalTypeId::DECIMAL, BindDecimalType},
                                            {"dec", LogicalTypeId::DECIMAL, BindDecimalType},
@@ -452,6 +482,7 @@ const builtin_type_array BUILTIN_TYPES = {{{"decimal", LogicalTypeId::DECIMAL, B
                                            {"timestamp_s", LogicalTypeId::TIMESTAMP_SEC, nullptr},
                                            {"timestamptz", LogicalTypeId::TIMESTAMP_TZ, nullptr},
                                            {"timestamp with time zone", LogicalTypeId::TIMESTAMP_TZ, nullptr},
+                                           {"timestamptz_ns", LogicalTypeId::TIMESTAMP_TZ_NS, nullptr},
                                            {"timetz", LogicalTypeId::TIME_TZ, nullptr},
                                            {"time with time zone", LogicalTypeId::TIME_TZ, nullptr},
                                            {"interval", LogicalTypeId::INTERVAL, BindIntervalType},
@@ -496,6 +527,7 @@ const builtin_type_array BUILTIN_TYPES = {{{"decimal", LogicalTypeId::DECIMAL, B
                                            {"uint8", LogicalTypeId::UTINYINT, nullptr},
                                            {"struct", LogicalTypeId::STRUCT, BindStructType},
                                            {"row", LogicalTypeId::STRUCT, BindStructType},
+                                           {"tuple", LogicalTypeId::TUPLE, BindTupleType},
                                            {"list", LogicalTypeId::LIST, BindListType},
                                            {"array", LogicalTypeId::ARRAY, BindArrayType},
                                            {"map", LogicalTypeId::MAP, BindMapType},
@@ -520,10 +552,10 @@ const builtin_type_array BUILTIN_TYPES = {{{"decimal", LogicalTypeId::DECIMAL, B
                                            {"geometry", LogicalTypeId::GEOMETRY, BindGeometryType},
                                            {"type", LogicalTypeId::TYPE, nullptr}}};
 
-optional_ptr<const DefaultType> TryGetDefaultTypeEntry(const string &name) {
+optional_ptr<const DefaultType> TryGetDefaultTypeEntry(const Identifier &name) {
 	auto &internal_types = BUILTIN_TYPES;
 	for (auto &type : internal_types) {
-		if (StringUtil::CIEquals(name, type.name)) {
+		if (name == type.name) {
 			return &type;
 		}
 	}
@@ -535,10 +567,10 @@ optional_ptr<const DefaultType> TryGetDefaultTypeEntry(const string &name) {
 //----------------------------------------------------------------------------------------------------------------------
 // Default Type Generator
 //----------------------------------------------------------------------------------------------------------------------
-LogicalTypeId DefaultTypeGenerator::GetDefaultType(const string &name) {
+LogicalTypeId DefaultTypeGenerator::GetDefaultType(const Identifier &name) {
 	auto &internal_types = BUILTIN_TYPES;
 	for (auto &type : internal_types) {
-		if (StringUtil::CIEquals(name, type.name)) {
+		if (name == type.name) {
 			return type.type;
 		}
 	}
@@ -546,7 +578,7 @@ LogicalTypeId DefaultTypeGenerator::GetDefaultType(const string &name) {
 }
 
 LogicalType DefaultTypeGenerator::TryDefaultBind(const string &name, const vector<pair<string, Value>> &params) {
-	auto entry = TryGetDefaultTypeEntry(name);
+	auto entry = TryGetDefaultTypeEntry(Identifier(name));
 	if (!entry) {
 		return LogicalTypeId::INVALID;
 	}
@@ -555,7 +587,7 @@ LogicalType DefaultTypeGenerator::TryDefaultBind(const string &name, const vecto
 		if (params.empty()) {
 			return LogicalType(entry->type);
 		} else {
-			throw InvalidInputException("Type '%s' does not take any type parameters", name);
+			throw InvalidInputException("Type %s does not take any type parameters", name);
 		}
 	}
 
@@ -572,7 +604,8 @@ DefaultTypeGenerator::DefaultTypeGenerator(Catalog &catalog, SchemaCatalogEntry 
     : DefaultGenerator(catalog), schema(schema) {
 }
 
-unique_ptr<CatalogEntry> DefaultTypeGenerator::CreateDefaultEntry(ClientContext &context, const string &entry_name) {
+unique_ptr<CatalogEntry> DefaultTypeGenerator::CreateDefaultEntry(ClientContext &context,
+                                                                  const Identifier &entry_name) {
 	if (schema.name != DEFAULT_SCHEMA) {
 		return nullptr;
 	}
@@ -581,7 +614,7 @@ unique_ptr<CatalogEntry> DefaultTypeGenerator::CreateDefaultEntry(ClientContext 
 		return nullptr;
 	}
 	CreateTypeInfo info;
-	info.name = entry_name;
+	info.SetTypeName(entry_name);
 	info.type = LogicalType(entry->type);
 	info.internal = true;
 	info.temporary = true;
@@ -589,8 +622,8 @@ unique_ptr<CatalogEntry> DefaultTypeGenerator::CreateDefaultEntry(ClientContext 
 	return make_uniq_base<CatalogEntry, TypeCatalogEntry>(catalog, schema, info);
 }
 
-vector<string> DefaultTypeGenerator::GetDefaultEntries() {
-	vector<string> result;
+vector<Identifier> DefaultTypeGenerator::GetDefaultEntries() {
+	vector<Identifier> result;
 	if (schema.name != DEFAULT_SCHEMA) {
 		return result;
 	}

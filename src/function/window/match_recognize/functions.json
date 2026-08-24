@@ -1,0 +1,20 @@
+[
+    {
+        "name": "match_recognize",
+        "parameters": "defines,pattern",
+        "description": "Internal window function implementing row pattern matching for MATCH_RECOGNIZE",
+        "example": "MATCH_RECOGNIZE(PATTERN (A B) DEFINE A AS x > 0, B AS y > 0)",
+        "categories": "",
+
+        "type": "window_function"
+    },
+    {
+        "name": "non_overlap_intervals",
+        "parameters": "low,high,inclusive",
+        "description": "Internal window function selecting the non-overlapping intervals of a partition",
+        "example": "non_overlap_intervals(match_start, match_end, false) OVER (PARTITION BY p)",
+        "categories": "",
+
+        "type": "window_function"
+    }
+]

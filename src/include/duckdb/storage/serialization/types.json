@@ -125,37 +125,30 @@
     ]
   },
   {
-    "class": "AggregateStateTypeInfo",
+    "class": "LegacyAggregateStateTypeInfo",
     "base": "ExtraTypeInfo",
-    "enum": "AGGREGATE_STATE_TYPE_INFO",
+    "enum": "LEGACY_AGGREGATE_STATE_TYPE_INFO",
     "members": [
       {
         "id": 200,
         "name": "function_name",
         "type": "string",
-        "property": "state_type.function_name"
+        "status": "deleted"
       },
       {
         "id": 201,
         "name": "return_type",
         "type": "LogicalType",
-        "property": "state_type.return_type"
+        "status": "deleted"
       },
       {
         "id": 202,
         "name": "bound_argument_types",
         "type": "vector<LogicalType>",
-        "property": "state_type.bound_argument_types"
-      },
-      {
-        "id": 203,
-        "name": "state_type",
-        "type": "LogicalType",
-        "property": "state_type.state_type",
-        "default": "LogicalTypeId::INVALID",
-        "version": "v1.5.0"
+        "status": "deleted"
       }
-    ]
+    ],
+    "constructor_method": "LegacyAggregateStateTypeInfo::LegacyDeserialize"
   },
   {
     "class": "ArrayTypeInfo",

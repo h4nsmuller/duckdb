@@ -4,12 +4,14 @@
 #include "result_helper.hpp"
 #include "sqllogic_test_runner.hpp"
 #include "test_helpers.hpp"
+#include "duckdb/common/box_renderer.hpp"
+#include "duckdb/common/box_renderer_context.hpp"
 
 namespace duckdb {
 
 SQLLogicTestLogger::SQLLogicTestLogger(ExecuteContext &context, const Command &command)
-    : log_lock(command.runner.log_lock), file_name(command.file_name), query_line(command.query_line),
-      sql_query(context.sql_query) {
+    : connection(command.CommandConnection(context)), log_lock(command.runner.log_lock), file_name(command.file_name),
+      query_line(command.query_line), sql_query(context.sql_query) {
 }
 
 SQLLogicTestLogger::~SQLLogicTestLogger() {
@@ -24,6 +26,13 @@ void SQLLogicTestLogger::AppendFailure(const string &log_message) {
 	FailureSummary::Log(log_message);
 }
 
+void SQLLogicTestLogger::EmitTestEvent(const string &json_payload) {
+	// The "[TEST_EVENT] " flare marks a line as a machine-readable event; the payload is a JSON
+	// object (begin / end). Callers gate on EmitTestEventsEnabled() and pass a serialized object.
+	// Build the whole line first so it reaches cerr as a single insertion — no interleaving.
+	std::cerr << "[TEST_EVENT] " + json_payload + "\n";
+}
+
 void SQLLogicTestLogger::LogFailure(const string &log_message) {
 	Log("", log_message);
 }
@@ -33,6 +42,17 @@ void SQLLogicTestLogger::LogFailureAnnotation(const string &log_message) {
 	// check the value is "true" otherwise you'll see the prefix in local run outputs
 	auto prefix = (ci && string(ci) == "true") ? "\n::error::" : "";
 	Log(prefix, log_message);
+}
+
+void SQLLogicTestLogger::PrintSkip(const string &file_name, const string &reason) {
+	// Opt-in via --emit-on-skip (SetEmitOnSkip): off by default so normal runs stay quiet.
+	if (!EmitOnSkipEnabled()) {
+		return;
+	}
+	// Stable, uncolored marker consumable by e.g. pytest collector. Emitted to std::cerr
+	// (which survives subprocess capture) per skipped test, so skips are attributable
+	// even inside a batched invocation.
+	std::cerr << "[SKIP_TEST] " << file_name << " :: " << reason << "\n";
 }
 
 void SQLLogicTestLogger::PrintSummaryHeader(const std::string &file_name, idx_t query_line) {
@@ -157,8 +177,19 @@ void SQLLogicTestLogger::PrintResultError(const vector<string> &result_values, c
 	PrintExpectedResult(result_values, expected_column_count, false);
 }
 
+string SQLLogicTestLogger::ResultToString(MaterializedQueryResult &result) {
+	if (result.RowCount() < 100) {
+		return result.ToString();
+	}
+	BoxRendererConfig config;
+	config.max_rows = 100;
+	config.max_width = -1;
+	ClientBoxRendererContext render_context(*connection.context);
+	return result.ToBox(render_context, config);
+}
+
 void SQLLogicTestLogger::PrintResultString(MaterializedQueryResult &result) {
-	LogFailure(result.ToString());
+	LogFailure(ResultToString(result));
 }
 
 void SQLLogicTestLogger::PrintResultError(MaterializedQueryResult &result, const vector<string> &values,
@@ -189,7 +220,7 @@ void SQLLogicTestLogger::OutputResult(MaterializedQueryResult &result, const vec
 		if (c != 0) {
 			LogFailure("\t");
 		}
-		LogFailure(result.names[c]);
+		LogFailure(result.ColumnName(c).GetIdentifierName());
 	}
 	LogFailure("\n");
 	// types
@@ -197,7 +228,7 @@ void SQLLogicTestLogger::OutputResult(MaterializedQueryResult &result, const vec
 		if (c != 0) {
 			LogFailure("\t");
 		}
-		LogFailure(result.types[c].ToString());
+		LogFailure(result.GetTypes()[c].ToString());
 	}
 	LogFailure("\n");
 	PrintLineSep();
@@ -294,19 +325,18 @@ void SQLLogicTestLogger::SplitMismatch(idx_t row_number, idx_t expected_column_c
 	PrintLineSep();
 }
 
-void SQLLogicTestLogger::WrongResultHash(QueryResult *expected_result, MaterializedQueryResult &result,
+void SQLLogicTestLogger::WrongResultHash(const string &expected_result, MaterializedQueryResult &result,
                                          const string &expected_hash, const string &actual_hash) {
-	if (expected_result) {
-		expected_result->Print();
-		expected_result->ToString();
-	} else {
-		LogFailure("???\n");
-	}
 	PrintErrorHeader("Wrong result hash!");
 	PrintLineSep();
 	PrintSQL();
 	PrintLineSep();
 	PrintHeader("Expected result:");
+	if (!expected_result.empty()) {
+		LogFailure(expected_result);
+	} else {
+		LogFailure("???\n");
+	}
 	PrintLineSep();
 	PrintHeader("Actual result:");
 	PrintLineSep();

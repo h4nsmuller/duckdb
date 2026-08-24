@@ -9,10 +9,11 @@ namespace duckdb {
 
 void PhysicalReset::ResetExtensionVariable(ExecutionContext &context, DBConfig &config,
                                            ExtensionOption &extension_option) const {
+	auto effective_scope = scope == SetScope::AUTOMATIC ? extension_option.default_scope : scope;
 	if (extension_option.set_function) {
-		extension_option.set_function(context.client, scope, extension_option.default_value);
+		extension_option.set_function(context.client, effective_scope, extension_option.default_value);
 	}
-	if (scope == SetScope::GLOBAL) {
+	if (effective_scope == SetScope::GLOBAL) {
 		config.ResetOption(extension_option);
 	} else {
 		auto &client_config = ClientConfig::GetConfig(context.client);
@@ -29,14 +30,15 @@ SourceResultType PhysicalReset::GetDataInternal(ExecutionContext &context, DataC
 		return SourceResultType::FINISHED;
 	}
 	auto &config = DBConfig::GetConfig(context.client);
-	config.CheckLock(name);
-	auto option = DBConfig::GetOptionByName(name);
+	Identifier option_name(name.ToStdString());
+	config.CheckLock(option_name);
+	auto option = DBConfig::GetOptionByName(option_name);
 	if (!option) {
 		// check if this is an extra extension variable
 		ExtensionOption extension_option;
-		if (!config.TryGetExtensionOption(name, extension_option)) {
-			auto extension_name = Catalog::AutoloadExtensionByConfigName(context.client, name);
-			if (!config.TryGetExtensionOption(name, extension_option)) {
+		if (!config.TryGetExtensionOption(option_name, extension_option)) {
+			auto extension_name = Catalog::AutoloadExtensionByConfigName(context.client, option_name);
+			if (!config.TryGetExtensionOption(option_name, extension_option)) {
 				throw InvalidInputException("Extension parameter %s was not found after autoloading", name);
 			}
 		}

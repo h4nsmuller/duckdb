@@ -4,6 +4,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/helper.hpp"
+#include "duckdb/common/memory_mapped_file.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/windows.hpp"
 #include "duckdb/function/scalar/string_common.hpp"
@@ -16,11 +17,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <sys/stat.h>
+#include <type_traits>
 
 #ifndef _WIN32
 #include <dirent.h>
 #include <fcntl.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
 #else
@@ -62,13 +65,14 @@ extern "C" WINBASEAPI BOOL QueryFullProcessImageNameW(HANDLE, DWORD, LPWSTR, PDW
 #endif
 
 namespace duckdb {
+
 #ifndef _WIN32
 bool LocalFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
 	if (!filename.empty()) {
-		auto normalized_file = NormalizeLocalPath(filename);
-		if (access(normalized_file, 0) == 0) {
+		auto normalized_file = ExpandPath(filename, opener);
+		if (access(normalized_file.c_str(), 0) == 0) {
 			struct stat status;
-			stat(normalized_file, &status);
+			stat(normalized_file.c_str(), &status);
 			if (S_ISREG(status.st_mode)) {
 				return true;
 			}
@@ -80,10 +84,10 @@ bool LocalFileSystem::FileExists(const string &filename, optional_ptr<FileOpener
 
 bool LocalFileSystem::IsPipe(const string &filename, optional_ptr<FileOpener> opener) {
 	if (!filename.empty()) {
-		auto normalized_file = NormalizeLocalPath(filename);
-		if (access(normalized_file, 0) == 0) {
+		auto normalized_file = ExpandPath(filename, opener);
+		if (access(normalized_file.c_str(), 0) == 0) {
 			struct stat status;
-			stat(normalized_file, &status);
+			stat(normalized_file.c_str(), &status);
 			if (S_ISFIFO(status.st_mode)) {
 				return true;
 			}
@@ -94,24 +98,77 @@ bool LocalFileSystem::IsPipe(const string &filename, optional_ptr<FileOpener> op
 }
 
 #else
-static std::wstring NormalizePathAndConvertToUnicode(const string &path) {
-	string normalized_path_copy;
-	const char *normalized_path;
-	if (StringUtil::StartsWith(path, "file:/")) {
-		normalized_path_copy = LocalFileSystem::NormalizeLocalPath(path);
-		normalized_path_copy = LocalFileSystem().ConvertSeparators(normalized_path_copy);
-		normalized_path = normalized_path_copy.c_str();
-	} else {
-		normalized_path = path.c_str();
+
+// Maximum length of a path that does not require a long path prefix or
+// LongPathsEnabled setting along with longPathAware manifest.
+// For files the limit is 260 - 1 characters.
+// Directories additionally must be able to create 8+3 files inside them.
+// The limit applies to fully resolved absolute paths.
+static const size_t WINDOWS_MAX_SHORT_PATH = 247;
+static const size_t WINDOWS_MAX_LONG_PATH = 32000;
+static const std::wstring WINDOWS_LOCAL_LONG_PATH_PREFIX = L"\\\\?\\";
+static const std::wstring WINDOWS_UNC_LONG_PATH_PREFIX = L"\\\\?\\UNC\\";
+
+static std::wstring ConvertPathToUnicode(const string &path) {
+	return WindowsUtil::UTF8ToUnicode(path.c_str());
+}
+
+static std::wstring ConvertPathToNormalizedAbsolute(const std::wstring &path) {
+	// len includes NULL-terminator
+	DWORD len = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+	if (len == 0) {
+		string error = LocalFileSystem::GetLastErrorAsString();
+		string utf8_path = WindowsUtil::UnicodeToUTF8(path.c_str());
+		throw IOException("Failed to get length for normalized path \"%s\": %s", utf8_path, error);
 	}
-	return WindowsUtil::UTF8ToUnicode(normalized_path);
+
+	std::vector<wchar_t> buf;
+	buf.resize(len);
+
+	// written does NOT include NULL-terminator
+	DWORD written = GetFullPathNameW(path.c_str(), len, buf.data(), nullptr);
+	if (written == 0) {
+		string error = LocalFileSystem::GetLastErrorAsString();
+		string utf8_path = WindowsUtil::UnicodeToUTF8(path.c_str());
+		throw IOException("Failed to normalize path \"%s\", length: %lu: %s", utf8_path, len, error);
+	}
+
+	return std::wstring(buf.data(), written);
+}
+
+static std::wstring NormalizePathAndConvertToUnicode(FileSystem &fs, const string &path,
+                                                     optional_ptr<FileOpener> opener) {
+	string normalized_path = fs.ExpandPath(path, opener);
+	std::wstring unicode_path = ConvertPathToUnicode(normalized_path);
+
+	// We need to get absolute path to check the length. Normalizing it (removing "." and "..",
+	// flipping forward slashes) is only required if the path is long.
+	// We are doing it for all paths to not perform current working dir resolving twice.
+	std::wstring abs_path = ConvertPathToNormalizedAbsolute(unicode_path);
+
+	if (abs_path.length() <= WINDOWS_MAX_SHORT_PATH || abs_path.find(WINDOWS_LOCAL_LONG_PATH_PREFIX) == 0 ||
+	    abs_path.find(WINDOWS_UNC_LONG_PATH_PREFIX) == 0) {
+		return abs_path;
+	}
+
+	if (abs_path.length() > WINDOWS_MAX_LONG_PATH) {
+		string resolved_path = WindowsUtil::UnicodeToUTF8(abs_path.c_str());
+		throw IOException("Path is longer than Windows MAX_PATH, length: %zu, beginning: %s[...]", abs_path.length(),
+		                  resolved_path.substr(0, 100));
+	}
+
+	if (abs_path.find(L"\\\\") == 0) {
+		return WINDOWS_UNC_LONG_PATH_PREFIX + abs_path;
+	}
+
+	return WINDOWS_LOCAL_LONG_PATH_PREFIX + abs_path;
 }
 
 bool LocalFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
-	auto unicode_path = NormalizePathAndConvertToUnicode(filename);
+	auto unicode_path = NormalizePathAndConvertToUnicode(*this, filename, opener);
 	const wchar_t *wpath = unicode_path.c_str();
 	if (_waccess(wpath, 0) == 0) {
-		struct _stati64 status;
+		struct _stati64 status; // typos:ignore
 		_wstati64(wpath, &status);
 		if (status.st_mode & S_IFREG) {
 			return true;
@@ -120,10 +177,10 @@ bool LocalFileSystem::FileExists(const string &filename, optional_ptr<FileOpener
 	return false;
 }
 bool LocalFileSystem::IsPipe(const string &filename, optional_ptr<FileOpener> opener) {
-	auto unicode_path = NormalizePathAndConvertToUnicode(filename);
+	auto unicode_path = NormalizePathAndConvertToUnicode(*this, filename, opener);
 	const wchar_t *wpath = unicode_path.c_str();
 	if (_waccess(wpath, 0) == 0) {
-		struct _stati64 status;
+		struct _stati64 status; // typos:ignore
 		_wstati64(wpath, &status);
 		if (status.st_mode & _S_IFCHR) {
 			return true;
@@ -146,14 +203,15 @@ bool LocalFileSystem::IsPipe(const string &filename, optional_ptr<FileOpener> op
 
 struct UnixFileHandle : public FileHandle {
 public:
-	UnixFileHandle(FileSystem &file_system, string path, int fd, FileOpenFlags flags)
-	    : FileHandle(file_system, std::move(path), flags), fd(fd) {
+	UnixFileHandle(FileSystem &file_system, string path, int fd, FileOpenFlags flags, optional_ptr<DatabaseInstance> db)
+	    : FileHandle(file_system, std::move(path), flags), fd(fd), db(db) {
 	}
 	~UnixFileHandle() override {
 		UnixFileHandle::Close();
 	}
 
 	int fd;
+	optional_ptr<DatabaseInstance> db;
 
 	// Kept for logging purposes
 	idx_t current_pos = 0;
@@ -168,16 +226,19 @@ public:
 	};
 };
 
-static FileMetadata StatsInternal(int fd, const string &path) {
-	struct stat s;
-	if (fstat(fd, &s) == -1) {
-		throw IOException({{"errno", std::to_string(errno)}}, "Failed to get stats for file \"%s\": %s", path,
-		                  strerror(errno));
+static void CloseFileAndAppendError(int fd, string &extended_error) {
+	if (close(fd) == -1) {
+		extended_error += ". Also, failed closing file: ";
+		extended_error += strerror(errno);
 	}
+}
 
+static FileMetadata StatsFromStruct(struct stat s) {
 	FileMetadata file_metadata;
 	file_metadata.file_size = s.st_size;
 	file_metadata.last_modification_time = Timestamp::FromEpochSeconds(s.st_mtime);
+	file_metadata.device_id = static_cast<idx_t>(s.st_dev);
+	file_metadata.file_id = static_cast<idx_t>(s.st_ino);
 
 	switch (s.st_mode & S_IFMT) {
 	case S_IFBLK:
@@ -207,7 +268,16 @@ static FileMetadata StatsInternal(int fd, const string &path) {
 	}
 
 	return file_metadata;
-} // LCOV_EXCL_STOP
+}
+
+static FileMetadata StatsInternal(int fd, const string &path) {
+	struct stat s;
+	if (fstat(fd, &s) == -1) {
+		throw IOException({{"errno", std::to_string(errno)}}, "Failed to get stats for file \"%s\": %s", path,
+		                  strerror(errno));
+	}
+	return StatsFromStruct(s);
+}
 
 #if __APPLE__ && !TARGET_OS_IPHONE
 
@@ -296,16 +366,73 @@ static string AdditionalProcessInfo(FileSystem &fs, pid_t pid) {
 }
 #endif
 
+// Apply a fcntl advisory lock per flags.Lock(); throws (and closes fd) on failure. Shared
+// by OpenFile and MemoryMapFile.
+static void TryAcquireFileLock(FileSystem &fs, int fd, const string &path, FileOpenFlags flags) {
+	if (flags.Lock() == FileLockType::NO_LOCK) {
+		return;
+	}
+	// only attempt locking on regular files (not FIFOs/sockets)
+	auto file_type = StatsInternal(fd, path).file_type;
+	if (file_type == FileType::FILE_TYPE_FIFO || file_type == FileType::FILE_TYPE_SOCKET) {
+		return;
+	}
+	struct flock fl;
+	memset(&fl, 0, sizeof fl);
+	fl.l_type = flags.Lock() == FileLockType::READ_LOCK ? F_RDLCK : F_WRLCK;
+	fl.l_whence = SEEK_SET;
+	fl.l_start = 0;
+	fl.l_len = 0;
+	int rc = fcntl(fd, F_SETLK, &fl);
+	int retained_errno = errno;
+	bool has_error = rc == -1;
+	string extended_error;
+	if (has_error) {
+		if (retained_errno == ENOTSUP) {
+			if (flags.Lock() == FileLockType::READ_LOCK) {
+				// file lock not supported here; ignore for read-only
+				return;
+			}
+			extended_error = "File locks are not supported for this file system, cannot open the file in "
+			                 "read-write mode. Try opening the file in read-only mode";
+		}
+	}
+	if (!has_error) {
+		return;
+	}
+	if (extended_error.empty()) {
+		// who is holding the lock?
+		rc = fcntl(fd, F_GETLK, &fl);
+		if (rc == -1) {
+			extended_error = strerror(errno);
+		} else {
+			extended_error = AdditionalProcessInfo(fs, fl.l_pid);
+		}
+		if (flags.Lock() == FileLockType::WRITE_LOCK) {
+			// could we get a read lock?
+			fl.l_type = F_RDLCK;
+			rc = fcntl(fd, F_SETLK, &fl);
+			if (rc != -1) {
+				extended_error += ". However, you would be able to open this database in read-only mode, e.g. by "
+				                  "using the -readonly parameter in the CLI";
+			}
+		}
+	}
+	CloseFileAndAppendError(fd, extended_error);
+	extended_error += ". See also https://duckdb.org/docs/current/connect/concurrency";
+	throw IOException({{"errno", std::to_string(retained_errno)}}, "Could not set lock on file \"%s\": %s", path,
+	                  extended_error);
+}
+
 bool LocalFileSystem::IsPrivateFile(const string &path_p, FileOpener *opener) {
 	auto path = FileSystem::ExpandPath(path_p, opener);
-	auto normalized_path = NormalizeLocalPath(path);
 
 	struct stat st;
 
-	if (lstat(normalized_path, &st) != 0) {
+	if (lstat(path.c_str(), &st) != 0) {
 		throw IOException(
 		    "Failed to stat '%s' when checking file permissions, file may be missing or have incorrect permissions",
-		    path.c_str());
+		    path_p.c_str());
 	}
 
 	// If group or other have any permission, the file is not private
@@ -318,8 +445,7 @@ bool LocalFileSystem::IsPrivateFile(const string &path_p, FileOpener *opener) {
 
 unique_ptr<FileHandle> LocalFileSystem::OpenFile(const string &path_p, FileOpenFlags flags,
                                                  optional_ptr<FileOpener> opener) {
-	auto path = FileSystem::ExpandPath(path_p, opener);
-	auto normalized_path = NormalizeLocalPath(path);
+	auto path = ExpandPath(path_p, opener);
 	if (flags.Compression() != FileCompressionType::UNCOMPRESSED) {
 		throw NotImplementedException("Unsupported compression type for default file system");
 	}
@@ -327,7 +453,6 @@ unique_ptr<FileHandle> LocalFileSystem::OpenFile(const string &path_p, FileOpenF
 	flags.Verify();
 
 	int open_flags = 0;
-	int rc;
 	bool open_read = flags.OpenForReading();
 	bool open_write = flags.OpenForWriting();
 	if (open_read && open_write) {
@@ -377,7 +502,7 @@ unique_ptr<FileHandle> LocalFileSystem::OpenFile(const string &path_p, FileOpenF
 	}
 
 	// Open the file
-	int fd = open(normalized_path, open_flags, filesec);
+	int fd = open(path.c_str(), open_flags, filesec);
 
 	if (fd == -1) {
 		if (flags.ReturnNullIfNotExists() && errno == ENOENT) {
@@ -392,74 +517,20 @@ unique_ptr<FileHandle> LocalFileSystem::OpenFile(const string &path_p, FileOpenF
 #if defined(__DARWIN__) || defined(__APPLE__)
 	if (flags.DirectIO()) {
 		// OSX requires fcntl for Direct IO
-		rc = fcntl(fd, F_NOCACHE, 1);
+		int rc = fcntl(fd, F_NOCACHE, 1);
 		if (rc == -1) {
-			throw IOException("Could not enable direct IO for file \"%s\": %s", path, strerror(errno));
+			int retained_errno = errno;
+			string extended_error = strerror(retained_errno);
+			CloseFileAndAppendError(fd, extended_error);
+			throw IOException({{"errno", std::to_string(retained_errno)}},
+			                  "Could not enable direct IO for file \"%s\": %s", path, extended_error);
 		}
 	}
 #endif
 
-	if (flags.Lock() != FileLockType::NO_LOCK) {
-		// set lock on file
-		// but only if it is not an input/output stream
-		auto file_type = StatsInternal(fd, path_p).file_type;
-		if (file_type != FileType::FILE_TYPE_FIFO && file_type != FileType::FILE_TYPE_SOCKET) {
-			struct flock fl;
-			memset(&fl, 0, sizeof fl);
-			fl.l_type = flags.Lock() == FileLockType::READ_LOCK ? F_RDLCK : F_WRLCK;
-			fl.l_whence = SEEK_SET;
-			fl.l_start = 0;
-			fl.l_len = 0;
-			rc = fcntl(fd, F_SETLK, &fl);
-			// Retain the original error.
-			int retained_errno = errno;
-			bool has_error = rc == -1;
-			string extended_error;
-			if (has_error) {
-				if (retained_errno == ENOTSUP) {
-					// file lock not supported for this file system
-					if (flags.Lock() == FileLockType::READ_LOCK) {
-						// for read-only, we ignore not-supported errors
-						has_error = false;
-						errno = 0;
-					} else {
-						extended_error = "File locks are not supported for this file system, cannot open the file in "
-						                 "read-write mode. Try opening the file in read-only mode";
-					}
-				}
-			}
-			if (has_error) {
-				if (extended_error.empty()) {
-					// try to find out who is holding the lock using F_GETLK
-					rc = fcntl(fd, F_GETLK, &fl);
-					if (rc == -1) { // fnctl does not want to help us
-						extended_error = strerror(errno);
-					} else {
-						extended_error = AdditionalProcessInfo(*this, fl.l_pid);
-					}
-					if (flags.Lock() == FileLockType::WRITE_LOCK) {
-						// maybe we can get a read lock instead and tell this to the user.
-						fl.l_type = F_RDLCK;
-						rc = fcntl(fd, F_SETLK, &fl);
-						if (rc != -1) { // success!
-							extended_error +=
-							    ". However, you would be able to open this database in read-only mode, e.g. by "
-							    "using the -readonly parameter in the CLI";
-						}
-					}
-				}
-				rc = close(fd);
-				if (rc == -1) {
-					extended_error += ". Also, failed closing file";
-				}
-				extended_error += ". See also https://duckdb.org/docs/stable/connect/concurrency";
-				throw IOException({{"errno", std::to_string(retained_errno)}}, "Could not set lock on file \"%s\": %s",
-				                  path, extended_error);
-			}
-		}
-	}
+	TryAcquireFileLock(*this, fd, path, flags);
 
-	auto file_handle = make_uniq<UnixFileHandle>(*this, path, fd, flags);
+	auto file_handle = make_uniq<UnixFileHandle>(*this, path, fd, flags, FileOpener::TryGetDatabase(opener));
 	if (opener) {
 		file_handle->TryAddLogger(*opener);
 		DUCKDB_LOG_FILE_SYSTEM_OPEN((*file_handle));
@@ -488,7 +559,8 @@ idx_t LocalFileSystem::GetFilePointer(FileHandle &handle) {
 
 void LocalFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto bytes_to_read = nr_bytes;
-	int fd = handle.Cast<UnixFileHandle>().fd;
+	auto &unix_handle = handle.Cast<UnixFileHandle>();
+	int fd = unix_handle.fd;
 	auto read_buffer = char_ptr_cast(buffer);
 	while (nr_bytes > 0) {
 		int64_t bytes_read =
@@ -526,7 +598,8 @@ int64_t LocalFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes
 }
 
 void LocalFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
-	int fd = handle.Cast<UnixFileHandle>().fd;
+	auto &unix_handle = handle.Cast<UnixFileHandle>();
+	int fd = unix_handle.fd;
 	auto write_buffer = char_ptr_cast(buffer);
 
 	auto bytes_to_write = nr_bytes;
@@ -576,19 +649,24 @@ int64_t LocalFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_byte
 }
 
 bool LocalFileSystem::Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) {
+	bool trimmed = false;
+#if defined(DUCKDB_RUN_SLOW_VERIFIERS) || defined(DUCKDB_ALTERNATIVE_VERIFY)
+	std::vector<char> zeros(length_bytes, '\0');
+	Write(handle, zeros.data(), length_bytes, offset_bytes);
+	trimmed = true;
+#endif
 #if defined(__linux__)
 	// FALLOC_FL_PUNCH_HOLE requires glibc 2.18 or up
 #if __GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 18)
-	return false;
+	// Nothing
 #else
 	int fd = handle.Cast<UnixFileHandle>().fd;
 	int res = fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, UnsafeNumericCast<int64_t>(offset_bytes),
 	                    UnsafeNumericCast<int64_t>(length_bytes));
-	return res == 0;
+	trimmed = (res == 0);
 #endif
-#else
-	return false;
 #endif
+	return trimmed;
 }
 
 int64_t LocalFileSystem::GetFileSize(FileHandle &handle) {
@@ -622,10 +700,10 @@ void LocalFileSystem::Truncate(FileHandle &handle, int64_t new_size) {
 
 bool LocalFileSystem::DirectoryExists(const string &directory, optional_ptr<FileOpener> opener) {
 	if (!directory.empty()) {
-		auto normalized_dir = NormalizeLocalPath(directory);
-		if (access(normalized_dir, 0) == 0) {
+		auto normalized_dir = ExpandPath(directory, opener);
+		if (access(normalized_dir.c_str(), 0) == 0) {
 			struct stat status;
-			stat(normalized_dir, &status);
+			stat(normalized_dir.c_str(), &status);
 			if (S_ISDIR(status.st_mode)) {
 				return true;
 			}
@@ -638,10 +716,10 @@ bool LocalFileSystem::DirectoryExists(const string &directory, optional_ptr<File
 void LocalFileSystem::CreateDirectory(const string &directory, optional_ptr<FileOpener> opener) {
 	struct stat st;
 
-	auto normalized_dir = NormalizeLocalPath(directory);
-	if (stat(normalized_dir, &st) != 0) {
+	auto normalized_dir = ExpandPath(directory, opener);
+	if (stat(normalized_dir.c_str(), &st) != 0) {
 		/* Directory does not exist. EEXIST for race condition */
-		if (mkdir(normalized_dir, 0755) != 0 && errno != EEXIST) {
+		if (mkdir(normalized_dir.c_str(), 0755) != 0 && errno != EEXIST) {
 			throw IOException({{"errno", std::to_string(errno)}}, "Failed to create directory \"%s\": %s", directory,
 			                  strerror(errno));
 		}
@@ -692,13 +770,13 @@ int RemoveDirectoryRecursive(const char *path) {
 }
 
 void LocalFileSystem::RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener) {
-	auto normalized_dir = NormalizeLocalPath(directory);
-	RemoveDirectoryRecursive(normalized_dir);
+	auto normalized_dir = ExpandPath(directory, opener);
+	RemoveDirectoryRecursive(normalized_dir.c_str());
 }
 
 void LocalFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
-	auto normalized_file = NormalizeLocalPath(filename);
-	if (std::remove(normalized_file) != 0) {
+	auto normalized_file = ExpandPath(filename, opener);
+	if (std::remove(normalized_file.c_str()) != 0) {
 		throw IOException({{"errno", std::to_string(errno)}}, "Could not remove file \"%s\": %s", filename,
 		                  strerror(errno));
 	}
@@ -707,8 +785,8 @@ void LocalFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener
 bool LocalFileSystem::ListFilesExtended(const string &directory,
                                         const std::function<void(OpenFileInfo &info)> &callback,
                                         optional_ptr<FileOpener> opener) {
-	auto normalized_dir = NormalizeLocalPath(directory);
-	auto dir = opendir(normalized_dir);
+	auto normalized_dir = ExpandPath(directory, opener);
+	auto dir = opendir(normalized_dir.c_str());
 	if (!dir) {
 		return false;
 	}
@@ -741,11 +819,10 @@ bool LocalFileSystem::ListFilesExtended(const string &directory,
 		auto &options = info.extended_info->options;
 		// file type
 		Value file_type(S_ISDIR(status.st_mode) ? "directory" : "file");
+		auto file_metadata = StatsFromStruct(status);
 		options.emplace("type", std::move(file_type));
-		// file size
-		options.emplace("file_size", Value::BIGINT(UnsafeNumericCast<int64_t>(status.st_size)));
-		// last modified time
-		options.emplace("last_modified", Value::TIMESTAMP(Timestamp::FromTimeT(status.st_mtime)));
+
+		FillFileOptions(file_metadata, options);
 
 		// invoke callback
 		callback(info);
@@ -785,16 +862,175 @@ void LocalFileSystem::FileSync(FileHandle &handle) {
 }
 
 void LocalFileSystem::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
-	auto normalized_source = NormalizeLocalPath(source);
-	auto normalized_target = NormalizeLocalPath(target);
+	auto normalized_source = ExpandPath(source, opener);
+	auto normalized_target = ExpandPath(target, opener);
 	//! FIXME: rename does not guarantee atomicity or overwriting target file if it exists
-	if (rename(normalized_source, normalized_target) != 0) {
-		throw IOException({{"errno", std::to_string(errno)}}, "Could not rename file!");
+	if (rename(normalized_source.c_str(), normalized_target.c_str()) != 0) {
+		throw IOException({{"errno", to_string(errno)}}, "Could not rename file \"%s\" to \"%s\": %s", source, target,
+		                  strerror(errno));
 	}
 }
 
 std::string LocalFileSystem::GetLastErrorAsString() {
 	return string();
+}
+
+bool LocalFileSystem::TryCanonicalizeExistingPath(string &input) {
+	char resolved[PATH_MAX];
+	if (!realpath(input.c_str(), resolved)) {
+		return false;
+	}
+	input = resolved;
+	return true;
+}
+
+bool LocalFileSystem::PathStartsWithDrive(const string &path) {
+	return false;
+}
+
+bool LocalFileSystem::IsPathAbsolute(const string &path) {
+	return FileSystem::IsPathAbsolute(path);
+}
+
+string LocalFileSystem::MakePathAbsolute(const string &path_p, optional_ptr<FileOpener> opener) {
+	auto parsed = Path::FromString(ExpandPath(path_p, opener));
+	return (parsed.IsAbsolute() ? parsed : Path::FromString(GetWorkingDirectory()).Join(parsed)).ToString();
+}
+
+//===----------------------------------------------------------------------===//
+// Memory-mapped files (Unix)
+//===----------------------------------------------------------------------===//
+class UnixMemoryMappedFile : public MemoryMappedFile {
+public:
+	UnixMemoryMappedFile(string path_p, FileOpenFlags flags_p, int fd_p, data_ptr_t data_p, idx_t size_p);
+	~UnixMemoryMappedFile() override;
+
+	void Sync() override;
+	bool Trim(idx_t offset, idx_t length) override;
+	void Close() override;
+
+private:
+	int fd;
+};
+
+UnixMemoryMappedFile::UnixMemoryMappedFile(string path_p, FileOpenFlags flags_p, int fd_p, data_ptr_t data_p,
+                                           idx_t size_p)
+    : MemoryMappedFile(std::move(path_p), flags_p, data_p, size_p), fd(fd_p) {
+}
+
+UnixMemoryMappedFile::~UnixMemoryMappedFile() {
+	try {
+		UnixMemoryMappedFile::Close();
+	} catch (...) {
+		// not allowed to throw in destructor
+	}
+}
+
+void UnixMemoryMappedFile::Sync() {
+	if (data == nullptr || size == 0) {
+		return;
+	}
+	if (msync(data, size, MS_SYNC) != 0) {
+		throw IOException({{"errno", std::to_string(errno)}}, "Could not msync file \"%s\": %s", path, strerror(errno));
+	}
+}
+
+bool UnixMemoryMappedFile::Trim(idx_t offset, idx_t length) {
+#if defined(__linux__) && !(defined(__GLIBC__) && (__GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 18)))
+	int rc = fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, NumericCast<off_t>(offset),
+	                   NumericCast<off_t>(length));
+	return rc == 0;
+#else
+	(void)offset;
+	(void)length;
+	return false;
+#endif
+}
+
+void UnixMemoryMappedFile::Close() {
+	if (data != nullptr) {
+		munmap(data, size);
+		data = nullptr;
+		size = 0;
+	}
+	if (fd != -1) {
+		close(fd);
+		fd = -1;
+	}
+}
+
+unique_ptr<MemoryMappedFile> LocalFileSystem::MemoryMapFile(const OpenFileInfo &path_info, FileOpenFlags flags,
+                                                            const MMapOptions &options,
+                                                            optional_ptr<FileOpener> opener) {
+	auto path = ExpandPath(path_info.path, opener);
+	flags.Verify();
+
+	bool open_read = flags.OpenForReading();
+	bool open_write = flags.OpenForWriting();
+	int open_flags;
+	if (open_read && open_write) {
+		open_flags = O_RDWR;
+	} else if (open_read) {
+		open_flags = O_RDONLY;
+	} else {
+		throw InternalException("READ or READ+WRITE must be specified when memory-mapping a file");
+	}
+	if (open_write && flags.CreateFileIfNotExists()) {
+		open_flags |= O_CREAT;
+	}
+
+	int fd = open(path.c_str(), open_flags, 0666);
+	if (fd == -1) {
+		if (flags.ReturnNullIfNotExists() && errno == ENOENT) {
+			return nullptr;
+		}
+		throw IOException({{"errno", std::to_string(errno)}}, "Cannot open file \"%s\" for memory mapping: %s", path,
+		                  strerror(errno));
+	}
+
+	TryAcquireFileLock(*this, fd, path, flags);
+
+	struct stat st;
+	if (fstat(fd, &st) != 0) {
+		int saved_errno = errno;
+		close(fd);
+		throw IOException({{"errno", std::to_string(saved_errno)}}, "Could not stat file \"%s\": %s", path,
+		                  strerror(saved_errno));
+	}
+	auto initial_file_size = NumericCast<idx_t>(st.st_size);
+
+	// Writable mappings sparsely extend the file to the reserve size so the region never
+	// needs to be remapped; read-only mappings just span the existing file.
+	idx_t mapping_size;
+	if (open_write) {
+		mapping_size = MaxValue<idx_t>(initial_file_size, options.reserve_size);
+		if (initial_file_size < mapping_size) {
+			if (ftruncate(fd, NumericCast<off_t>(mapping_size)) != 0) {
+				int saved_errno = errno;
+				close(fd);
+				throw IOException({{"errno", std::to_string(saved_errno)}},
+				                  "Could not ftruncate file \"%s\" to reserve size %llu: %s", path, mapping_size,
+				                  strerror(saved_errno));
+			}
+		}
+	} else {
+		mapping_size = initial_file_size;
+	}
+
+	data_ptr_t data = nullptr;
+	if (mapping_size > 0) {
+		int prot = PROT_READ | (open_write ? PROT_WRITE : 0);
+		void *mapped = mmap(nullptr, mapping_size, prot, MAP_SHARED, fd, 0);
+		if (mapped == MAP_FAILED) {
+			int saved_errno = errno;
+			close(fd);
+			throw IOException({{"errno", std::to_string(saved_errno)}}, "Could not mmap file \"%s\" (size=%llu): %s",
+			                  path, mapping_size, strerror(saved_errno));
+		}
+		data = data_ptr_cast(mapped);
+	}
+
+	return make_uniq<UnixMemoryMappedFile>(path, flags, fd, data, mapping_size);
 }
 
 #else
@@ -841,7 +1077,7 @@ static timestamp_t FiletimeToTimeStamp(FILETIME file_time) {
 	// Adapted from: https://stackoverflow.com/questions/6161776/convert-windows-filetime-to-second-in-unix-linux
 	const auto WINDOWS_TICK = 10000000;
 	const auto SEC_TO_UNIX_EPOCH = 11644473600LL;
-	return Timestamp::FromTimeT(fileTime64 / WINDOWS_TICK - SEC_TO_UNIX_EPOCH);
+	return Timestamp::FromEpochSeconds(fileTime64 / WINDOWS_TICK - SEC_TO_UNIX_EPOCH);
 }
 
 static FileMetadata StatsInternal(HANDLE hFile, const string &path) {
@@ -851,13 +1087,13 @@ static FileMetadata StatsInternal(HANDLE hFile, const string &path) {
 	if (handle_type == FILE_TYPE_CHAR) {
 		file_metadata.file_type = FileType::FILE_TYPE_CHARDEV;
 		file_metadata.file_size = 0;
-		file_metadata.last_modification_time = Timestamp::FromTimeT(0);
+		file_metadata.last_modification_time = Timestamp::FromEpochSeconds(0);
 		return file_metadata;
 	}
 	if (handle_type == FILE_TYPE_PIPE) {
 		file_metadata.file_type = FileType::FILE_TYPE_FIFO;
 		file_metadata.file_size = 0;
-		file_metadata.last_modification_time = Timestamp::FromTimeT(0);
+		file_metadata.last_modification_time = Timestamp::FromEpochSeconds(0);
 		return file_metadata;
 	}
 
@@ -870,6 +1106,9 @@ static FileMetadata StatsInternal(HANDLE hFile, const string &path) {
 	// Get file size from high and low parts.
 	file_metadata.file_size =
 	    (static_cast<int64_t>(file_info.nFileSizeHigh) << 32) | static_cast<int64_t>(file_info.nFileSizeLow);
+	file_metadata.device_id = static_cast<uint64_t>(file_info.dwVolumeSerialNumber);
+	file_metadata.file_id =
+	    (static_cast<uint64_t>(file_info.nFileIndexHigh) << 32) | static_cast<uint64_t>(file_info.nFileIndexLow);
 
 	// Get last modification time
 	file_metadata.last_modification_time = FiletimeToTimeStamp(file_info.ftLastWriteTime);
@@ -891,6 +1130,19 @@ static FileMetadata StatsInternal(HANDLE hFile, const string &path) {
 	}
 
 	return file_metadata;
+}
+
+static FileMetadata StatsFromDirInfo(const FILE_ID_BOTH_DIR_INFO &entry) {
+	FileMetadata result;
+	result.file_size = static_cast<idx_t>(entry.EndOfFile.QuadPart);
+
+	FILETIME ft;
+	ft.dwLowDateTime = entry.LastWriteTime.LowPart;
+	ft.dwHighDateTime = entry.LastWriteTime.HighPart;
+	result.last_modification_time = FiletimeToTimeStamp(ft);
+
+	result.file_id = entry.FileId.QuadPart;
+	return result;
 }
 
 struct WindowsFileHandle : public FileHandle {
@@ -988,7 +1240,7 @@ bool LocalFileSystem::IsPrivateFile(const string &path_p, FileOpener *opener) {
 unique_ptr<FileHandle> LocalFileSystem::OpenFile(const string &path_p, FileOpenFlags flags,
                                                  optional_ptr<FileOpener> opener) {
 	auto path = FileSystem::ExpandPath(path_p, opener);
-	auto unicode_path = NormalizePathAndConvertToUnicode(path);
+	auto unicode_path = NormalizePathAndConvertToUnicode(*this, path, opener);
 	if (flags.Compression() != FileCompressionType::UNCOMPRESSED) {
 		throw NotImplementedException("Unsupported compression type for default file system");
 	}
@@ -1049,7 +1301,8 @@ unique_ptr<FileHandle> LocalFileSystem::OpenFile(const string &path_p, FileOpenF
 		if (!extended_error.empty()) {
 			extended_error = "\n" + extended_error;
 		}
-		throw IOException("Cannot open file \"%s\": %s%s", path.c_str(), error, extended_error);
+		auto abs_path = WindowsUtil::UnicodeToUTF8(unicode_path.c_str());
+		throw IOException("Cannot open file \"%s\": %s%s", abs_path, error, extended_error);
 	}
 	auto handle = make_uniq<WindowsFileHandle>(*this, path.c_str(), hFile, flags);
 	if (flags.OpenForAppending()) {
@@ -1191,8 +1444,8 @@ void LocalFileSystem::Truncate(FileHandle &handle, int64_t new_size) {
 	}
 }
 
-static DWORD WindowsGetFileAttributes(const string &filename) {
-	auto unicode_path = NormalizePathAndConvertToUnicode(filename);
+static DWORD WindowsGetFileAttributes(LocalFileSystem &fs, const string &filename, optional_ptr<FileOpener> opener) {
+	auto unicode_path = NormalizePathAndConvertToUnicode(fs, filename, opener);
 	return GetFileAttributesW(unicode_path.c_str());
 }
 
@@ -1201,7 +1454,7 @@ static DWORD WindowsGetFileAttributes(const std::wstring &filename) {
 }
 
 bool LocalFileSystem::DirectoryExists(const string &directory, optional_ptr<FileOpener> opener) {
-	DWORD attrs = WindowsGetFileAttributes(directory);
+	DWORD attrs = WindowsGetFileAttributes(*this, directory, opener);
 	return (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY));
 }
 
@@ -1209,25 +1462,27 @@ void LocalFileSystem::CreateDirectory(const string &directory, optional_ptr<File
 	if (DirectoryExists(directory)) {
 		return;
 	}
-	auto unicode_path = NormalizePathAndConvertToUnicode(directory);
+	auto unicode_path = NormalizePathAndConvertToUnicode(*this, directory, opener);
 	if (directory.empty() || !CreateDirectoryW(unicode_path.c_str(), NULL) || !DirectoryExists(directory)) {
 		auto error = LocalFileSystem::GetLastErrorAsString();
-		throw IOException("Failed to create directory \"%s\": %s", directory.c_str(), error);
+		auto abs_path = WindowsUtil::UnicodeToUTF8(unicode_path.c_str());
+		throw IOException("Failed to create directory \"%s\": %s", abs_path, error);
 	}
 }
 
-static void DeleteDirectoryRecursive(FileSystem &fs, string directory) {
+static void DeleteDirectoryRecursive(FileSystem &fs, string directory, optional_ptr<FileOpener> opener) {
 	fs.ListFiles(directory, [&](const string &fname, bool is_directory) {
 		if (is_directory) {
-			DeleteDirectoryRecursive(fs, fs.JoinPath(directory, fname));
+			DeleteDirectoryRecursive(fs, fs.JoinPath(directory, fname), opener);
 		} else {
 			fs.RemoveFile(fs.JoinPath(directory, fname));
 		}
 	});
-	auto unicode_path = NormalizePathAndConvertToUnicode(directory);
+	auto unicode_path = NormalizePathAndConvertToUnicode(fs, directory, opener);
 	if (!RemoveDirectoryW(unicode_path.c_str())) {
 		auto error = LocalFileSystem::GetLastErrorAsString();
-		throw IOException("Failed to delete directory \"%s\": %s", directory, error);
+		auto abs_path = WindowsUtil::UnicodeToUTF8(unicode_path.c_str());
+		throw IOException("Failed to delete directory \"%s\": %s", abs_path, error);
 	}
 }
 
@@ -1238,60 +1493,84 @@ void LocalFileSystem::RemoveDirectory(const string &directory, optional_ptr<File
 	if (!DirectoryExists(directory)) {
 		return;
 	}
-	DeleteDirectoryRecursive(*this, directory);
+	DeleteDirectoryRecursive(*this, directory, opener);
 }
 
 void LocalFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
-	auto unicode_path = NormalizePathAndConvertToUnicode(filename);
+	auto unicode_path = NormalizePathAndConvertToUnicode(*this, filename, opener);
 	if (!DeleteFileW(unicode_path.c_str())) {
 		auto error = LocalFileSystem::GetLastErrorAsString();
-		throw IOException("Failed to delete file \"%s\": %s", filename, error);
+		auto abs_path = WindowsUtil::UnicodeToUTF8(unicode_path.c_str());
+		throw IOException("Failed to delete file \"%s\": %s", abs_path, error);
 	}
 }
 
 bool LocalFileSystem::ListFilesExtended(const string &directory,
                                         const std::function<void(OpenFileInfo &info)> &callback,
                                         optional_ptr<FileOpener> opener) {
-	string search_dir = JoinPath(directory, "*");
-	auto unicode_path = NormalizePathAndConvertToUnicode(search_dir);
+	auto unicode_path = NormalizePathAndConvertToUnicode(*this, directory, opener);
 
-	WIN32_FIND_DATAW ffd;
-	HANDLE hFind = FindFirstFileW(unicode_path.c_str(), &ffd);
-	if (hFind == INVALID_HANDLE_VALUE) {
+	// Open a handle to the directory itself so we can use GetFileInformationByHandleEx,
+	// which returns FILE_ID_BOTH_DIR_INFO entries that include the per-file FileId
+	// (equivalent to inode number) without requiring a separate handle per file.
+	HANDLE hDir =
+	    CreateFileW(unicode_path.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+	                NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+	if (hDir == INVALID_HANDLE_VALUE) {
 		return false;
 	}
-	do {
-		OpenFileInfo info(WindowsUtil::UnicodeToUTF8(ffd.cFileName));
-		auto &name = info.path;
-		if (name == "." || name == "..") {
-			continue;
+
+	DWORD volume_serial_number = 0;
+	if (!GetVolumeInformationByHandleW(hDir, NULL, 0, &volume_serial_number, NULL, NULL, NULL, 0)) {
+		CloseHandle(hDir);
+		throw IOException("Failed to get volume serial number from directory \"%s\": %s", directory,
+		                  GetLastErrorAsString());
+	}
+
+	static constexpr DWORD BUFFER_SIZE = 65536;
+	auto buffer = unique_ptr<char[]>(new char[BUFFER_SIZE]);
+
+	FILE_INFO_BY_HANDLE_CLASS info_class = FileIdBothDirectoryRestartInfo;
+	while (true) {
+		if (!GetFileInformationByHandleEx(hDir, info_class, buffer.get(), BUFFER_SIZE)) {
+			CloseHandle(hDir);
+			if (GetLastError() == ERROR_NO_MORE_FILES) {
+				// success - listed all files in the directory
+				return true;
+			}
+			auto error = LocalFileSystem::GetLastErrorAsString();
+			throw IOException("Failed to list directory \"%s\": %s", directory, error);
 		}
-		// create extended info
-		info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
-		auto &options = info.extended_info->options;
-		// file type
-		Value file_type(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ? "directory" : "file");
-		options.emplace("type", std::move(file_type));
-		// file size
-		int64_t file_size_bytes =
-		    (static_cast<int64_t>(ffd.nFileSizeHigh) << 32) | static_cast<int64_t>(ffd.nFileSizeLow);
-		options.emplace("file_size", Value::BIGINT(file_size_bytes));
-		// last modified time
-		auto last_modified_time = FiletimeToTimeStamp(ffd.ftLastWriteTime);
-		options.emplace("last_modified", Value::TIMESTAMP(last_modified_time));
 
-		// callback
-		callback(info);
-	} while (FindNextFileW(hFind, &ffd) != 0);
+		auto *entry = reinterpret_cast<FILE_ID_BOTH_DIR_INFO *>(buffer.get());
+		while (true) {
+			// FileName is not null-terminated; use FileNameLength (in bytes) to construct the string.
+			std::wstring wname(entry->FileName, entry->FileNameLength / sizeof(WCHAR));
+			string name = WindowsUtil::UnicodeToUTF8(wname.c_str());
 
-	DWORD dwError = GetLastError();
-	if (dwError != ERROR_NO_MORE_FILES) {
-		FindClose(hFind);
-		return false;
+			if (name != "." && name != "..") {
+				OpenFileInfo info(name);
+				info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+				auto &options = info.extended_info->options;
+				// file type
+				Value file_type(entry->FileAttributes & FILE_ATTRIBUTE_DIRECTORY ? "directory" : "file");
+				options.emplace("type", std::move(file_type));
+
+				auto metadata = StatsFromDirInfo(*entry);
+				metadata.device_id = volume_serial_number;
+				FillFileOptions(metadata, options);
+
+				callback(info);
+			}
+
+			if (entry->NextEntryOffset == 0) {
+				break;
+			}
+			entry = reinterpret_cast<FILE_ID_BOTH_DIR_INFO *>(reinterpret_cast<char *>(entry) + entry->NextEntryOffset);
+		}
+		// next iteration -
+		info_class = FileIdBothDirectoryInfo;
 	}
-
-	FindClose(hFind);
-	return true;
 }
 
 void LocalFileSystem::FileSync(FileHandle &handle) {
@@ -1302,8 +1581,8 @@ void LocalFileSystem::FileSync(FileHandle &handle) {
 }
 
 void LocalFileSystem::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
-	auto source_unicode = NormalizePathAndConvertToUnicode(source);
-	auto target_unicode = NormalizePathAndConvertToUnicode(target);
+	auto source_unicode = NormalizePathAndConvertToUnicode(*this, source, opener);
+	auto target_unicode = NormalizePathAndConvertToUnicode(*this, target, opener);
 	DWORD flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
 
 	if (!MoveFileExW(source_unicode.c_str(), target_unicode.c_str(), flags)) {
@@ -1321,36 +1600,360 @@ FileMetadata LocalFileSystem::Stats(FileHandle &handle) {
 	auto file_metadata = StatsInternal(hFile, handle.GetPath());
 	return file_metadata;
 }
+
+bool LocalFileSystem::TryCanonicalizeExistingPath(string &input) {
+	auto unicode_path = ConvertPathToUnicode(input);
+	HANDLE handle = CreateFileW(unicode_path.c_str(),
+	                            0, // No access needed, just query
+	                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+	                            FILE_FLAG_BACKUP_SEMANTICS, // Required for directories
+	                            NULL);
+
+	if (handle == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	wchar_t resolved[MAX_PATH];
+	DWORD len = GetFinalPathNameByHandleW(handle, resolved, MAX_PATH, FILE_NAME_NORMALIZED);
+	CloseHandle(handle);
+
+	if (len == 0 || len >= MAX_PATH) {
+		return false;
+	}
+
+	std::wstring resolved_wstr(resolved, static_cast<size_t>(len));
+
+	if (resolved_wstr.find(WINDOWS_UNC_LONG_PATH_PREFIX) == 0) {
+		resolved_wstr = L"\\\\" + resolved_wstr.substr(WINDOWS_UNC_LONG_PATH_PREFIX.length());
+	} else if (resolved_wstr.find(WINDOWS_LOCAL_LONG_PATH_PREFIX) == 0) {
+		resolved_wstr = resolved_wstr.substr(WINDOWS_LOCAL_LONG_PATH_PREFIX.length());
+	}
+
+	input = WindowsUtil::UnicodeToUTF8(resolved_wstr.c_str());
+	return true;
+}
+
+bool LocalFileSystem::PathStartsWithDrive(const string &path) {
+	return path.size() >= 2 && path[0] >= 'A' && path[0] <= 'Z' && path[1] == ':';
+}
+
+bool LocalFileSystem::IsPathAbsolute(const string &path) {
+	if (FileSystem::IsPathAbsolute(path)) {
+		return true;
+	}
+	// check if this is a drive letter (e.g. C:)
+	if (PathStartsWithDrive(path)) {
+		return true;
+	}
+	return false;
+}
+
+string LocalFileSystem::MakePathAbsolute(const string &path_p, optional_ptr<FileOpener> opener) {
+	auto path = ExpandPath(path_p, opener);
+	auto parsed = Path::FromString(path);
+	if (parsed.IsAbsolute()) {
+		// already absolute - nothing to do
+		return parsed.ToString();
+	}
+
+	auto parsed_wd = Path::FromString(GetWorkingDirectory());
+	if (parsed.HasDrive() && parsed_wd.GetDriveChar() != parsed.GetDriveChar()) {
+		// this is relative path "C:", and this is not the drive we are on right now
+		// (referencing D: while in $PWD in C:); In this case, default as if PWD is
+		// root of drive, e.g. "C:\"
+		// NOTE: should this error? pushdir("c:") && getcwd() && popdir()?
+		parsed_wd = Path::FromString(parsed.GetBase() + parsed.GetSeparator());
+	}
+	return parsed_wd.Join(parsed.GetPath()).ToString();
+}
+
+//===----------------------------------------------------------------------===//
+// Memory-mapped files (Windows)
+//===----------------------------------------------------------------------===//
+class WindowsMemoryMappedFile : public MemoryMappedFile {
+public:
+	WindowsMemoryMappedFile(string path_p, FileOpenFlags flags_p, HANDLE file_handle_p, HANDLE mapping_handle_p,
+	                        data_ptr_t data_p, idx_t size_p);
+	~WindowsMemoryMappedFile() override;
+
+	void Sync() override;
+	bool Trim(idx_t offset, idx_t length) override;
+	void Close() override;
+
+private:
+	HANDLE file_handle;
+	HANDLE mapping_handle;
+};
+
+WindowsMemoryMappedFile::WindowsMemoryMappedFile(string path_p, FileOpenFlags flags_p, HANDLE file_handle_p,
+                                                 HANDLE mapping_handle_p, data_ptr_t data_p, idx_t size_p)
+    : MemoryMappedFile(std::move(path_p), flags_p, data_p, size_p), file_handle(file_handle_p),
+      mapping_handle(mapping_handle_p) {
+}
+
+WindowsMemoryMappedFile::~WindowsMemoryMappedFile() {
+	try {
+		WindowsMemoryMappedFile::Close();
+	} catch (...) {
+		// not allowed to throw in destructor
+	}
+}
+
+void WindowsMemoryMappedFile::Sync() {
+	if (data == nullptr || size == 0) {
+		return;
+	}
+	if (!FlushViewOfFile(data, size)) {
+		throw IOException("Could not FlushViewOfFile for \"%s\": %s", path, LocalFileSystem::GetLastErrorAsString());
+	}
+	if (!FlushFileBuffers(file_handle)) {
+		throw IOException("Could not FlushFileBuffers for \"%s\": %s", path, LocalFileSystem::GetLastErrorAsString());
+	}
+}
+
+bool WindowsMemoryMappedFile::Trim(idx_t offset, idx_t length) {
+	// FSCTL_SET_ZERO_DATA on NTFS sparse files would work; not implemented yet.
+	(void)offset;
+	(void)length;
+	return false;
+}
+
+void WindowsMemoryMappedFile::Close() {
+	if (data != nullptr) {
+		UnmapViewOfFile(data);
+		data = nullptr;
+		size = 0;
+	}
+	if (mapping_handle != nullptr) {
+		CloseHandle(mapping_handle);
+		mapping_handle = nullptr;
+	}
+	if (file_handle != nullptr && file_handle != INVALID_HANDLE_VALUE) {
+		CloseHandle(file_handle);
+		file_handle = nullptr;
+	}
+}
+
+unique_ptr<MemoryMappedFile> LocalFileSystem::MemoryMapFile(const OpenFileInfo &path_info, FileOpenFlags flags,
+                                                            const MMapOptions &options,
+                                                            optional_ptr<FileOpener> opener) {
+	auto path = ExpandPath(path_info.path, opener);
+	flags.Verify();
+
+	bool open_read = flags.OpenForReading();
+	bool open_write = flags.OpenForWriting();
+	DWORD desired_access;
+	DWORD share_mode;
+	DWORD creation_disposition = OPEN_EXISTING;
+
+	if (open_read && open_write) {
+		desired_access = GENERIC_READ | GENERIC_WRITE;
+	} else if (open_read) {
+		desired_access = GENERIC_READ;
+	} else {
+		throw InternalException("READ or READ+WRITE must be specified when memory-mapping a file");
+	}
+	// share_mode mirrors OpenFile's handling: write lock excludes, read lock blocks writers.
+	switch (flags.Lock()) {
+	case FileLockType::NO_LOCK:
+		share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+		break;
+	case FileLockType::READ_LOCK:
+		share_mode = FILE_SHARE_READ;
+		break;
+	case FileLockType::WRITE_LOCK:
+		share_mode = 0;
+		break;
+	default:
+		throw InternalException("Unknown FileLockType");
+	}
+	share_mode |= FILE_SHARE_DELETE;
+	if (open_write && flags.CreateFileIfNotExists()) {
+		creation_disposition = OPEN_ALWAYS;
+	}
+
+	auto unicode_path = WindowsUtil::UTF8ToUnicode(path.c_str());
+	HANDLE file_handle = CreateFileW(unicode_path.c_str(), desired_access, share_mode, NULL, creation_disposition,
+	                                 FILE_ATTRIBUTE_NORMAL, NULL);
+	if (file_handle == INVALID_HANDLE_VALUE) {
+		if (flags.ReturnNullIfNotExists() && GetLastError() == ERROR_FILE_NOT_FOUND) {
+			return nullptr;
+		}
+		throw IOException("Cannot open file \"%s\" for memory mapping: %s", path,
+		                  LocalFileSystem::GetLastErrorAsString());
+	}
+
+	LARGE_INTEGER size_li;
+	if (!GetFileSizeEx(file_handle, &size_li)) {
+		auto err = LocalFileSystem::GetLastErrorAsString();
+		CloseHandle(file_handle);
+		throw IOException("Could not GetFileSizeEx for \"%s\": %s", path, err);
+	}
+	auto initial_file_size = NumericCast<idx_t>(size_li.QuadPart);
+
+	// Writable mappings sparsely extend the file to the reserve size so the region never
+	// needs to be remapped; read-only mappings just span the existing file.
+	idx_t mapping_size;
+	if (open_write) {
+		mapping_size = MaxValue<idx_t>(initial_file_size, options.reserve_size);
+		if (initial_file_size < mapping_size) {
+			// Sparse so the SetEndOfFile below doesn't allocate the untouched range.
+			DWORD bytes_returned = 0;
+			DeviceIoControl(file_handle, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &bytes_returned, NULL);
+			LARGE_INTEGER li;
+			li.QuadPart = static_cast<LONGLONG>(mapping_size);
+			if (!SetFilePointerEx(file_handle, li, NULL, FILE_BEGIN)) {
+				auto err = LocalFileSystem::GetLastErrorAsString();
+				CloseHandle(file_handle);
+				throw IOException("Could not SetFilePointerEx for \"%s\": %s", path, err);
+			}
+			if (!SetEndOfFile(file_handle)) {
+				auto err = LocalFileSystem::GetLastErrorAsString();
+				CloseHandle(file_handle);
+				throw IOException("Could not SetEndOfFile for \"%s\" (reserve_size=%llu): %s", path, mapping_size, err);
+			}
+		}
+	} else {
+		mapping_size = initial_file_size;
+	}
+
+	HANDLE mapping_handle = nullptr;
+	data_ptr_t data = nullptr;
+	if (mapping_size > 0) {
+		DWORD protect = open_write ? PAGE_READWRITE : PAGE_READONLY;
+		DWORD desired_map_access = open_write ? FILE_MAP_WRITE : FILE_MAP_READ;
+		DWORD high = static_cast<DWORD>((static_cast<uint64_t>(mapping_size) >> 32) & 0xFFFFFFFFULL);
+		DWORD low = static_cast<DWORD>(static_cast<uint64_t>(mapping_size) & 0xFFFFFFFFULL);
+		mapping_handle = CreateFileMappingW(file_handle, NULL, protect, high, low, NULL);
+		if (mapping_handle == NULL) {
+			auto err = LocalFileSystem::GetLastErrorAsString();
+			CloseHandle(file_handle);
+			throw IOException("Could not CreateFileMapping for \"%s\": %s", path, err);
+		}
+		void *mapped = MapViewOfFile(mapping_handle, desired_map_access, 0, 0, mapping_size);
+		if (mapped == NULL) {
+			auto err = LocalFileSystem::GetLastErrorAsString();
+			CloseHandle(mapping_handle);
+			CloseHandle(file_handle);
+			throw IOException("Could not MapViewOfFile for \"%s\": %s", path, err);
+		}
+		data = data_ptr_cast(mapped);
+	}
+
+	return make_uniq<WindowsMemoryMappedFile>(path, flags, file_handle, mapping_handle, data, mapping_size);
+}
+
 #endif
 
 bool LocalFileSystem::CanSeek() {
 	return true;
 }
 
+FileWriteMode LocalFileSystem::GetWriteMode(FileHandle &handle) {
+	return FileWriteMode::POSITIONAL;
+}
+
 bool LocalFileSystem::OnDiskFile(FileHandle &handle) {
 	return true;
 }
 
-string LocalFileSystem::GetVersionTag(FileHandle &handle) {
-	// TODO: Fix using FileSystem::Stats for v1.5, which should also fix it for Windows
-#ifdef _WIN32
-	return "";
-#else
-	int fd = handle.Cast<UnixFileHandle>().fd;
-	struct stat s;
-	if (fstat(fd, &s) == -1) {
-		throw IOException("Failed to get file size for file \"%s\": %s", handle.path, strerror(errno));
+string LocalFileSystem::CanonicalizePath(const string &input, optional_ptr<FileOpener> opener) {
+	auto path_sep = PathSeparator(input);
+	if (path_sep.size() != 1) {
+		throw InternalException("path separator can only be a single byte for local file systems");
 	}
+	// make the path absolute
+	string path = MakePathAbsolute(input, opener);
 
-	// dev/ino should be enough, but to guard against in-place writes we also add file size and modification time
+	string current = path;
+	string remainder;
+	idx_t dot_dot_count = 0;
+	bool is_drive = false;
+	while (!current.empty()) {
+		if (dot_dot_count == 0 && TryCanonicalizeExistingPath(current)) {
+			// successfully canonicalized "current" - add remainder if we have any
+			if (remainder.empty()) {
+				return current;
+			}
+			if (StringUtil::EndsWith(current, path_sep)) {
+				return current + remainder;
+			}
+			return current + path_sep + remainder;
+		}
+		if (is_drive) {
+			// this is a drive only (e.g. C:\)
+			// if we reach this, this is an unknown drive letter
+			// use fallback canonicalize for the remainder
+			return current + FileSystem::CanonicalizePath(remainder);
+		}
+		// move up one directory
+		optional_idx sep_idx;
+		for (idx_t i = current.size(); i > 0; i--) {
+			// on windows we accept both separators (\ and /, and also :)
+			if (current[i - 1] == path_sep[0] || current[i - 1] == '/') {
+				sep_idx = i - 1;
+				break;
+			}
+		}
+		if (!sep_idx.IsValid()) {
+			// exhausted the full path and nothing exists - break out
+			current = string();
+			break;
+		}
+		auto sep = sep_idx.GetIndex();
+		auto component = current.substr(sep + 1);
+		if (component == "..") {
+			// dot dot - we need to move up a level
+			// increment the count
+			dot_dot_count++;
+		} else if (!component.empty() && component != ".") {
+			if (dot_dot_count > 0) {
+				// just clear this directory
+				dot_dot_count--;
+			} else {
+				// add component to remainder - unless it's dot or empty
+				if (remainder.empty()) {
+					remainder = component;
+				} else {
+					remainder = component + path_sep + remainder;
+				}
+			}
+		}
+		// continue with remainder
+		current = current.substr(0, sep);
+		if (current.size() == 2 && PathStartsWithDrive(current)) {
+			// Windows only
+			// C: and C:\\ mean different things (C: is relative, C:\\ is absolute)
+			// we should have already normalized to C:\\ earlier on in this function
+			// so turn this base drive letter into C:\\ for the final lookup
+			is_drive = true;
+			current += "\\";
+		}
+	}
+	// failed to canonicalize path - fallback to generic canonicalization
+	return FileSystem::CanonicalizePath(path);
+}
+
+string LocalFileSystem::VersionTagFromMetadata(const FileMetadata &stats) {
 	uint64_t version_tag[4];
-	Store(NumericCast<uint64_t>(s.st_dev), data_ptr_cast(&version_tag[0]));
-	Store(NumericCast<uint64_t>(s.st_ino), data_ptr_cast(&version_tag[1]));
-	Store(NumericCast<uint64_t>(s.st_size), data_ptr_cast(&version_tag[2]));
-	Store(Timestamp::FromEpochSeconds(s.st_mtime).value, data_ptr_cast(&version_tag[3]));
-
+	Store(stats.device_id.IsValid() ? stats.device_id.GetIndex() : 0, data_ptr_cast(&version_tag[0]));
+	Store(stats.file_id.IsValid() ? stats.file_id.GetIndex() : 0, data_ptr_cast(&version_tag[1]));
+	Store(stats.file_size, data_ptr_cast(&version_tag[2]));
+	Store(stats.last_modification_time.value, data_ptr_cast(&version_tag[3]));
 	return string(char_ptr_cast(version_tag), sizeof(uint64_t) * 4);
-#endif
+}
+
+void LocalFileSystem::FillFileOptions(const FileMetadata &file_metadata, unordered_map<string, Value> &options) {
+	// file size
+	options.emplace("file_size", Value::BIGINT(file_metadata.file_size));
+	// last modified time
+	options.emplace("last_modified", Value::TIMESTAMP(file_metadata.last_modification_time));
+	// version tag
+	options.emplace("etag", Value::BLOB_RAW(VersionTagFromMetadata(file_metadata)));
+}
+
+string LocalFileSystem::GetVersionTag(FileHandle &handle) {
+	auto stats = handle.Stats();
+	return VersionTagFromMetadata(stats);
 }
 
 void LocalFileSystem::Seek(FileHandle &handle, idx_t location) {
@@ -1373,14 +1976,15 @@ static bool IsCrawl(const string &glob) {
 }
 
 static bool IsSymbolicLink(const string &path) {
-	auto normalized_path = LocalFileSystem::NormalizeLocalPath(path);
 #ifndef _WIN32
 	struct stat status;
-	return (lstat(normalized_path, &status) != -1 && S_ISLNK(status.st_mode));
+	return (lstat(path.c_str(), &status) != -1 && S_ISLNK(status.st_mode));
 #else
-	auto attributes = WindowsGetFileAttributes(path);
-	if (attributes == INVALID_FILE_ATTRIBUTES)
+	auto unicode_path = ConvertPathToUnicode(path);
+	auto attributes = WindowsGetFileAttributes(unicode_path);
+	if (attributes == INVALID_FILE_ATTRIBUTES) {
 		return false;
+	}
 	return attributes & FILE_ATTRIBUTE_REPARSE_POINT;
 #endif
 }
@@ -1404,47 +2008,6 @@ vector<OpenFileInfo> LocalFileSystem::FetchFileWithoutGlob(const string &path, o
 		}
 	}
 	return result;
-}
-
-// Helper function to handle file:/ URLs
-static idx_t GetFileUrlOffset(const string &path) {
-	if (!StringUtil::StartsWith(path, "file:/")) {
-		return 0;
-	}
-
-	// Url without host: file:/some/path
-	if (path[6] != '/') {
-#ifdef _WIN32
-		return 6;
-#else
-		return 5;
-#endif
-	}
-
-	// Url with empty host: file:///some/path
-	if (path[7] == '/') {
-#ifdef _WIN32
-		return 8;
-#else
-		return 7;
-#endif
-	}
-
-	// Url with localhost: file://localhost/some/path
-	if (path.compare(7, 10, "localhost/") == 0) {
-#ifdef _WIN32
-		return 17;
-#else
-		return 16;
-#endif
-	}
-
-	// unkown file:/ url format
-	return 0;
-}
-
-const char *LocalFileSystem::NormalizeLocalPath(const string &path) {
-	return path.c_str() + GetFileUrlOffset(path);
 }
 
 struct PathSplit {
@@ -1528,41 +2091,29 @@ private:
 
 LocalGlobResult::LocalGlobResult(LocalFileSystem &fs, const string &path_p, FileGlobOptions options_p,
                                  optional_ptr<FileOpener> opener)
-    : fs(fs), path(path_p), opener(opener) {
+    : LazyMultiFileList(FileOpener::TryGetClientContext(opener)), fs(fs), path(fs.ExpandPath(path_p, opener)),
+      opener(opener) {
 	if (path.empty()) {
 		finished = true;
 		return;
 	}
-	// split up the path into separate chunks
-	idx_t file_url_path_offset = GetFileUrlOffset(path);
-
-	idx_t last_pos = 0;
-	for (idx_t i = file_url_path_offset; i < path.size(); i++) {
-		if (path[i] == '\\' || path[i] == '/') {
-			if (i == last_pos) {
-				// empty: skip this position
-				last_pos = i + 1;
-				continue;
-			}
-			if (splits.empty()) {
-				splits.emplace_back(fs, path.substr(0, i));
-			} else {
-				splits.emplace_back(fs, path.substr(last_pos, i - last_pos));
-			}
-			last_pos = i + 1;
-		}
+	// Split path into base (= scheme+authority+anchor) + individual segments.
+	auto parsed = Path::FromString(path);
+	string base = parsed.GetBase();
+	if (!base.empty()) {
+		splits.emplace_back(fs, base);
 	}
-	splits.emplace_back(fs, path.substr(last_pos, path.size() - last_pos));
-	// handle absolute paths
-	absolute_path = false;
-	if (fs.IsPathAbsolute(path)) {
-		// first character is a slash -  unix absolute path
-		absolute_path = true;
-	} else if (StringUtil::Contains(splits[0].path,
-	                                ":")) { // TODO: this is weird? shouldn't IsPathAbsolute handle this?
-		// first split has a colon -  windows absolute path
-		absolute_path = true;
-	} else if (splits[0].path == "~") {
+	for (auto &seg : parsed.GetPathSegments()) {
+		splits.emplace_back(fs, seg);
+	}
+	absolute_path = parsed.IsAbsolute();
+	// Preserve trailing separator semantics: glob("dir/*/") matches directories,
+	// not files. Add empty trailing split to enforce this and make preceding splits
+	// non-final.
+	if (parsed.HasTrailingSeparator()) {
+		splits.emplace_back(fs, string());
+	}
+	if (!splits.empty() && splits[0].path == "~") {
 		// starts with home directory
 		auto home_directory = fs.GetHomeDirectory(opener);
 		if (!home_directory.empty()) {

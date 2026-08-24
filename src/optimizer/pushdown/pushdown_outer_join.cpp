@@ -80,7 +80,7 @@ static bool ExprIsFunctionOnlyOf(const Expression &expr, const expression_set_t 
 
 	ExpressionIterator::EnumerateExpression(expr_to_check, [&](unique_ptr<Expression> &sub_expr) {
 		if (args.find(*sub_expr) != args.end()) {
-			auto null_value = make_uniq<BoundConstantExpression>(Value(sub_expr->return_type));
+			auto null_value = make_uniq<BoundConstantExpression>(Value(sub_expr->GetReturnType()));
 			sub_expr = std::move(null_value);
 		}
 	});
@@ -172,8 +172,8 @@ PushDownFiltersOnCoalescedEqualJoinKeys(vector<unique_ptr<Filter>> &filters, vec
 }
 
 unique_ptr<LogicalOperator> FilterPushdown::PushdownOuterJoin(unique_ptr<LogicalOperator> op,
-                                                              unordered_set<idx_t> &left_bindings,
-                                                              unordered_set<idx_t> &right_bindings) {
+                                                              unordered_set<TableIndex> &left_bindings,
+                                                              unordered_set<TableIndex> &right_bindings) {
 	if (op->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		return FinishPushdown(std::move(op));
 	}
@@ -181,7 +181,8 @@ unique_ptr<LogicalOperator> FilterPushdown::PushdownOuterJoin(unique_ptr<Logical
 	auto &join = op->Cast<LogicalComparisonJoin>();
 	D_ASSERT(join.join_type == JoinType::OUTER);
 
-	FilterPushdown left_pushdown(optimizer, convert_mark_joins), right_pushdown(optimizer, convert_mark_joins);
+	FilterPushdown left_pushdown(optimizer, convert_mark_joins, projection_mode);
+	FilterPushdown right_pushdown(optimizer, convert_mark_joins, projection_mode);
 	auto has_applied_pushdown = PushDownFiltersOnCoalescedEqualJoinKeys(
 	    filters, join.conditions, [&](unique_ptr<Expression> filter) { left_pushdown.AddFilter(std::move(filter)); },
 	    [&](unique_ptr<Expression> filter) { right_pushdown.AddFilter(std::move(filter)); });

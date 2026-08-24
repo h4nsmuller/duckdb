@@ -1,0 +1,224 @@
+# name: test/sql/match_recognize/test_match_recognize_clauses.test
+# description: MATCH_RECOGNIZE clauses - PARTITION BY, ORDER BY, ROWS PER MATCH, AFTER MATCH SKIP
+# group: [match_recognize]
+
+statement ok
+pragma threads=1;
+
+statement ok
+create table q(i integer);
+
+statement ok
+insert into q values (1),(2),(3),(4);
+
+# PATTERN (A A) over four always-matching rows produces the overlapping matches
+# 0-1, 1-2 and 2-3; the AFTER MATCH SKIP option decides which survive.
+
+# the default skips past the last row of the match, so 1-2 is dropped
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A A) DEFINE A as true
+) ORDER BY i
+----
+1
+3
+
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x AFTER MATCH SKIP PAST LAST ROW PATTERN (A A) DEFINE A as true
+) ORDER BY i
+----
+1
+3
+
+# skipping to the next row keeps every match, including the overlapping ones
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x AFTER MATCH SKIP TO NEXT ROW PATTERN (A A) DEFINE A as true
+) ORDER BY i
+----
+1
+2
+3
+
+# skipping to a pattern variable allows matches to abut
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x AFTER MATCH SKIP TO FIRST A PATTERN (A A) DEFINE A as true
+) ORDER BY i
+----
+1
+2
+3
+
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x AFTER MATCH SKIP TO LAST A PATTERN (A A) DEFINE A as true
+) ORDER BY i
+----
+1
+2
+3
+
+# ROWS PER MATCH parses in both forms and combines with AFTER MATCH SKIP
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x ONE ROW PER MATCH PATTERN (A A) DEFINE A as true
+) ORDER BY i
+----
+1
+3
+
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x ALL ROWS PER MATCH PATTERN (A A) DEFINE A as true
+) ORDER BY i
+----
+1
+3
+
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x ALL ROWS PER MATCH AFTER MATCH SKIP TO NEXT ROW PATTERN (A A) DEFINE A as true
+) ORDER BY i
+----
+1
+2
+3
+
+# ORDER BY is optional
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
+    MEASURES i AS x PATTERN (A A) DEFINE A as true
+) ORDER BY i
+----
+1
+3
+
+# ordering direction changes which rows start a match
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
+    ORDER BY i DESC MEASURES i AS x PATTERN (A A) DEFINE A as true
+) ORDER BY i
+----
+2
+4
+
+# PARTITION BY accepts arbitrary expressions
+query I
+SELECT i FROM q MATCH_RECOGNIZE(
+    PARTITION BY i%2 ORDER BY i MEASURES i AS x PATTERN (A A) DEFINE A as true
+) ORDER BY i
+----
+1
+2
+
+statement ok
+create table pt(p integer, i integer);
+
+statement ok
+insert into pt values (1,1),(1,2),(1,3),(2,1),(2,2),(2,3);
+
+# matches never span a partition, and the reported offsets are partition relative
+query IIII
+SELECT p, i, __pattern_window.match_start, __pattern_window.match_end FROM pt MATCH_RECOGNIZE(
+    PARTITION BY p ORDER BY i MEASURES i AS x PATTERN (A A) DEFINE A as true
+) ORDER BY p, i
+----
+1	1	0	1
+2	1	0	1
+
+# every row of every partition is considered, including the last one
+query II
+SELECT p, i FROM pt MATCH_RECOGNIZE(
+    PARTITION BY p ORDER BY i MEASURES i AS x PATTERN (A) DEFINE A as true
+) ORDER BY p, i
+----
+1	1
+1	2
+1	3
+2	1
+2	2
+2	3
+
+statement ok
+create table m(a integer, b integer, i integer);
+
+statement ok
+insert into m values (1,1,1),(1,1,2),(1,2,1),(1,2,2);
+
+# partitioning on several columns
+query III
+SELECT a, b, i FROM m MATCH_RECOGNIZE(
+    PARTITION BY a, b ORDER BY i MEASURES i AS x PATTERN (A A) DEFINE A as true
+) ORDER BY a, b, i
+----
+1	1	1
+1	2	1
+
+statement ok
+create table coll(a integer, i integer);
+
+statement ok
+insert into coll values (5,1),(5,2),(9,3),(5,4);
+
+# a DEFINE symbol may share its name with an input column, and its body may reference that column
+query I
+SELECT i FROM coll MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A A) DEFINE A as a=5
+) ORDER BY i
+----
+1
+
+statement ok
+create table one(i integer);
+
+statement ok
+insert into one values (7);
+
+# a single row partition still matches
+query I
+SELECT i FROM one MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A) DEFINE A as true
+)
+----
+7
+
+statement ok
+create table empty_tbl(i integer);
+
+query I
+SELECT count(*) FROM empty_tbl MATCH_RECOGNIZE(
+    MEASURES i AS x PATTERN (A) DEFINE A as true
+)
+----
+0
+
+# a pattern that never matches produces no rows
+query I
+SELECT count(*) FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A) DEFINE A as false
+)
+----
+0
+
+# table alias and result alias
+query I
+SELECT z.i FROM q AS t MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A A) DEFINE A as true
+) AS z ORDER BY z.i
+----
+1
+3
+
+# several MEASURES entries, and PREV/NEXT/FIRST/LAST inside DEFINE
+statement ok
+SELECT count(*) FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x, i+1 AS y PATTERN (A) DEFINE A as true
+)
+
+statement ok
+SELECT count(*) FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A)
+    DEFINE A as PREV(i) IS NOT NULL AND NEXT(i) IS NOT NULL AND FIRST(i) IS NOT NULL AND LAST(i) IS NOT NULL
+)

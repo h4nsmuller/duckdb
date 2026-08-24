@@ -1,7 +1,6 @@
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/optimizer/statistics_propagator.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_any_join.hpp"
@@ -13,6 +12,73 @@
 #include "duckdb/planner/operator/logical_positional_join.hpp"
 
 namespace duckdb {
+
+bool StatisticsPropagator::HandleJoinNeverMatches(LogicalJoin &join, unique_ptr<LogicalOperator> &node_ptr) {
+	switch (join.join_type) {
+	case JoinType::RIGHT_SEMI:
+	case JoinType::SEMI:
+	case JoinType::INNER:
+		// semi or inner join on false; entire node can be pruned
+		ReplaceWithEmptyResult(node_ptr);
+		return true;
+	case JoinType::RIGHT_ANTI:
+	case JoinType::ANTI: {
+		if (join.join_type == JoinType::RIGHT_ANTI) {
+			std::swap(join.children[0], join.children[1]);
+		}
+		// If the filter is always false or Null, just return the left child.
+		node_ptr = std::move(join.children[0]);
+		return true;
+	}
+	case JoinType::LEFT:
+		// anti/left outer join: replace right side with empty node
+		ReplaceWithEmptyResult(join.children[1]);
+		return true;
+	case JoinType::RIGHT:
+		// right outer join: replace left side with empty node
+		ReplaceWithEmptyResult(join.children[0]);
+		return true;
+	default:
+		// other join types: can't do much meaningful with this information
+		// full outer join requires both sides anyway; we can skip the execution of the actual join, but eh
+		// mark/single join requires knowing if the rhs has null values or not
+		return false;
+	}
+}
+
+bool StatisticsPropagator::HandleJoinAlwaysMatches(LogicalJoin &join, unique_ptr<LogicalOperator> &node_ptr) {
+	switch (join.join_type) {
+	case JoinType::RIGHT_SEMI:
+	case JoinType::SEMI: {
+		if (join.join_type == JoinType::RIGHT_SEMI) {
+			std::swap(join.children[0], join.children[1]);
+		}
+		// when the right child has no data, return an empty set
+		// cannot just return the left child because if the right child has no cardinality
+		// then the whole result should be empty.
+		// TODO: write better CE logic for limits so that we can just look at
+		//  join.children[1].estimated_cardinality.
+		auto limit = make_uniq<LogicalLimit>(BoundLimitNode::ConstantValue(1), BoundLimitNode());
+		limit->SetEstimatedCardinality(1);
+		limit->AddChild(std::move(join.children[1]));
+		auto cross_product = LogicalCrossProduct::Create(std::move(join.children[0]), std::move(limit));
+		cross_product->SetEstimatedCardinality(join.estimated_cardinality);
+		node_ptr = std::move(cross_product);
+		return true;
+	}
+	case JoinType::INNER: {
+		// inner, replace with cross product
+		auto cross_product = LogicalCrossProduct::Create(std::move(join.children[0]), std::move(join.children[1]));
+		cross_product->SetEstimatedCardinality(join.estimated_cardinality);
+		node_ptr = std::move(cross_product);
+		return true;
+	}
+	default:
+		// anti joins only produce an empty result when the other side has rows - with no rows to match against,
+		// every tuple survives. left/mark/single/outer joins still emit their non-matching rows.
+		return false;
+	}
+}
 
 void StatisticsPropagator::PropagateStatistics(LogicalComparisonJoin &join, unique_ptr<LogicalOperator> &node_ptr) {
 	for (idx_t i = 0; i < join.conditions.size(); i++) {
@@ -34,41 +100,14 @@ void StatisticsPropagator::PropagateStatistics(LogicalComparisonJoin &join, uniq
 			}
 			auto prune_result = PropagateComparison(*stats_left, *stats_right, condition.GetComparisonType());
 			// Add stats to logical_join for perfect hash join
-			join.join_stats.push_back(stats_left->ToUnique());
-			join.join_stats.push_back(stats_right->ToUnique());
+			condition.SetLeftStats(stats_left->ToUnique());
+			condition.SetRightStats(stats_right->ToUnique());
 			switch (prune_result) {
 			case FilterPropagateResult::FILTER_FALSE_OR_NULL:
 			case FilterPropagateResult::FILTER_ALWAYS_FALSE:
 				// filter is always false or null, none of the join conditions matter
-				switch (join.join_type) {
-				case JoinType::RIGHT_SEMI:
-				case JoinType::SEMI:
-				case JoinType::INNER:
-					// semi or inner join on false; entire node can be pruned
-					ReplaceWithEmptyResult(node_ptr);
+				if (HandleJoinNeverMatches(join, node_ptr)) {
 					return;
-				case JoinType::RIGHT_ANTI:
-				case JoinType::ANTI: {
-					if (join.join_type == JoinType::RIGHT_ANTI) {
-						std::swap(join.children[0], join.children[1]);
-					}
-					// If the filter is always false or Null, just return the left child.
-					node_ptr = std::move(join.children[0]);
-					return;
-				}
-				case JoinType::LEFT:
-					// anti/left outer join: replace right side with empty node
-					ReplaceWithEmptyResult(join.children[1]);
-					return;
-				case JoinType::RIGHT:
-					// right outer join: replace left side with empty node
-					ReplaceWithEmptyResult(join.children[0]);
-					return;
-				default:
-					// other join types: can't do much meaningful with this information
-					// full outer join requires both sides anyway; we can skip the execution of the actual join, but eh
-					// mark/single join requires knowing if the rhs has null values or not
-					break;
 				}
 				break;
 			case FilterPropagateResult::FILTER_ALWAYS_TRUE:
@@ -91,46 +130,12 @@ void StatisticsPropagator::PropagateStatistics(LogicalComparisonJoin &join, uniq
 				if (join.conditions.size() > 1) {
 					// there are multiple conditions: erase this condition
 					join.conditions.erase_at(i);
-					// remove the corresponding statistics
-					join.join_stats.clear();
 					i--;
 					continue;
-				} else {
-					// this is the only condition and it is always true: all conditions are true
-					switch (join.join_type) {
-					case JoinType::RIGHT_SEMI:
-					case JoinType::SEMI: {
-						if (join.join_type == JoinType::RIGHT_SEMI) {
-							std::swap(join.children[0], join.children[1]);
-						}
-						// when the right child has no data, return an empty set
-						// cannot just return the left child because if the right child has no cardinality
-						// then the whole result should be empty.
-						// TODO: write better CE logic for limits so that we can just look at
-						//  join.children[1].estimated_cardinality.
-						auto limit = make_uniq<LogicalLimit>(BoundLimitNode::ConstantValue(1), BoundLimitNode());
-						limit->SetEstimatedCardinality(1);
-						limit->AddChild(std::move(join.children[1]));
-						auto cross_product = LogicalCrossProduct::Create(std::move(join.children[0]), std::move(limit));
-						node_ptr = std::move(cross_product);
-						return;
-					}
-					case JoinType::INNER: {
-						// inner, replace with cross product
-						auto cross_product =
-						    LogicalCrossProduct::Create(std::move(join.children[0]), std::move(join.children[1]));
-						node_ptr = std::move(cross_product);
-						return;
-					}
-					case JoinType::ANTI:
-					case JoinType::RIGHT_ANTI: {
-						ReplaceWithEmptyResult(node_ptr);
-						return;
-					}
-					default:
-						// we don't handle mark/single join here yet
-						break;
-					}
+				}
+				// this is the only condition and it is always true: all conditions are true
+				if (HandleJoinAlwaysMatches(join, node_ptr)) {
+					return;
 				}
 				break;
 			default:
@@ -141,7 +146,8 @@ void StatisticsPropagator::PropagateStatistics(LogicalComparisonJoin &join, uniq
 		// note that it is fine to do this now, even if the same column is used again later
 		// e.g. if we have i=j AND i=k, and the stats for j and k are disjoint, we know there are no results
 		// so if we have e.g. i: [0, 100], j: [0, 25], k: [75, 100]
-		// we can set i: [0, 25] after the first comparison, and statically determine that the second comparison is fals
+		// we can set i: [0, 25] after the first comparison, and statically determine that the second comparison is
+		// false
 
 		// note that we can't update statistics the same for all join types
 		// mark and single joins don't filter any tuples -> so there is no propagation possible
@@ -168,12 +174,10 @@ void StatisticsPropagator::PropagateStatistics(LogicalComparisonJoin &join, uniq
 				                          *updated_stats_left);
 				CreateFilterFromJoinStats(join.children[1], condition.RightReference(), *stats_right,
 				                          *updated_stats_right);
-			}
 
-			// Update join_stats when is already part of the join
-			if (join.join_stats.size() == 2) {
-				join.join_stats[0] = std::move(updated_stats_left);
-				join.join_stats[1] = std::move(updated_stats_right);
+				// Update join_stats when is already part of the join
+				condition.SetLeftStats(std::move(updated_stats_left));
+				condition.SetRightStats(std::move(updated_stats_right));
 			}
 			break;
 		}
@@ -185,7 +189,18 @@ void StatisticsPropagator::PropagateStatistics(LogicalComparisonJoin &join, uniq
 
 void StatisticsPropagator::PropagateStatistics(LogicalAnyJoin &join, unique_ptr<LogicalOperator> &node_ptr) {
 	// propagate the expression into the join condition
-	PropagateExpression(join.condition);
+	// note that a condition that is TRUE_OR_NULL does not always match: a NULL condition rejects the pair
+	switch (ClassifyFilter(join.condition)) {
+	case FilterPropagateResult::FILTER_ALWAYS_TRUE:
+		HandleJoinAlwaysMatches(join, node_ptr);
+		break;
+	case FilterPropagateResult::FILTER_ALWAYS_FALSE:
+	case FilterPropagateResult::FILTER_FALSE_OR_NULL:
+		HandleJoinNeverMatches(join, node_ptr);
+		break;
+	default:
+		break;
+	}
 }
 
 void StatisticsPropagator::MultiplyCardinalities(unique_ptr<NodeStatistics> &stats, NodeStatistics &new_stats) {
@@ -331,7 +346,7 @@ void StatisticsPropagator::CreateFilterFromJoinStats(unique_ptr<LogicalOperator>
                                                      const BaseStatistics &stats_before,
                                                      const BaseStatistics &stats_after) {
 	// Only do this for integral colref's that have stats
-	if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF || !expr->return_type.IsIntegral() ||
+	if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF || !expr->GetReturnType().IsIntegral() ||
 	    !NumericStats::HasMinMax(stats_before) || !NumericStats::HasMinMax(stats_after)) {
 		return;
 	}
@@ -345,13 +360,13 @@ void StatisticsPropagator::CreateFilterFromJoinStats(unique_ptr<LogicalOperator>
 	vector<unique_ptr<Expression>> filter_exprs;
 	if (min_after > min_before) {
 		filter_exprs.emplace_back(
-		    make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, expr->Copy(),
-		                                         make_uniq<BoundConstantExpression>(std::move(min_after))));
+		    BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHANOREQUALTO, expr->Copy(),
+		                                      make_uniq<BoundConstantExpression>(std::move(min_after))));
 	}
 	if (max_after < max_before) {
 		filter_exprs.emplace_back(
-		    make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_LESSTHANOREQUALTO, expr->Copy(),
-		                                         make_uniq<BoundConstantExpression>(std::move(max_after))));
+		    BoundComparisonExpression::Create(ExpressionType::COMPARE_LESSTHANOREQUALTO, expr->Copy(),
+		                                      make_uniq<BoundConstantExpression>(std::move(max_after))));
 	}
 
 	if (filter_exprs.empty()) {

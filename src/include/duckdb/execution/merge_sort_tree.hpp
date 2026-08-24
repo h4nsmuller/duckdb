@@ -443,9 +443,26 @@ void MergeSortTree<E, O, CMP, F, C>::BuildRun(idx_t level_idx, idx_t run_idx) {
 
 template <typename E, typename O, typename CMP, uint64_t F, uint64_t C>
 pair<idx_t, idx_t> MergeSortTree<E, O, CMP, F, C>::SelectNth(const SubFrames &frames, idx_t n) const {
-	// Handle special case of a one-element tree
+	// Find Nth element in a top-down traversal
+	idx_t result = 0;
+
+	// Handle special case of a 0/1-element tree
 	if (tree.size() < 2) {
-		return {0, 0};
+		++n;
+
+		//	Zero element tree always fails
+		if (tree[0].first.empty()) {
+			return {result, n};
+		}
+
+		//	Either the element is in the frame or it isn't
+		const auto *level_data = tree[0].first.data();
+		const auto v = level_data[result];
+		for (const auto &frame : frames) {
+			n -= (v >= frame.start) && (v < frame.end);
+		}
+
+		return {result, n};
 	}
 
 	// 	The first level contains a single run,
@@ -456,13 +473,10 @@ pair<idx_t, idx_t> MergeSortTree<E, O, CMP, F, C>::SelectNth(const SubFrames &fr
 		level_width *= FANOUT;
 	}
 
-	// Find Nth element in a top-down traversal
-	idx_t result = 0;
-
 	// First, handle levels with cascading pointers
 	const auto min_cascaded = LowestCascadingLevel();
 	if (level_no > min_cascaded) {
-		//	Initialise the cascade indicies from the previous level
+		//	Initialise the cascade indices from the previous level
 		using CascadeRange = pair<idx_t, idx_t>;
 		std::array<CascadeRange, 3> cascades;
 		const auto &level = tree[level_no + 1].first;
@@ -479,7 +493,7 @@ pair<idx_t, idx_t> MergeSortTree<E, O, CMP, F, C>::SelectNth(const SubFrames &fr
 
 		// 	Walk the cascaded levels
 		for (; level_no >= min_cascaded; --level_no) {
-			//	The cascade indicies into this level are in the previous level
+			//	The cascade indices into this level are in the previous level
 			const auto &level_cascades = tree[level_no + 1].second;
 
 			// Go over all children until we found enough in range

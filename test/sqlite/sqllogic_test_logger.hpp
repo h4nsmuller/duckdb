@@ -23,6 +23,7 @@ public:
 	~SQLLogicTestLogger();
 
 	static void Log(const string &annotation, const string &str);
+	static void PrintSkip(const string &file_name, const string &reason);
 	void PrintExpectedResult(const vector<string> &values, idx_t columns, bool row_wise);
 	static void PrintLineSep();
 	static void PrintHeader(string header);
@@ -48,18 +49,22 @@ public:
 	void ColumnCountMismatchCorrectResult(idx_t original_expected_columns, idx_t expected_column_count,
 	                                      MaterializedQueryResult &result);
 	void SplitMismatch(idx_t row_number, idx_t expected_column_count, idx_t split_count);
-	void WrongResultHash(QueryResult *expected_result, MaterializedQueryResult &result, const string &expected_hash,
+	void WrongResultHash(const string &expected_result, MaterializedQueryResult &result, const string &expected_hash,
 	                     const string &actual_hash);
 	void UnexpectedStatement(bool expect_ok, MaterializedQueryResult &result);
 	void ExpectedErrorMismatch(const string &expected_error, MaterializedQueryResult &result);
 	void InternalException(MaterializedQueryResult &result);
 	static void LoadDatabaseFail(const string &file_name, const string &dbpath, const string &message);
+	//! Write a machine-readable event line: "[TEST_EVENT] <json>" (--emit-test-events). Caller gates.
+	static void EmitTestEvent(const string &json_payload);
 
 	static void AppendFailure(const string &log_message);
 	static void LogFailure(const string &log_message);
 	static void LogFailureAnnotation(const string &log_message);
+	string ResultToString(MaterializedQueryResult &result);
 
 private:
+	Connection &connection;
 	lock_guard<mutex> log_lock;
 	string file_name;
 	int query_line;

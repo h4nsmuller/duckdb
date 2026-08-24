@@ -1,6 +1,9 @@
 #include "duckdb/execution/operator/persistent/physical_merge_into.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/execution/row_id_deduplicator.hpp"
 #include "duckdb/parser/statement/merge_into_statement.hpp"
+#include "duckdb/parser/query_node/merge_query_node.hpp"
+#include "duckdb/common/types/vector.hpp"
 
 namespace duckdb {
 
@@ -86,7 +89,7 @@ public:
 				state.insert_executor = make_uniq<ExpressionExecutor>(context.client, action->expressions);
 				vector<LogicalType> insert_types;
 				for (auto &expr : action->expressions) {
-					insert_types.push_back(expr->return_type);
+					insert_types.push_back(expr->GetReturnType());
 				}
 				state.insert_chunk = make_uniq<DataChunk>();
 				state.insert_chunk->Initialize(context.client, insert_types);
@@ -108,16 +111,42 @@ public:
 
 class MergeIntoGlobalState : public GlobalSinkState {
 public:
-	MergeIntoGlobalState(ClientContext &context, const PhysicalMergeInto &op) : op(op) {
+	MergeIntoGlobalState(ClientContext &context, const PhysicalMergeInto &op)
+	    : op(op), matched_rows(context, GetRowIdTypes(op)) {
 		for (auto &action : op.actions) {
 			sink_states.push_back(action->op ? action->op->GetGlobalSinkState(context) : nullptr);
 		}
 		merged_count = 0;
 	}
+
+	static vector<LogicalType> GetRowIdTypes(const PhysicalMergeInto &op) {
+		auto &input_types = op.children[0].get().types;
+		if (op.row_id_index >= input_types.size()) {
+			throw InternalException("MERGE row ID index is out of range");
+		}
+		auto row_id_offset = NumericCast<vector<LogicalType>::difference_type>(op.row_id_index);
+		return vector<LogicalType>(input_types.begin() + row_id_offset, input_types.end());
+	}
+
 	const PhysicalMergeInto &op;
 	idx_t finalize_idx = 0;
 	vector<unique_ptr<GlobalSinkState>> sink_states;
 	atomic<idx_t> merged_count;
+	//! Target row-ids already matched by a WHEN MATCHED modifying action, to detect a second action on a row.
+	mutex match_lock;
+	RowIdDeduplicator matched_rows;
+
+	//! Record the matched target rows; throw if any row was already matched (cardinality violation). A distinct
+	//! count below the input count means a row ID repeated.
+	void CheckMatchedRows(DataChunk &matched, idx_t row_id_index) {
+		lock_guard<mutex> glock(match_lock);
+		auto distinct = matched_rows.Register(matched, row_id_index);
+		if (distinct != matched.size()) {
+			throw InvalidInputException(
+			    "MERGE INTO command cannot affect the same target row more than once. A target row matched more "
+			    "than one source row; ensure the source rows are deduplicated or the ON condition is unique.");
+		}
+	}
 
 	optional_ptr<DataChunk> ComputeActionInput(ClientContext &context, MergeIntoOperator &action, DataChunk &chunk,
 	                                           MergeIntoLocalState &local_state,
@@ -187,13 +216,22 @@ public:
 					// no data for this action - move to next action
 					continue;
 				}
+				// A WHEN MATCHED update/delete must not affect the same target row twice (cardinality violation).
+				// Checked here, on the freshly condition-selected rows (which still carry the row-id column), so
+				// rows filtered out by the action condition are not counted - matching PostgreSQL. Runs once per
+				// input chunk: on a BLOCKED resume input_chunk is still set and we skip re-checking.
+				if (range.condition == MergeActionCondition::WHEN_MATCHED &&
+				    (action->action_type == MergeActionType::MERGE_UPDATE ||
+				     action->action_type == MergeActionType::MERGE_DELETE)) {
+					CheckMatchedRows(*input_chunk, op.row_id_index);
+				}
 			}
 			// process the action
 			if (!action->op) {
 				if (action->action_type == MergeActionType::MERGE_ERROR) {
 					// abort - generate an error message
 					string merge_condition;
-					merge_condition += MergeIntoStatement::ActionConditionToString(range.condition);
+					merge_condition += MergeQueryNode::ActionConditionToString(range.condition);
 					if (action->condition) {
 						merge_condition += " AND " + action->condition->ToString();
 					}
@@ -286,17 +324,16 @@ void PhysicalMergeInto::ComputeMatches(MergeIntoLocalState &local_state, DataChu
 	not_matched.count = 0;
 	not_matched_by_source.count = 0;
 
-	UnifiedVectorFormat row_id_data;
-	chunk.data[row_id_index].ToUnifiedFormat(chunk.size(), row_id_data);
+	// The first row-ID component is also the target-presence marker and must be non-NULL for target rows.
+	auto row_id_validity = chunk.data[row_id_index].Validity();
 	if (source_marker.IsValid()) {
 		// source marker - check both row id and source marker
-		UnifiedVectorFormat source_marker_data;
-		chunk.data[source_marker.GetIndex()].ToUnifiedFormat(chunk.size(), source_marker_data);
+		auto source_marker_validity = chunk.data[source_marker.GetIndex()].Validity();
 		for (idx_t i = 0; i < chunk.size(); i++) {
-			if (!source_marker_data.validity.RowIsValid(source_marker_data.sel->get_index(i))) {
+			if (!source_marker_validity.IsValid(i)) {
 				// source marker is NULL - no source match
 				not_matched_by_source.sel.set_index(not_matched_by_source.count++, i);
-			} else if (!row_id_data.validity.RowIsValid(row_id_data.sel->get_index(i))) {
+			} else if (!row_id_validity.IsValid(i)) {
 				// target marker is NULL - no target match
 				not_matched.sel.set_index(not_matched.count++, i);
 			} else {
@@ -307,8 +344,7 @@ void PhysicalMergeInto::ComputeMatches(MergeIntoLocalState &local_state, DataChu
 	} else {
 		// no source marker - only check row-ids
 		for (idx_t i = 0; i < chunk.size(); i++) {
-			auto idx = row_id_data.sel->get_index(i);
-			if (row_id_data.validity.RowIsValid(idx)) {
+			if (row_id_validity.IsValid(i)) {
 				// match
 				matched.sel.set_index(matched.count++, i);
 			} else {
@@ -459,8 +495,7 @@ SourceResultType PhysicalMergeInto::GetDataInternal(ExecutionContext &context, D
                                                     OperatorSourceInput &input) const {
 	auto &g = sink_state->Cast<MergeIntoGlobalState>();
 	if (!return_chunk) {
-		chunk.SetCardinality(1);
-		chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(g.merged_count.load())));
+		chunk.data[0].Append(Value::BIGINT(NumericCast<int64_t>(g.merged_count.load())));
 		return SourceResultType::FINISHED;
 	}
 	auto &gstate = input.global_state.Cast<MergeGlobalSourceState>();
@@ -505,8 +540,7 @@ SourceResultType PhysicalMergeInto::GetDataInternal(ExecutionContext &context, D
 				throw InternalException("Unsupported merge action for RETURNING");
 			}
 			Value merge_action(merge_action_name);
-			chunk.data.back().Reference(merge_action);
-			chunk.SetCardinality(lstate.scan_chunk.size());
+			chunk.data.back().Reference(merge_action, count_t(lstate.scan_chunk.size()));
 		}
 
 		if (result != SourceResultType::FINISHED) {
