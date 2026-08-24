@@ -148,3 +148,64 @@ SELECT __mr_define_A FROM ev MATCH_RECOGNIZE(
 )
 ----
 <REGEX>:Binder Error.*__mr_define_A.*
+
+# CLASSIFIER() inside DEFINE
+# The row a DEFINE is deciding on is tentatively assigned to the symbol being defined, so
+# CLASSIFIER() is that symbol.
+
+query I
+SELECT i FROM ev MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A) DEFINE A as CLASSIFIER()='A'
+) ORDER BY i
+----
+1
+2
+3
+4
+5
+6
+
+# ... and it is never any other symbol
+query I
+SELECT count(*) FROM ev MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A) DEFINE A as CLASSIFIER()='B'
+)
+----
+0
+
+query I
+SELECT count(*) FROM ev MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A B) DEFINE A as v=1, B as CLASSIFIER()='A'
+)
+----
+0
+
+# each DEFINE sees its own symbol, so this matches the same rows as the plain conditions
+query I
+SELECT i FROM ev MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A B+)
+    DEFINE A as v=1 AND CLASSIFIER()='A', B as v=0 AND CLASSIFIER()='B'
+) ORDER BY i
+----
+1
+4
+
+query II
+SELECT i, cl FROM ev MATCH_RECOGNIZE(
+    ORDER BY i MEASURES CLASSIFIER() AS cl ALL ROWS PER MATCH PATTERN (A B)
+    DEFINE A as v=1 AND CLASSIFIER()='A', B as v=0
+) ORDER BY i
+----
+1	A
+2	B
+4	A
+5	B
+
+# MATCH_NUMBER() cannot work in DEFINE: the condition decides which rows form a match, so it is
+# evaluated before the match it would be numbered by exists
+statement error
+SELECT 1 FROM ev MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A) DEFINE A as MATCH_NUMBER()=1
+)
+----
+<REGEX>:Not implemented Error.*MATCH_NUMBER\(\) is not supported in DEFINE.*

@@ -79,7 +79,8 @@ static void CheckAndZapQualifiers(ParsedExpression &root_expr, const string &def
 	});
 }
 
-static void ReplaceFunctions(unique_ptr<ParsedExpression> &expr, const WindowExpression &pattern_window) {
+static void ReplaceFunctions(unique_ptr<ParsedExpression> &expr, const WindowExpression &pattern_window,
+                             const string &define_name) {
 	if (expr->GetExpressionType() == ExpressionType::FUNCTION) {
 		auto &function = expr->Cast<FunctionExpression>();
 		auto function_name = StringUtil::Upper(function.FunctionName().GetIdentifierName());
@@ -94,9 +95,15 @@ static void ReplaceFunctions(unique_ptr<ParsedExpression> &expr, const WindowExp
 		} else if (function_name == "LAST") {
 			window_function = "last_value";
 		} else if (function_name == "MATCH_NUMBER") {
-			throw NotImplementedException("MATCH_NUMBER");
-		} else if (function_name == "CLASSIFIER") {
-			throw NotImplementedException("CLASSIFIER");
+			// DEFINE predicates are evaluated for every row before matching starts, so they cannot
+			// depend on the match that is being assembled
+			throw NotImplementedException(
+			    "MATCH_NUMBER() is not supported in DEFINE, because a DEFINE condition is evaluated before "
+			    "the match it would belong to exists. It is supported in MEASURES.");
+		} else if (function_name == "CLASSIFIER" && function.GetArguments().empty()) {
+			// the row being tested is the one this DEFINE is deciding on, so it classifies as this symbol
+			expr = make_uniq<ConstantExpression>(Value(define_name));
+			return;
 		}
 
 		if (!window_function.empty()) {
@@ -110,7 +117,7 @@ static void ReplaceFunctions(unique_ptr<ParsedExpression> &expr, const WindowExp
 		// we do nothing if it's something else
 	}
 	ParsedExpressionIterator::EnumerateChildren(
-	    *expr, [&](unique_ptr<ParsedExpression> &child) { ReplaceFunctions(child, pattern_window); });
+	    *expr, [&](unique_ptr<ParsedExpression> &child) { ReplaceFunctions(child, pattern_window, define_name); });
 }
 
 //! Pattern symbols live in the same namespace as the input columns, so they are qualified with an
@@ -274,7 +281,7 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 		D_ASSERT(pattern_window_child_entries.find(column_name) == pattern_window_child_entries.end());
 
 		CheckAndZapQualifiers(*expr, define_name);
-		ReplaceFunctions(expr, window_template->Cast<WindowExpression>());
+		ReplaceFunctions(expr, window_template->Cast<WindowExpression>(), define_name);
 		expr->SetAlias(Identifier(column_name));
 		define_select_node->select_list.push_back(std::move(expr));
 		pattern_window_child_entries[column_name] = make_uniq<ColumnRefExpression>(Identifier(column_name));

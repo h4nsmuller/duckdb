@@ -74,16 +74,14 @@ SELECT 1 FROM q MATCH_RECOGNIZE(MEASURES i AS x PATTERN (A B) DEFINE A as B.i > 
 ----
 <REGEX>:Not implemented Error.*Define references cannot refer to other defines.*
 
-# not implemented yet: the MATCH_NUMBER and CLASSIFIER functions
+# CLASSIFIER() resolves inside DEFINE, MATCH_NUMBER() cannot
+statement ok
+SELECT 1 FROM q MATCH_RECOGNIZE(MEASURES i AS x PATTERN (A) DEFINE A as CLASSIFIER() = 'A')
+
 statement error
 SELECT 1 FROM q MATCH_RECOGNIZE(MEASURES i AS x PATTERN (A) DEFINE A as MATCH_NUMBER() > 0)
 ----
-<REGEX>:Not implemented Error.*MATCH_NUMBER.*
-
-statement error
-SELECT 1 FROM q MATCH_RECOGNIZE(MEASURES i AS x PATTERN (A) DEFINE A as CLASSIFIER() = 'A')
-----
-<REGEX>:Not implemented Error.*CLASSIFIER.*
+<REGEX>:Not implemented Error.*MATCH_NUMBER\(\) is not supported in DEFINE.*
 
 # MATCH_RECOGNIZE has to be reserved, otherwise the optional table alias in a base
 # table reference consumes it before the clause can match
