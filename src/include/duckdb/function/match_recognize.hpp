@@ -118,6 +118,16 @@ struct MatchRecognizeFunctionData : FunctionData {
 	vector<string> symbols;
 	//! Whether any condition reads MATCH_NUMBER(), which is what forces re-evaluation per match
 	bool depends_on_match_number = false;
+	//! FIRST()/LAST() calls, resolved against the match being assembled
+	struct Navigation {
+		bool last;
+		string symbol;
+		idx_t field;
+		idx_t offset;
+	};
+	vector<Navigation> navigations;
+	//! Conditions that read a navigation field, and so have to be evaluated row by row
+	vector<bool> row_scoped;
 	//! How to resume scanning after a match has been found
 	MatchRecognizeAfterMatch after_match = MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_DEFAULT;
 	//! The target pattern variable for the SKIP TO FIRST/LAST forms
@@ -132,6 +142,8 @@ struct MatchRecognizeFunctionData : FunctionData {
 		}
 		res->symbols = symbols;
 		res->depends_on_match_number = depends_on_match_number;
+		res->navigations = navigations;
+		res->row_scoped = row_scoped;
 		res->after_match = after_match;
 		res->after_match_variable = after_match_variable;
 		return res;
