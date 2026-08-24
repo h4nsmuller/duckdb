@@ -145,8 +145,8 @@ PEGTransformerFactory::TransformRowPatternFactor(PEGTransformer &transformer,
 	MatchRecognizeQuantifier quantifier;
 	if (row_pattern_quantifier) {
 		quantifier = *row_pattern_quantifier;
-	} else if (row_pattern_primary->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-		// a bare symbol matches exactly once
+	} else {
+		// an unquantified symbol or group matches exactly once
 		quantifier.min_count = 1;
 		quantifier.max_count = 1;
 	}

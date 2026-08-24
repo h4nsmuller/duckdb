@@ -240,28 +240,30 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 	// figure out which define has which child offset
 
 	unordered_map<string, uint8_t *> define_child_mapping;
-	auto defines_struct_child = partition_chunk.GetTypes()[0];
+	// the DEFINE struct is wherever expression sharing put it, which is not necessarily column 0
+	const auto defines_idx = gstate.executor.child_idx[0];
+	auto defines_struct_child = partition_chunk.GetTypes()[defines_idx];
 	for (idx_t struct_child_idx = 0; struct_child_idx < StructType::GetChildCount(defines_struct_child);
 	     struct_child_idx++) {
-		auto &child_vector = StructVector::GetEntries(partition_chunk.data[0])[struct_child_idx];
+		auto &child_vector = StructVector::GetEntries(partition_chunk.data[defines_idx])[struct_child_idx];
 		D_ASSERT(child_vector.GetVectorType() == VectorType::FLAT_VECTOR);
 		define_child_mapping[StructType::GetChildName(defines_struct_child, struct_child_idx).GetIdentifierName()] =
 		    FlatVector::GetDataMutable<uint8_t>(child_vector);
 	}
 
 	// iterate over entire input, but there can be many partitions in the input
-	for (idx_t payload_idx = 1; payload_idx < gstate.payload_count; payload_idx++) {
-		if (!gstate.partition_mask.RowIsValid(payload_idx) && payload_idx + 1 < gstate.payload_count) {
+	for (idx_t payload_idx = 1; payload_idx <= gstate.payload_count; payload_idx++) {
+		// a partition is closed either by the start of the next one or by the end of the input
+		const auto at_end = payload_idx == gstate.payload_count;
+		if (!at_end && !gstate.partition_mask.RowIsValid(payload_idx)) {
 			continue;
 		}
-		// the partition end offset depends on whether we found a next partition or if we are at the end
-		auto partition_end =
-		    payload_idx + 1 == gstate.partition_mask.RowIsValid(payload_idx) ? payload_idx - 1 : payload_idx;
+		const idx_t partition_end = payload_idx - 1;
 
 		// FIXME
 		FetchPartition(context.client, *collection->inputs, partition_chunk, partition_start, partition_end);
 
-		for (idx_t partition_idx = partition_start; partition_idx < partition_end; partition_idx++) {
+		for (idx_t partition_idx = partition_start; partition_idx <= partition_end; partition_idx++) {
 			auto match = MatchPattern(*config.pattern, partition_chunk, partition_idx, define_child_mapping).back();
 
 			FlatVector::ValidityMutable(gstate.result_vec).SetValid(partition_idx);

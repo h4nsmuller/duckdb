@@ -111,6 +111,12 @@ static void ReplaceFunctions(unique_ptr<ParsedExpression> &expr, const WindowExp
 	    *expr, [&](unique_ptr<ParsedExpression> &child) { ReplaceFunctions(child, pattern_window); });
 }
 
+//! Pattern symbols live in the same namespace as the input columns, so they are qualified with an
+//! internal prefix to keep a DEFINE from resolving to a base table column of the same name.
+static string DefineColumnName(const string &symbol) {
+	return "__mr_define_" + symbol;
+}
+
 static unique_ptr<ParsedExpression> CreateStructExtract(const string &column_name, const string &child_name) {
 	vector<unique_ptr<ParsedExpression>> children;
 	children.push_back(make_uniq<ColumnRefExpression>(Identifier(column_name)));
@@ -165,13 +171,22 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 		auto define_name = expr->GetAlias().GetIdentifierName();
 		// TODO can this happen?
 		D_ASSERT(!define_name.empty());
-		D_ASSERT(pattern_window_child_entries.find(define_name) == pattern_window_child_entries.end());
+		auto column_name = DefineColumnName(define_name);
+		D_ASSERT(pattern_window_child_entries.find(column_name) == pattern_window_child_entries.end());
 
 		CheckAndZapQualifiers(*expr, define_name);
 		ReplaceFunctions(expr, window_template->Cast<WindowExpression>());
+		expr->SetAlias(Identifier(column_name));
 		define_select_node->select_list.push_back(std::move(expr));
-		pattern_window_child_entries[define_name] = make_uniq<ColumnRefExpression>(Identifier(define_name));
+		pattern_window_child_entries[column_name] = make_uniq<ColumnRefExpression>(Identifier(column_name));
 	}
+
+	// rewrite the pattern symbols to the same internal names
+	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(
+	    *ref.config->pattern, [&](ColumnRefExpression &colref) {
+		    D_ASSERT(colref.ColumnNames().size() == 1);
+		    colref.ColumnNamesMutable() = {Identifier(DefineColumnName(colref.GetColumnName().GetIdentifierName()))};
+	    });
 
 	// push computation of measures into the lowest window.
 	// for (auto &expr : ref.config->measures_expression_list) {
