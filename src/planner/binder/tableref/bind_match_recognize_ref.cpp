@@ -114,7 +114,7 @@ static void ReplaceFunctions(unique_ptr<ParsedExpression> &expr, const WindowExp
 //! Pattern symbols live in the same namespace as the input columns, so they are qualified with an
 //! internal prefix to keep a DEFINE from resolving to a base table column of the same name.
 static string DefineColumnName(const string &symbol) {
-	return "__mr_define_" + symbol;
+	return MATCH_RECOGNIZE_DEFINE_PREFIX + symbol;
 }
 
 static unique_ptr<ParsedExpression> CreateStructExtract(const string &column_name, const string &child_name) {
@@ -223,7 +223,15 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	// TODO deal with measures, what on earth is in the output??
 	// TODO likely measures have to be pushed into the way-down window, too
 
-	// the pattern is passed as a trailing argument - the bind callback moves it into the function data
+	// the AFTER MATCH SKIP option and the pattern are configuration rather than per-row arguments;
+	// the bind callback moves them into the function data
+	pattern_window->GetArgumentsMutable().emplace_back(
+	    make_uniq<ConstantExpression>(Value::UTINYINT(static_cast<uint8_t>(ref.config->after_match))));
+	auto skip_variable = Value(LogicalType::VARCHAR);
+	if (ref.config->after_match_variable) {
+		skip_variable = Value(DefineColumnName(ref.config->after_match_variable->GetValue().ToString()));
+	}
+	pattern_window->GetArgumentsMutable().emplace_back(make_uniq<ConstantExpression>(std::move(skip_variable)));
 	pattern_window->GetArgumentsMutable().emplace_back(std::move(ref.config->pattern));
 
 	auto define_select = make_uniq<SelectStatement>(std::move(define_select_node));
@@ -231,73 +239,10 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	pattern_window->SetAlias("__pattern_window");
 	select_node->select_list.push_back(std::move(pattern_window));
 
-	select_node->qualify = CreateStructExtract("__pattern_window", "complete");
-
-	// After Match skip option
-	bool is_skip_to_next_row =
-	    ref.config->after_match == MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_NEXT_ROW;
-	unique_ptr<LogicalFilter> last_filter = nullptr;
-
-	if (!is_skip_to_next_row) {
-		// // After Match window
-		auto after_match_window = make_uniq<WindowExpression>("", "", "non_overlap_intervals");
-		after_match_window->WindowStartMutable() = WindowBoundary::UNBOUNDED_PRECEDING;
-		after_match_window->WindowEndMutable() = WindowBoundary::CURRENT_ROW_RANGE;
-
-		// bind same partitions to second window as well
-		for (auto &expr : ref.config->partition_expressions) {
-			after_match_window->PartitionsMutable().push_back(expr->Copy());
-		}
-
-		// enforce ordering: intervals are always ordered by their lower bound
-		auto low = CreateStructExtract("__pattern_window", "match_start");
-		after_match_window->OrderByMutable().emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST,
-		                                                  low->Copy());
-		after_match_window->GetArgumentsMutable().emplace_back(std::move(low));
-
-		after_match_window->SetAlias("__after_match_window");
-
-		// upper interval bound: depends on the skip option
-		switch (ref.config->after_match) {
-		case MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_FIRST_VAR:
-		case MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_LAST_VAR: {
-			auto high = CreateStructExtract("__pattern_window", "skip_to");
-			after_match_window->GetArgumentsMutable().emplace_back(std::move(high));
-			after_match_window->GetArgumentsMutable().emplace_back(make_uniq<ConstantExpression>(Value::BOOLEAN(true)));
-			break;
-		}
-		case MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_LAST_ROW:
-		case MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_DEFAULT:
-		default: {
-			auto high = CreateStructExtract("__pattern_window", "match_end");
-			after_match_window->GetArgumentsMutable().emplace_back(std::move(high));
-			after_match_window->GetArgumentsMutable().emplace_back(
-			    make_uniq<ConstantExpression>(Value::BOOLEAN(false)));
-			break;
-		}
-		}
-
-		auto skip_select = make_uniq<SelectStatement>(std::move(select_node));
-		auto skip_node = make_uniq<SelectNode>(make_uniq<SubqueryRef>(std::move(skip_select)));
-		skip_node->select_list.push_back(make_uniq<StarExpression>()); // TODO ??
-		skip_node->qualify = std::move(after_match_window);
-
-		select_node = std::move(skip_node);
-	}
-
-	// auto measures_select = make_uniq<SelectStatement>(std::move(select_node));
-	// auto measures_node = make_uniq<SelectNode>(make_uniq<SubqueryRef>(std::move(measures_select)));
-	//
-	// // it seems the partitions go first?
-	// for (auto &expr : ref.config->partition_expressions) {
-	// 	measures_node->select_list.push_back(expr->Copy());
-	// }
-	// // now all the measures that we have prepared earlier
-	// for (auto &expr : ref.config->measures_expression_list) {
-	// 	D_ASSERT(!expr->alias.empty());
-	// 	measures_node->select_list.push_back(make_uniq<ColumnRefExpression>(expr->alias));
-	// }
-	// select_node = std::move(measures_node);
+	// ONE ROW PER MATCH keeps only the row a match starts on, ALL ROWS PER MATCH keeps every row of
+	// the match. Rows outside a match have a NULL struct, so both filters discard them.
+	const auto all_rows = ref.config->rows_per_match == MatchRecognizeRows::MATCH_RECOGNIZE_ROWS_ALL;
+	select_node->qualify = CreateStructExtract("__pattern_window", all_rows ? "in_match" : "is_match_start");
 
 	auto child_binder = Binder::CreateBinder(context, this);
 	auto result = child_binder->Bind(*select_node);

@@ -17,19 +17,9 @@ namespace duckdb {
 
 struct MatchRecognizeFun {
 	static constexpr const char *Name = "match_recognize";
-	static constexpr const char *Parameters = "defines,pattern";
+	static constexpr const char *Parameters = "defines,after_match,after_match_variable,pattern";
 	static constexpr const char *Description = "Internal window function implementing row pattern matching for MATCH_RECOGNIZE";
 	static constexpr const char *Example = "MATCH_RECOGNIZE(PATTERN (A B) DEFINE A AS x > 0, B AS y > 0)";
-	static constexpr const char *Categories = "";
-
-	static WindowFunction GetFunction();
-};
-
-struct NonOverlapIntervalsFun {
-	static constexpr const char *Name = "non_overlap_intervals";
-	static constexpr const char *Parameters = "low,high,inclusive";
-	static constexpr const char *Description = "Internal window function selecting the non-overlapping intervals of a partition";
-	static constexpr const char *Example = "non_overlap_intervals(match_start, match_end, false) OVER (PARTITION BY p)";
 	static constexpr const char *Categories = "";
 
 	static WindowFunction GetFunction();

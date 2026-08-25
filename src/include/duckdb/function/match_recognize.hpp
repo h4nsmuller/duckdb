@@ -9,9 +9,23 @@
 #pragma once
 
 #include "duckdb/function/function.hpp"
+#include "duckdb/parser/tableref/match_recognize_ref.hpp"
 #include "duckdb/planner/expression.hpp"
 
 namespace duckdb {
+
+//! Pattern symbols share a namespace with the input columns, so they are qualified with this prefix in
+//! the plan to keep a DEFINE from resolving to a base table column of the same name.
+constexpr const char *MATCH_RECOGNIZE_DEFINE_PREFIX = "__mr_define_";
+
+//! The user facing pattern variable for a prefixed plan column
+inline string MatchRecognizeSymbolName(const string &column_name) {
+	const auto prefix_size = strlen(MATCH_RECOGNIZE_DEFINE_PREFIX);
+	if (StringUtil::StartsWith(column_name, MATCH_RECOGNIZE_DEFINE_PREFIX)) {
+		return column_name.substr(prefix_size);
+	}
+	return column_name;
+}
 
 class BoundAlternationExpression : public Expression {
 public:
@@ -93,16 +107,23 @@ public:
 // TODO this needs to live somewhere else!!
 struct MatchRecognizeFunctionData : FunctionData {
 	unique_ptr<Expression> pattern;
+	//! How to resume scanning after a match has been found
+	MatchRecognizeAfterMatch after_match = MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_DEFAULT;
+	//! The target pattern variable for the SKIP TO FIRST/LAST forms
+	string after_match_variable;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto res = make_uniq<MatchRecognizeFunctionData>();
 
 		res->pattern = pattern->Copy();
+		res->after_match = after_match;
+		res->after_match_variable = after_match_variable;
 		return res;
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<MatchRecognizeFunctionData>();
-		return other.pattern->Equals(*pattern);
+		return other.pattern->Equals(*pattern) && other.after_match == after_match &&
+		       other.after_match_variable == after_match_variable;
 	}
 };
 
