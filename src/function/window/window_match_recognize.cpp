@@ -609,40 +609,39 @@ static idx_t SkipTo(const MatchRecognizeFunctionData &config, idx_t skip_symbol,
 }
 
 // this gets called per partition
-void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_ptr<WindowCollection> collection,
-                                            OperatorSinkInput &sink) {
-	auto &gstate = sink.global_state.Cast<WindowMatchRecognizeGlobalState>();
-	auto &config = gstate.executor.wexpr.BindInfo()->Cast<MatchRecognizeFunctionData>();
+//! Work out where the partitions are, and materialise the rows if a condition has to be settled per
+//! row. Both are shared by every thread that reaches Finalize, so this happens once.
+static void PrepareHashGroup(ExecutionContext &context, WindowMatchRecognizeGlobalState &gstate,
+                             const MatchRecognizeFunctionData &config, WindowCollection &collection) {
+	lock_guard<mutex> lock(gstate.state_lock);
+	if (gstate.prepared) {
+		return;
+	}
+	gstate.prepared = true;
 
-	// we always start with a new partition
-	D_ASSERT(gstate.partition_mask.RowIsValid(0));
-
-	// One time setup: work out where the partitions are, and materialise the rows if a condition has
-	// to be settled per row. Both are shared by every thread that gets here.
-	{
-		lock_guard<mutex> lock(gstate.state_lock);
-		if (!gstate.prepared) {
-			gstate.prepared = true;
-			idx_t partition_start = 0;
-			for (idx_t payload_idx = 1; payload_idx <= gstate.payload_count; payload_idx++) {
-				const auto at_end = payload_idx == gstate.payload_count;
-				if (!at_end && !gstate.partition_mask.RowIsValid(payload_idx)) {
-					continue;
-				}
-				gstate.partitions.emplace_back(partition_start, payload_idx - 1);
-				partition_start = payload_idx;
-			}
-			auto per_row = !config.navigations.empty();
-			for (auto scoped : config.row_scoped) {
-				per_row = per_row || scoped;
-			}
-			if (per_row) {
-				gstate.rows.Initialize(context.client, collection->inputs->Types(), gstate.payload_count);
-				FetchHashGroup(*collection->inputs, gstate.rows);
-			}
+	idx_t partition_start = 0;
+	for (idx_t payload_idx = 1; payload_idx <= gstate.payload_count; payload_idx++) {
+		const auto at_end = payload_idx == gstate.payload_count;
+		if (!at_end && !gstate.partition_mask.RowIsValid(payload_idx)) {
+			continue;
 		}
+		gstate.partitions.emplace_back(partition_start, payload_idx - 1);
+		partition_start = payload_idx;
 	}
 
+	auto per_row = !config.navigations.empty();
+	for (auto scoped : config.row_scoped) {
+		per_row = per_row || scoped;
+	}
+	if (per_row) {
+		gstate.rows.Initialize(context.client, collection.inputs->Types(), gstate.payload_count);
+		FetchHashGroup(*collection.inputs, gstate.rows);
+	}
+}
+
+//! Match the partitions of the hash group, taking them from the shared cursor until they run out.
+static void ScanPartitions(ExecutionContext &context, WindowMatchRecognizeGlobalState &gstate,
+                           const MatchRecognizeFunctionData &config) {
 	auto &partition_chunk = gstate.rows;
 	auto &classifiers = gstate.classifiers;
 
@@ -809,6 +808,18 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 			gstate.MaterializeSpans(config.symbols);
 		}
 	}
+}
+
+void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_ptr<WindowCollection> collection,
+                                            OperatorSinkInput &sink) {
+	auto &gstate = sink.global_state.Cast<WindowMatchRecognizeGlobalState>();
+	auto &config = gstate.executor.wexpr.BindInfo()->Cast<MatchRecognizeFunctionData>();
+
+	// we always start with a new partition
+	D_ASSERT(gstate.partition_mask.RowIsValid(0));
+
+	PrepareHashGroup(context, gstate, config, *collection);
+	ScanPartitions(context, gstate, config);
 }
 
 void WindowMatchRecognizeExecutor::GetData(ExecutionContext &context, DataChunk &eval_chunk, DataChunk &bounds,
