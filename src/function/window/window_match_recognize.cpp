@@ -28,6 +28,7 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 		for (auto &values : condition_values) {
 			values.assign(payload_count, 0);
 		}
+		classifiers.resize(payload_count);
 		D_ASSERT(result_vec.GetType().id() == LogicalTypeId::LIST);
 	}
 
@@ -69,9 +70,16 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 
 	// TODO can we get away with putting this into the local state?
 	mutex state_lock;
-	//! Finalize runs on every thread, but the matching is over the whole hash group and only has to
-	//! happen once
-	bool finalized = false;
+	//! Set up once; the threads then take partitions from the cursor below
+	bool prepared = false;
+	//! Partitions are independent, so the threads that reach Finalize share them out
+	vector<pair<idx_t, idx_t>> partitions;
+	atomic<idx_t> next_partition {0};
+	atomic<idx_t> completed_partitions {0};
+	//! The variable that classified each row, written only by the thread that owns the partition
+	vector<string> classifiers;
+	//! Materialised only when a condition has to be settled per row, and then shared by the threads
+	DataChunk rows;
 	//! One boolean per symbol per row. Sink fills these as rows arrive, over disjoint ranges, so the
 	//! threads do not need to coordinate.
 	vector<vector<uint8_t>> condition_values;
@@ -558,33 +566,39 @@ static idx_t SkipTo(const MatchRecognizeFunctionData &config, idx_t match_start,
 void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_ptr<WindowCollection> collection,
                                             OperatorSinkInput &sink) {
 	auto &gstate = sink.global_state.Cast<WindowMatchRecognizeGlobalState>();
-	lock_guard<mutex> lock(gstate.state_lock);
-	if (gstate.finalized) {
-		return;
-	}
-	gstate.finalized = true;
-
 	auto &config = gstate.executor.wexpr.BindInfo()->Cast<MatchRecognizeFunctionData>();
 
-	idx_t partition_start = 0;
 	// we always start with a new partition
 	D_ASSERT(gstate.partition_mask.RowIsValid(0));
 
-	// TODO this should probably be kept elsewhere
-	// The operator has already materialised the hash group. Only logical navigation needs random
-	// access to arbitrary rows of it, so a second copy is made only when a condition navigates.
-	auto navigates = !config.navigations.empty();
-	for (auto scoped : config.row_scoped) {
-		navigates = navigates || scoped;
-	}
-	DataChunk partition_chunk;
-	if (navigates) {
-		partition_chunk.Initialize(context.client, collection->inputs->Types(), gstate.payload_count);
-		FetchHashGroup(*collection->inputs, partition_chunk);
+	// One time setup: work out where the partitions are, and materialise the rows if a condition has
+	// to be settled per row. Both are shared by every thread that gets here.
+	{
+		lock_guard<mutex> lock(gstate.state_lock);
+		if (!gstate.prepared) {
+			gstate.prepared = true;
+			idx_t partition_start = 0;
+			for (idx_t payload_idx = 1; payload_idx <= gstate.payload_count; payload_idx++) {
+				const auto at_end = payload_idx == gstate.payload_count;
+				if (!at_end && !gstate.partition_mask.RowIsValid(payload_idx)) {
+					continue;
+				}
+				gstate.partitions.emplace_back(partition_start, payload_idx - 1);
+				partition_start = payload_idx;
+			}
+			auto per_row = !config.navigations.empty();
+			for (auto scoped : config.row_scoped) {
+				per_row = per_row || scoped;
+			}
+			if (per_row) {
+				gstate.rows.Initialize(context.client, collection->inputs->Types(), gstate.payload_count);
+				FetchHashGroup(*collection->inputs, gstate.rows);
+			}
+		}
 	}
 
-	// the pattern variable that classified each row, indexed by row offset within the hash group
-	vector<string> classifiers(gstate.payload_count);
+	auto &partition_chunk = gstate.rows;
+	auto &classifiers = gstate.classifiers;
 
 	// The conditions reference the window arguments; expression sharing decided where those landed in
 	// the collection, so rebind them against it before evaluating.
@@ -692,14 +706,15 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		       UnifiedVectorFormat::GetData<bool>(result_data)[result_idx];
 	};
 
-	// iterate over entire input, but there can be many partitions in the input
-	for (idx_t payload_idx = 1; payload_idx <= gstate.payload_count; payload_idx++) {
-		// a partition is closed either by the start of the next one or by the end of the input
-		const auto at_end = payload_idx == gstate.payload_count;
-		if (!at_end && !gstate.partition_mask.RowIsValid(payload_idx)) {
-			continue;
+	// Partitions are independent, so every thread that reaches Finalize takes them from a shared
+	// cursor rather than one thread doing the whole hash group.
+	while (true) {
+		const auto partition_idx = gstate.next_partition++;
+		if (partition_idx >= gstate.partitions.size()) {
+			break;
 		}
-		const idx_t partition_end = payload_idx - 1;
+		const auto partition_start = gstate.partitions[partition_idx].first;
+		const auto partition_end = gstate.partitions[partition_idx].second;
 
 		// scan the partition left to right, applying AFTER MATCH SKIP after every match. Rows that are
 		// not part of any match keep a NULL struct, which filters them out downstream.
@@ -725,10 +740,12 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 			row = SkipTo(config, row, match_end, classifiers);
 			current_match_number = match_number + 1;
 		}
-		partition_start = payload_idx;
-	}
 
-	gstate.MaterializeSpans();
+		// the thread that finishes the last partition publishes the result
+		if (++gstate.completed_partitions == gstate.partitions.size()) {
+			gstate.MaterializeSpans();
+		}
+	}
 }
 
 // this should actually be it yay!
