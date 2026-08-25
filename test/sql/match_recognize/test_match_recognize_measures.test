@@ -269,3 +269,103 @@ SELECT p, i FROM mp MATCH_RECOGNIZE(
 1	2
 2	1
 2	2
+
+# Row pattern navigation in DEFINE
+# PREV/NEXT are physical: they navigate the ordered partition and may leave the match.
+# FIRST/LAST are logical: they navigate the rows of the match being assembled.
+
+statement ok
+create table nav(i integer, v integer);
+
+statement ok
+insert into nav values (1,5),(2,7),(3,6),(4,9),(5,2);
+
+# PREV is relative to the partition, so it sees the row before the match starts
+query I
+SELECT i FROM nav MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A) DEFINE A as v > PREV(v)
+) ORDER BY i
+----
+2
+4
+
+query I
+SELECT i FROM nav MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A) DEFINE A as v < NEXT(v)
+) ORDER BY i
+----
+1
+3
+
+# LAST navigates the rows of this match, so it reads the A of the same match
+query I
+SELECT i FROM nav MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x ALL ROWS PER MATCH PATTERN (A B)
+    DEFINE A as true, B as v > LAST(A.v)
+) ORDER BY i
+----
+1
+2
+3
+4
+
+statement ok
+create table run(i integer, v integer);
+
+statement ok
+insert into run values (1,1),(2,3),(3,5),(4,2),(5,8);
+
+# FIRST is anchored at the row the match started on
+query I
+SELECT i FROM run MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x ALL ROWS PER MATCH PATTERN (A B B)
+    DEFINE A as true, B as v > FIRST(A.v)
+) ORDER BY i
+----
+1
+2
+3
+
+# unqualified navigation refers to the match rather than to one variable
+query I
+SELECT i FROM run MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x ALL ROWS PER MATCH PATTERN (A B)
+    DEFINE A as true, B as v > FIRST(v)
+) ORDER BY i
+----
+1
+2
+4
+5
+
+# the row under test counts as the variable it is being tested for, so LAST(B.v) is its own value
+query I
+SELECT count(*) FROM run MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A B+) DEFINE A as true, B as v > LAST(B.v)
+)
+----
+0
+
+# navigation composes with the other DEFINE features
+query I
+SELECT i FROM nav MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x ALL ROWS PER MATCH PATTERN (A B)
+    DEFINE A as true, B as v > LAST(A.v) AND CLASSIFIER()='B' AND MATCH_NUMBER()=1
+) ORDER BY i
+----
+1
+2
+
+statement error
+SELECT 1 FROM nav MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A B) DEFINE A as true, B as v > LAST(FIRST(v))
+)
+----
+<REGEX>:Binder Error.*Nested row pattern navigation is not supported.*
+
+statement error
+SELECT 1 FROM nav MATCH_RECOGNIZE(
+    ORDER BY i MEASURES i AS x PATTERN (A B) DEFINE A as true, B as v > LAST(v, i)
+)
+----
+<REGEX>:Binder Error.*offset of LAST\(\) must be a constant.*

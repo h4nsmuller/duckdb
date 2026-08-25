@@ -66,7 +66,7 @@ static void RebindToArguments(unique_ptr<Expression> &expr, const expression_map
 
 unique_ptr<FunctionData> WindowMatchRecognizeExecutor::Bind(BindWindowFunctionInput &input) {
 	auto &arguments = input.GetArguments();
-	if (arguments.size() != 6) {
+	if (arguments.size() != 7) {
 		throw BinderException("MATCH_RECOGNIZE expects its columns, conditions, pattern and configuration");
 	}
 
@@ -90,9 +90,27 @@ unique_ptr<FunctionData> WindowMatchRecognizeExecutor::Bind(BindWindowFunctionIn
 	}
 
 	// the conditions are only packed so that they get bound; they are evaluated by the matcher
+	unordered_set<idx_t> navigation_fields;
+	for (auto &navigation : ListValue::GetChildren(arguments[6]->Cast<BoundConstantExpression>().GetValue())) {
+		auto &fields = StructValue::GetChildren(navigation);
+		MatchRecognizeFunctionData::Navigation spec;
+		spec.last = fields[0].GetValue<bool>();
+		spec.symbol = fields[1].IsNull() ? string() : fields[1].GetValue<string>();
+		spec.field = NumericCast<idx_t>(fields[2].GetValue<uint64_t>());
+		spec.offset = NumericCast<idx_t>(fields[3].GetValue<uint64_t>());
+		navigation_fields.insert(spec.field);
+		bind_data->navigations.push_back(spec);
+	}
+
 	auto &condition_pack = arguments[1]->Cast<BoundFunctionExpression>();
 	for (auto &condition : condition_pack.GetChildrenMutable()) {
 		RebindToArguments(condition, argument_index, 0, bind_data->depends_on_match_number);
+		bool reads_navigation = false;
+		ExpressionIterator::VisitExpression<BoundReferenceExpression>(
+		    *condition, [&](const BoundReferenceExpression &bound_ref) {
+			    reads_navigation = reads_navigation || navigation_fields.count(bound_ref.Index()) > 0;
+		    });
+		bind_data->row_scoped.push_back(reads_navigation);
 		bind_data->conditions.push_back(std::move(condition));
 	}
 	if (bind_data->conditions.size() != bind_data->symbols.size()) {
@@ -187,9 +205,11 @@ struct Match {
 // Successful symbol matches record the matching variable at their row offset. Failed branches may leave
 // stale entries behind, but every offset a successful match covers is written by that match, so reading
 // the range of a successful match is well defined.
-static vector<Match> MatchPattern(const Expression &pattern, const DataChunk &input, const idx_t offset,
-                                  unordered_map<string, uint8_t *> &define_child_mapping, vector<string> &classifiers) {
-	if (offset >= input.size()) {
+using SymbolMatcher = std::function<bool(const string &symbol, idx_t row)>;
+
+static vector<Match> MatchPattern(const Expression &pattern, idx_t input_size, const idx_t offset,
+                                  const SymbolMatcher &symbol_matches, vector<string> &classifiers) {
+	if (offset >= input_size) {
 		return {Match(false)};
 	}
 	switch (pattern.GetExpressionType()) {
@@ -202,7 +222,7 @@ static vector<Match> MatchPattern(const Expression &pattern, const DataChunk &in
 
 		while (token_idx < concatenation_expr.children.size()) {
 			auto &child_pattern = *concatenation_expr.children[token_idx];
-			auto res = MatchPattern(child_pattern, input, child_start_idx, define_child_mapping, classifiers);
+			auto res = MatchPattern(child_pattern, input_size, child_start_idx, symbol_matches, classifiers);
 			if (res.back().success) {
 				matches.insert(matches.end(), res.begin(), res.end());
 				child_start_idx = res.back().end_idx.GetIndex();
@@ -232,22 +252,22 @@ static vector<Match> MatchPattern(const Expression &pattern, const DataChunk &in
 	case ExpressionType::ALTERNATION: {
 		// ordered choice: the left alternative wins if it matches
 		auto &alternation_expr = pattern.Cast<BoundAlternationExpression>();
-		auto left = MatchPattern(*alternation_expr.child_left, input, offset, define_child_mapping, classifiers);
+		auto left = MatchPattern(*alternation_expr.child_left, input_size, offset, symbol_matches, classifiers);
 		if (left.back().success) {
 			return left;
 		}
-		return MatchPattern(*alternation_expr.child_right, input, offset, define_child_mapping, classifiers);
+		return MatchPattern(*alternation_expr.child_right, input_size, offset, symbol_matches, classifiers);
 	}
 	case ExpressionType::QUANTIFIER: {
 		auto &quantifier_expr = pattern.Cast<BoundQuantifierExpression>();
 		idx_t match_count = 0;
 		auto child_start_idx = offset;
 		auto max_offset = quantifier_expr.max_count.IsValid()
-		                      ? MinValue(input.size(), quantifier_expr.max_count.GetIndex())
-		                      : input.size();
+		                      ? MinValue(input_size, quantifier_expr.max_count.GetIndex())
+		                      : input_size;
 		vector<Match> matches;
 		while (match_count < max_offset) {
-			auto res = MatchPattern(*quantifier_expr.child, input, child_start_idx, define_child_mapping, classifiers);
+			auto res = MatchPattern(*quantifier_expr.child, input_size, child_start_idx, symbol_matches, classifiers);
 			if (!res.back().success) {
 				break;
 			}
@@ -267,11 +287,14 @@ static vector<Match> MatchPattern(const Expression &pattern, const DataChunk &in
 	case ExpressionType::VALUE_CONSTANT: {
 		// TODO cache those pointers in the map instead of the vector
 		auto symbol = pattern.Cast<BoundConstantExpression>().GetValue().GetValue<string>();
-		D_ASSERT(define_child_mapping.find(symbol) != define_child_mapping.end());
-		if (!define_child_mapping[symbol][offset]) {
+		// the row is tentatively this symbol while its condition is evaluated, which is what lets
+		// LAST(X.c) see the row being tested
+		auto previous = classifiers[offset];
+		classifiers[offset] = symbol;
+		if (!symbol_matches(symbol, offset)) {
+			classifiers[offset] = previous;
 			return {Match(false)};
 		}
-		classifiers[offset] = symbol;
 		return {Match(true, offset + 1)};
 	}
 	default:
@@ -347,10 +370,91 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 
 	// one boolean per symbol per row, refreshed whenever the match number changes
 	vector<vector<uint8_t>> condition_values(conditions.size(), vector<uint8_t>(gstate.payload_count, 0));
-	unordered_map<string, uint8_t *> define_child_mapping;
+	unordered_map<string, idx_t> symbol_index;
 	for (idx_t i = 0; i < conditions.size(); i++) {
-		define_child_mapping[config.symbols[i]] = condition_values[i].data();
+		symbol_index[config.symbols[i]] = i;
 	}
+
+	// state of the attempt in progress, needed to resolve FIRST()/LAST()
+	idx_t current_match_start = 0;
+	idx_t current_match_number = 1;
+	DataChunk row_chunk;
+	DataChunk row_result;
+	bool row_chunk_ready = false;
+
+	//	The row FIRST()/LAST() navigates to, or an invalid index when the match has no such row
+	auto navigate = [&](const MatchRecognizeFunctionData::Navigation &navigation, idx_t row,
+	                    const vector<string> &assignment) -> optional_idx {
+		if (navigation.symbol.empty()) {
+			// the match as a whole, counted from whichever end
+			if (navigation.last) {
+				return row < current_match_start + navigation.offset ? optional_idx()
+				                                                     : optional_idx(row - navigation.offset);
+			}
+			const auto target = current_match_start + navigation.offset;
+			return target > row ? optional_idx() : optional_idx(target);
+		}
+		idx_t seen = 0;
+		if (navigation.last) {
+			for (idx_t candidate = row + 1; candidate > current_match_start; candidate--) {
+				if (assignment[candidate - 1] == navigation.symbol && seen++ == navigation.offset) {
+					return candidate - 1;
+				}
+			}
+		} else {
+			for (idx_t candidate = current_match_start; candidate <= row; candidate++) {
+				if (assignment[candidate] == navigation.symbol && seen++ == navigation.offset) {
+					return candidate;
+				}
+			}
+		}
+		return optional_idx();
+	};
+
+	SymbolMatcher symbol_matches = [&](const string &symbol, idx_t row) -> bool {
+		auto entry = symbol_index.find(symbol);
+		D_ASSERT(entry != symbol_index.end());
+		const auto index = entry->second;
+		if (index >= config.row_scoped.size() || !config.row_scoped[index]) {
+			return condition_values[index][row] != 0;
+		}
+
+		auto &columns = StructVector::GetEntries(partition_chunk.data[columns_idx]);
+		if (!row_chunk_ready) {
+			vector<LogicalType> column_types;
+			for (auto &column : columns) {
+				column_types.push_back(column.GetType());
+			}
+			row_chunk.Initialize(context.client, column_types, 1);
+			row_result.Initialize(context.client, condition_types, 1);
+			row_chunk_ready = true;
+		}
+
+		row_chunk.Reset();
+		for (idx_t col = 0; col < columns.size(); col++) {
+			row_chunk.data[col].Slice(columns[col], row, row + 1);
+		}
+		row_chunk.data[0].Reference(Value::UBIGINT(current_match_number), count_t(1));
+		for (auto &navigation : config.navigations) {
+			auto target = navigate(navigation, row, classifiers);
+			if (target.IsValid()) {
+				row_chunk.data[navigation.field].Slice(columns[navigation.field], target.GetIndex(),
+				                                       target.GetIndex() + 1);
+			} else {
+				row_chunk.data[navigation.field].Reference(Value(columns[navigation.field].GetType()), count_t(1));
+			}
+		}
+		row_chunk.SetCardinality(1);
+
+		row_result.Reset();
+		ExpressionExecutor row_executor(context.client, *conditions[index]);
+		row_executor.Execute(row_chunk, row_result);
+		UnifiedVectorFormat result_data;
+		row_result.data[0].ToUnifiedFormat(1, result_data);
+		const auto result_idx = result_data.sel->get_index(0);
+		return result_data.validity.RowIsValid(result_idx) &&
+		       UnifiedVectorFormat::GetData<bool>(result_data)[result_idx];
+	};
 
 	ExpressionExecutor condition_executor(context.client, conditions);
 	DataChunk condition_result;
@@ -409,10 +513,13 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		// not part of any match keep a NULL struct, which filters them out downstream.
 		auto &struct_entries = StructVector::GetEntries(gstate.result_vec);
 		idx_t match_number = 0;
+		current_match_number = 1;
+		current_match_number = 1;
 		evaluate_conditions(partition_start, partition_end, match_number + 1);
 		auto row = partition_start;
 		while (row <= partition_end) {
-			auto match = MatchPattern(*config.pattern, partition_chunk, row, define_child_mapping, classifiers).back();
+			current_match_start = row;
+			auto match = MatchPattern(*config.pattern, partition_end + 1, row, symbol_matches, classifiers).back();
 			// a zero length match would never advance the scan
 			if (!match.success || !match.end_idx.IsValid() || match.end_idx.GetIndex() <= row) {
 				row++;
@@ -432,6 +539,7 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 				struct_entries[MATCH_END].SetValue(match_row, Value::UBIGINT(match_end));
 			}
 			row = SkipTo(config, row, match_end, classifiers);
+			current_match_number = match_number + 1;
 			if (config.depends_on_match_number) {
 				// the conditions can see the match number, so the next match sees different rows
 				evaluate_conditions(row, partition_end, match_number + 1);
@@ -454,7 +562,7 @@ WindowFunction MatchRecognizeFun::GetFunction() {
 	// the configuration constants
 	WindowFunction fun(Name,
 	                   {LogicalType::ANY, LogicalType::ANY, LogicalType::ANY, LogicalType::LIST(LogicalType::VARCHAR),
-	                    LogicalType::VARCHAR, LogicalType::UTINYINT},
+	                    LogicalType::VARCHAR, LogicalType::UTINYINT, LogicalType::ANY},
 	                   WindowMatchRecognizeExecutor::ResultType(), ExpressionType::WINDOW_FUNCTION,
 	                   WindowMatchRecognizeExecutor::Bind, WindowMatchRecognizeExecutor::GetBounds,
 	                   WindowMatchRecognizeExecutor::GetSharing, WindowMatchRecognizeExecutor::GetGlobal,

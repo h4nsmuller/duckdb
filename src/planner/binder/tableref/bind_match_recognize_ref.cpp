@@ -90,10 +90,7 @@ static void ReplaceFunctions(unique_ptr<ParsedExpression> &expr, const WindowExp
 			window_function = "lag";
 		} else if (function_name == "NEXT") {
 			window_function = "lead";
-		} else if (function_name == "FIRST") {
-			window_function = "first_value";
-		} else if (function_name == "LAST") {
-			window_function = "last_value";
+
 		} else if (function_name == "CLASSIFIER" && function.GetArguments().empty()) {
 			// the row being tested is the one this DEFINE is deciding on, so it classifies as this symbol
 			expr = make_uniq<ConstantExpression>(Value(define_name));
@@ -118,7 +115,7 @@ static void ReplaceFunctions(unique_ptr<ParsedExpression> &expr, const WindowExp
 //! Materialise them in the subquery below it and reference the result instead.
 static void HoistWindows(unique_ptr<ParsedExpression> &expr, SelectNode &subquery, idx_t &counter) {
 	if (expr->GetExpressionClass() == ExpressionClass::WINDOW) {
-		auto alias = "__mr_nav_" + to_string(counter++);
+		auto alias = "__mr_win_" + to_string(counter++);
 		expr->SetAlias(Identifier(alias));
 		auto colref = make_uniq<ColumnRefExpression>(Identifier(alias));
 		subquery.select_list.push_back(std::move(expr));
@@ -127,6 +124,82 @@ static void HoistWindows(unique_ptr<ParsedExpression> &expr, SelectNode &subquer
 	}
 	ParsedExpressionIterator::EnumerateChildren(
 	    *expr, [&](unique_ptr<ParsedExpression> &child) { HoistWindows(child, subquery, counter); });
+}
+
+//! Pattern symbols live in the same namespace as the input columns, so they are qualified with an
+//! internal prefix to keep a DEFINE from resolving to a base table column of the same name.
+static string DefineColumnName(const string &symbol) {
+	return MATCH_RECOGNIZE_DEFINE_PREFIX + symbol;
+}
+
+//! A FIRST()/LAST() call in a DEFINE condition. These navigate the rows of the match being assembled,
+//! so the matcher resolves them per row rather than the plan computing them up front.
+struct MatchRecognizeNavigation {
+	bool last;
+	//! The pattern variable navigated, empty for the match as a whole
+	string symbol;
+	//! The subquery column holding the navigated expression
+	string column;
+	idx_t offset;
+};
+
+static bool ContainsNavigation(const ParsedExpression &expr) {
+	bool found = false;
+	ParsedExpressionIterator::VisitExpression<FunctionExpression>(expr, [&](const FunctionExpression &function) {
+		auto name = StringUtil::Upper(function.FunctionName().GetIdentifierName());
+		found = found || name == "FIRST" || name == "LAST";
+	});
+	return found;
+}
+
+//! Replace FIRST()/LAST() with a column the matcher fills in, and record what it has to navigate
+static void ExtractNavigation(unique_ptr<ParsedExpression> &expr, SelectNode &subquery,
+                              const case_insensitive_set_t &symbols, vector<MatchRecognizeNavigation> &navigations) {
+	if (expr->GetExpressionType() == ExpressionType::FUNCTION) {
+		auto &function = expr->Cast<FunctionExpression>();
+		auto name = StringUtil::Upper(function.FunctionName().GetIdentifierName());
+		if (name == "FIRST" || name == "LAST") {
+			auto &args = function.GetArgumentsMutable();
+			if (args.empty() || args.size() > 2) {
+				throw BinderException("%s() takes an expression and an optional offset", name);
+			}
+			idx_t offset = 0;
+			if (args.size() == 2) {
+				auto &offset_expr = *args[1].GetExpressionMutable();
+				if (offset_expr.GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
+					throw BinderException("The offset of %s() must be a constant", name);
+				}
+				auto offset_value = offset_expr.Cast<ConstantExpression>().GetValue();
+				if (!offset_value.DefaultTryCastAs(LogicalType::UBIGINT)) {
+					throw BinderException("The offset of %s() must be a non-negative integer", name);
+				}
+				offset = NumericCast<idx_t>(offset_value.GetValue<uint64_t>());
+			}
+			auto inner = std::move(args[0].GetExpressionMutable());
+			if (ContainsNavigation(*inner)) {
+				throw BinderException("Nested row pattern navigation is not supported");
+			}
+
+			string symbol;
+			if (inner->GetExpressionType() == ExpressionType::COLUMN_REF) {
+				auto &colref = inner->Cast<ColumnRefExpression>();
+				auto &names = colref.ColumnNames();
+				if (names.size() == 2 && symbols.find(names[0].GetIdentifierName()) != symbols.end()) {
+					symbol = DefineColumnName(names[0].GetIdentifierName());
+					inner = make_uniq<ColumnRefExpression>(colref.GetColumnName());
+				}
+			}
+
+			auto column = "__mr_nav_" + to_string(navigations.size());
+			inner->SetAlias(Identifier(column));
+			subquery.select_list.push_back(std::move(inner));
+			navigations.push_back(MatchRecognizeNavigation {name == "LAST", symbol, column, offset});
+			expr = make_uniq<ColumnRefExpression>(Identifier(column));
+			return;
+		}
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expr, [&](unique_ptr<ParsedExpression> &child) { ExtractNavigation(child, subquery, symbols, navigations); });
 }
 
 //! Pattern leaves only have to carry the symbol they name; there is no column behind them
@@ -152,12 +225,6 @@ static void ReplaceMatchNumber(unique_ptr<ParsedExpression> &expr) {
 	}
 	ParsedExpressionIterator::EnumerateChildren(
 	    *expr, [&](unique_ptr<ParsedExpression> &child) { ReplaceMatchNumber(child); });
-}
-
-//! Pattern symbols live in the same namespace as the input columns, so they are qualified with an
-//! internal prefix to keep a DEFINE from resolving to a base table column of the same name.
-static string DefineColumnName(const string &symbol) {
-	return MATCH_RECOGNIZE_DEFINE_PREFIX + symbol;
 }
 
 static unique_ptr<ParsedExpression> CreateStructExtract(const string &column_name, const string &child_name) {
@@ -315,12 +382,20 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	define_select_node->select_list.push_back(std::move(match_number_column));
 	hidden_columns.emplace_back(MATCH_RECOGNIZE_MATCH_NUMBER_COLUMN);
 
+	vector<MatchRecognizeNavigation> navigations;
+	case_insensitive_set_t declared_symbols;
+	for (auto &expr : ref.config->defines_expression_list) {
+		declared_symbols.insert(expr->GetAlias().GetIdentifierName());
+	}
+
 	for (auto &expr : ref.config->defines_expression_list) {
 		auto define_name = expr->GetAlias().GetIdentifierName();
 		// TODO can this happen?
 		D_ASSERT(!define_name.empty());
 		D_ASSERT(pattern_symbols.find(define_name) == pattern_symbols.end());
 
+		// logical navigation is resolved by the matcher, so it leaves before qualifiers are checked
+		ExtractNavigation(expr, *define_select_node, declared_symbols, navigations);
 		CheckAndZapQualifiers(*expr, define_name);
 		ReplaceFunctions(expr, window_template->Cast<WindowExpression>(), define_name);
 		HoistWindows(expr, *define_select_node, nav_counter);
@@ -375,8 +450,12 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	auto &arguments = pattern_window->GetArgumentsMutable();
 
 	vector<unique_ptr<ParsedExpression>> column_fields;
+	case_insensitive_map_t<idx_t> column_field_index;
+	column_field_index[MATCH_RECOGNIZE_MATCH_NUMBER_COLUMN] = 0;
 	column_fields.push_back(make_uniq<ColumnRefExpression>(Identifier(MATCH_RECOGNIZE_MATCH_NUMBER_COLUMN)));
 	for (auto &column : condition_columns) {
+		column_field_index[column->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName()] =
+		    column_fields.size();
 		column_fields.push_back(std::move(column));
 	}
 	arguments.emplace_back(make_uniq<FunctionExpression>("struct_pack", std::move(column_fields)));
@@ -404,8 +483,27 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	arguments.emplace_back(
 	    make_uniq<ConstantExpression>(Value::UTINYINT(static_cast<uint8_t>(ref.config->after_match))));
 
+	child_list_t<LogicalType> navigation_type {{"last", LogicalType::BOOLEAN},
+	                                           {"symbol", LogicalType::VARCHAR},
+	                                           {"field", LogicalType::UBIGINT},
+	                                           {"offset", LogicalType::UBIGINT}};
+	vector<Value> navigation_values;
+	for (auto &navigation : navigations) {
+		auto entry = column_field_index.find(navigation.column);
+		D_ASSERT(entry != column_field_index.end());
+		navigation_values.push_back(Value::STRUCT(LogicalType::STRUCT(navigation_type),
+		                                          {Value::BOOLEAN(navigation.last), Value(navigation.symbol),
+		                                           Value::UBIGINT(entry->second), Value::UBIGINT(navigation.offset)}));
+	}
+	arguments.emplace_back(
+	    make_uniq<ConstantExpression>(Value::LIST(LogicalType::STRUCT(navigation_type), std::move(navigation_values))));
+
+	for (auto &navigation : navigations) {
+		hidden_columns.push_back(navigation.column);
+	}
+
 	for (idx_t nav_idx = 0; nav_idx < nav_counter; nav_idx++) {
-		hidden_columns.push_back("__mr_nav_" + to_string(nav_idx));
+		hidden_columns.push_back("__mr_win_" + to_string(nav_idx));
 	}
 
 	auto define_select = make_uniq<SelectStatement>(std::move(define_select_node));
