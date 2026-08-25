@@ -68,7 +68,6 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 		}
 	}
 
-	// TODO can we get away with putting this into the local state?
 	mutex state_lock;
 	//! Set up once; the threads then take partitions from the cursor below
 	bool prepared = false;
@@ -87,8 +86,6 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 	Vector result_vec;
 	vector<vector<Span>> spans;
 };
-
-//	Column indexes into the result struct
 
 LogicalType WindowMatchRecognizeExecutor::ResultType() {
 	// One entry per match a row takes part in: overlapping matches each keep their own, and the plan
@@ -359,8 +356,7 @@ void WindowMatchRecognizeExecutor::GetSharing(WindowExecutor &executor, WindowSh
 	for (auto &child : executor.wexpr.GetChildren()) {
 		executor.child_idx.emplace_back(shared.RegisterSink(child));
 	}
-	// navigation resolves to arbitrary rows, and MATCH_NUMBER() forces a re-evaluation per match;
-	// both need the group kept around
+	// conditions settled per candidate row need the group kept around to read arbitrary rows from
 	auto per_row = !config.navigations.empty();
 	for (auto scoped : config.row_scoped) {
 		per_row = per_row || scoped;
@@ -467,8 +463,7 @@ struct Match {
 	bool optional;
 };
 
-// simplistic backtracking-based pattern executor
-// FIXME pretty naive this, and an allocation-fest.
+// simplistic backtracking pattern matcher
 // Successful symbol matches record the matching variable at their row offset. Failed branches may leave
 // stale entries behind, but every offset a successful match covers is written by that match, so reading
 // the range of a successful match is well defined.
@@ -816,7 +811,6 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 	}
 }
 
-// this should actually be it yay!
 void WindowMatchRecognizeExecutor::GetData(ExecutionContext &context, DataChunk &eval_chunk, DataChunk &bounds,
                                            Vector &result, idx_t row_idx, OperatorSinkInput &sink) {
 	auto &gstate = sink.global_state.Cast<WindowMatchRecognizeGlobalState>();

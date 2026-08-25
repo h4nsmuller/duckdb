@@ -113,7 +113,6 @@ public:
 	}
 };
 
-// TODO this needs to live somewhere else!!
 struct MatchRecognizeFunctionData : FunctionData {
 	unique_ptr<Expression> pattern;
 	//! One condition per pattern symbol, evaluated by the matcher rather than precomputed. Column
