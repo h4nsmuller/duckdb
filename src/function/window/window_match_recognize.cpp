@@ -56,7 +56,7 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 		ListVector::Reserve(result_vec, total);
 		ListVector::SetListSize(result_vec, total);
 		auto list_data = FlatVector::GetDataMutable<list_entry_t>(result_vec);
-		auto &child = ListVector::GetEntry(result_vec);
+		auto &child = ListVector::GetChildMutable(result_vec);
 		auto &fields = StructVector::GetEntries(child);
 
 		idx_t offset = 0;
@@ -438,13 +438,13 @@ void WindowMatchRecognizeExecutor::Sink(ExecutionContext &context, DataChunk &si
 	for (idx_t col = 0; col < columns.size(); col++) {
 		slice.data[col].Reference(columns[col]);
 	}
-	slice.SetCardinality(count);
+	slice.SetCardinalityUnsafe(count);
 
 	lstate.result.Reset();
 	lstate.executor->Execute(slice, lstate.result);
 	for (idx_t i = 0; i < lstate.conditions.size(); i++) {
 		UnifiedVectorFormat condition_data;
-		lstate.result.data[i].ToUnifiedFormat(count, condition_data);
+		lstate.result.data[i].ToUnifiedFormat(condition_data);
 		auto values = UnifiedVectorFormat::GetData<bool>(condition_data);
 		for (idx_t row = 0; row < count; row++) {
 			const auto row_idx = condition_data.sel->get_index(row);
@@ -779,7 +779,7 @@ public:
 				row_chunk.data[navigation.field].Reference(Value(columns[navigation.field].GetType()), count_t(1));
 			}
 		}
-		row_chunk.SetCardinality(1);
+		row_chunk.SetCardinalityUnsafe(1);
 
 		row_result.Reset();
 		if (!executors[index]) {
@@ -787,7 +787,7 @@ public:
 		}
 		executors[index]->Execute(row_chunk, row_result);
 		UnifiedVectorFormat result_data;
-		row_result.data[0].ToUnifiedFormat(1, result_data);
+		row_result.data[0].ToUnifiedFormat(result_data);
 		const auto result_idx = result_data.sel->get_index(0);
 		return result_data.validity.RowIsValid(result_idx) &&
 		       UnifiedVectorFormat::GetData<bool>(result_data)[result_idx];
