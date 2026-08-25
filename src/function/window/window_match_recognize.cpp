@@ -161,13 +161,17 @@ unique_ptr<FunctionData> WindowMatchRecognizeExecutor::Bind(BindWindowFunctionIn
 
 	auto &condition_pack = arguments[1]->Cast<BoundFunctionExpression>();
 	for (auto &condition : condition_pack.GetChildrenMutable()) {
-		RebindToArguments(condition, argument_index, 0, bind_data->depends_on_match_number);
+		bool reads_match_number = false;
+		RebindToArguments(condition, argument_index, 0, reads_match_number);
 		bool reads_navigation = false;
 		ExpressionIterator::VisitExpression<BoundReferenceExpression>(
 		    *condition, [&](const BoundReferenceExpression &bound_ref) {
 			    reads_navigation = reads_navigation || navigation_fields.count(bound_ref.Index()) > 0;
 		    });
-		bind_data->row_scoped.push_back(reads_navigation);
+		// Both kinds depend on the match being assembled, so both are settled per candidate row.
+		// Re-deciding them for a whole partition after every match would be quadratic.
+		bind_data->row_scoped.push_back(reads_navigation || reads_match_number);
+		bind_data->depends_on_match_number = bind_data->depends_on_match_number || reads_match_number;
 		bind_data->conditions.push_back(std::move(condition));
 	}
 	if (bind_data->conditions.size() != bind_data->symbols.size()) {
@@ -310,7 +314,11 @@ void WindowMatchRecognizeExecutor::GetSharing(WindowExecutor &executor, WindowSh
 	}
 	// navigation resolves to arbitrary rows, and MATCH_NUMBER() forces a re-evaluation per match;
 	// both need the group kept around
-	if (!config.navigations.empty() || config.depends_on_match_number) {
+	auto per_row = !config.navigations.empty();
+	for (auto scoped : config.row_scoped) {
+		per_row = per_row || scoped;
+	}
+	if (per_row) {
 		for (auto &child : executor.wexpr.GetChildren()) {
 			executor.aux_idx.emplace_back(shared.RegisterCollection(child, false));
 		}
@@ -357,10 +365,7 @@ void WindowMatchRecognizeExecutor::Sink(ExecutionContext &context, DataChunk &si
                                         idx_t input_idx, OperatorSinkInput &sink) {
 	auto &gstate = sink.global_state.Cast<WindowMatchRecognizeGlobalState>();
 	auto &lstate = sink.local_state.Cast<MatchRecognizeLocalState>();
-	auto &config = gstate.executor.wexpr.BindInfo()->Cast<MatchRecognizeFunctionData>();
-	// a condition that reads MATCH_NUMBER() cannot be settled before the match it belongs to exists,
-	// so those are left to Finalize
-	if (!lstate.executor || config.depends_on_match_number) {
+	if (!lstate.executor) {
 		return;
 	}
 
@@ -568,7 +573,10 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 	// TODO this should probably be kept elsewhere
 	// The operator has already materialised the hash group. Only logical navigation needs random
 	// access to arbitrary rows of it, so a second copy is made only when a condition navigates.
-	const auto navigates = !config.navigations.empty();
+	auto navigates = !config.navigations.empty();
+	for (auto scoped : config.row_scoped) {
+		navigates = navigates || scoped;
+	}
 	DataChunk partition_chunk;
 	if (navigates) {
 		partition_chunk.Initialize(context.client, collection->inputs->Types(), gstate.payload_count);
@@ -580,8 +588,6 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 
 	// The conditions reference the window arguments; expression sharing decided where those landed in
 	// the collection, so rebind them against it before evaluating.
-	// the sink path fills the conditions as rows arrive; only the cases it cannot settle are redone here
-	const auto sink_filled = !config.depends_on_match_number;
 	const auto columns_idx = gstate.executor.aux_idx.empty() ? 0 : gstate.executor.aux_idx[0];
 	vector<LogicalType> condition_types;
 	vector<unique_ptr<Expression>> conditions;
@@ -686,63 +692,6 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		       UnifiedVectorFormat::GetData<bool>(result_data)[result_idx];
 	};
 
-	ExpressionExecutor condition_executor(context.client, conditions);
-	DataChunk condition_result;
-	if (!conditions.empty()) {
-		condition_result.Initialize(context.client, condition_types);
-	}
-
-	//	Evaluate every condition over [begin, end] with MATCH_NUMBER() bound to match_number, by
-	//	streaming the collection rather than holding a copy of it
-	auto evaluate_conditions = [&](idx_t begin, idx_t end, idx_t match_number) {
-		if (conditions.empty() || begin > end) {
-			return;
-		}
-		ColumnDataScanState scan_state;
-		DataChunk scan_chunk;
-		collection->inputs->InitializeScanChunk(scan_chunk);
-		collection->inputs->InitializeScan(scan_state);
-
-		idx_t scanned = 0;
-		while (collection->inputs->Scan(scan_state, scan_chunk)) {
-			const auto chunk_begin = scanned;
-			const auto chunk_end = chunk_begin + scan_chunk.size();
-			scanned = chunk_end;
-			if (chunk_end <= begin || chunk_begin > end) {
-				continue;
-			}
-			const auto from = begin > chunk_begin ? begin - chunk_begin : 0;
-			const auto to = MinValue(chunk_end, end + 1) - chunk_begin;
-			const auto count = to - from;
-
-			auto &columns = StructVector::GetEntries(scan_chunk.data[columns_idx]);
-			vector<LogicalType> column_types;
-			for (auto &column : columns) {
-				column_types.push_back(column.GetType());
-			}
-			DataChunk slice;
-			slice.InitializeEmpty(column_types);
-			for (idx_t col = 0; col < columns.size(); col++) {
-				slice.data[col].Slice(columns[col], from, to);
-			}
-			slice.SetCardinality(count);
-			slice.data[MATCH_NUMBER_FIELD].Reference(Value::UBIGINT(match_number), count_t(count));
-
-			condition_result.Reset();
-			condition_executor.Execute(slice, condition_result);
-			for (idx_t i = 0; i < conditions.size(); i++) {
-				UnifiedVectorFormat condition_data;
-				condition_result.data[i].ToUnifiedFormat(count, condition_data);
-				auto values = UnifiedVectorFormat::GetData<bool>(condition_data);
-				for (idx_t row = 0; row < count; row++) {
-					const auto row_idx = condition_data.sel->get_index(row);
-					condition_values[i][chunk_begin + from + row] =
-					    condition_data.validity.RowIsValid(row_idx) && values[row_idx] ? 1 : 0;
-				}
-			}
-		}
-	};
-
 	// iterate over entire input, but there can be many partitions in the input
 	for (idx_t payload_idx = 1; payload_idx <= gstate.payload_count; payload_idx++) {
 		// a partition is closed either by the start of the next one or by the end of the input
@@ -756,9 +705,6 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		// not part of any match keep a NULL struct, which filters them out downstream.
 		idx_t match_number = 0;
 		current_match_number = 1;
-		if (!sink_filled) {
-			evaluate_conditions(partition_start, partition_end, match_number + 1);
-		}
 		auto row = partition_start;
 		while (row <= partition_end) {
 			current_match_start = row;
@@ -778,10 +724,6 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 			}
 			row = SkipTo(config, row, match_end, classifiers);
 			current_match_number = match_number + 1;
-			if (config.depends_on_match_number) {
-				// the conditions can see the match number, so the next match sees different rows
-				evaluate_conditions(row, partition_end, match_number + 1);
-			}
 		}
 		partition_start = payload_idx;
 	}
