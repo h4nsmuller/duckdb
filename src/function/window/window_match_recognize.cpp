@@ -456,6 +456,8 @@ static void FetchHashGroup(ColumnDataCollection &input, DataChunk &result_chunk)
 }
 
 struct Match {
+	Match() : success(false), optional(false) {
+	}
 	Match(bool success_p, optional_idx end_idx_p = optional_idx::Invalid(), bool optional_p = false)
 	    : success(success_p), end_idx(end_idx_p), optional(optional_p) {
 	}
@@ -472,25 +474,25 @@ struct Match {
 // the range of a successful match is well defined.
 using SymbolMatcher = std::function<bool(idx_t symbol, idx_t row)>;
 
-static vector<Match> MatchPattern(const Expression &pattern, idx_t input_size, const idx_t offset,
-                                  const SymbolMatcher &symbol_matches, vector<idx_t> &classifiers) {
+// The matches a successful call produces are appended to `matches`, which the caller reuses across
+// rows rather than every node handing back a fresh vector. A failed call leaves it as it found it.
+static bool MatchPattern(const Expression &pattern, idx_t input_size, const idx_t offset,
+                         const SymbolMatcher &symbol_matches, vector<idx_t> &classifiers, vector<Match> &matches) {
 	if (offset >= input_size) {
-		return {Match(false)};
+		return false;
 	}
+	const auto mark = matches.size();
 	switch (pattern.GetExpressionType()) {
 	case ExpressionType::CONCATENATION: {
 		auto &concatenation_expr = pattern.Cast<BoundConcatenationExpression>();
 
 		auto child_start_idx = offset;
 		idx_t token_idx = 0;
-		vector<Match> matches;
 
 		while (token_idx < concatenation_expr.children.size()) {
 			auto &child_pattern = *concatenation_expr.children[token_idx];
-			auto res = MatchPattern(child_pattern, input_size, child_start_idx, symbol_matches, classifiers);
-			if (res.back().success) {
-				matches.insert(matches.end(), res.begin(), res.end());
-				child_start_idx = res.back().end_idx.GetIndex();
+			if (MatchPattern(child_pattern, input_size, child_start_idx, symbol_matches, classifiers, matches)) {
+				child_start_idx = matches.back().end_idx.GetIndex();
 				token_idx++;
 			} else {
 				auto token_is_optional = false;
@@ -504,7 +506,7 @@ static vector<Match> MatchPattern(const Expression &pattern, idx_t input_size, c
 					token_idx++;
 					continue;
 				}
-				if (!matches.empty() && matches.back().optional) {
+				if (matches.size() > mark && matches.back().optional) {
 					child_start_idx = matches.back().end_idx.GetIndex();
 					matches.pop_back();
 					continue;
@@ -512,16 +514,22 @@ static vector<Match> MatchPattern(const Expression &pattern, idx_t input_size, c
 				break;
 			}
 		}
-		return {Match(token_idx == concatenation_expr.children.size(), child_start_idx)};
+		// the concatenation reports one match spanning its children
+		matches.resize(mark);
+		if (token_idx != concatenation_expr.children.size()) {
+			return false;
+		}
+		matches.emplace_back(Match(true, child_start_idx));
+		return true;
 	}
 	case ExpressionType::ALTERNATION: {
 		// ordered choice: the left alternative wins if it matches
 		auto &alternation_expr = pattern.Cast<BoundAlternationExpression>();
-		auto left = MatchPattern(*alternation_expr.child_left, input_size, offset, symbol_matches, classifiers);
-		if (left.back().success) {
-			return left;
+		if (MatchPattern(*alternation_expr.child_left, input_size, offset, symbol_matches, classifiers, matches)) {
+			return true;
 		}
-		return MatchPattern(*alternation_expr.child_right, input_size, offset, symbol_matches, classifiers);
+		matches.resize(mark);
+		return MatchPattern(*alternation_expr.child_right, input_size, offset, symbol_matches, classifiers, matches);
 	}
 	case ExpressionType::QUANTIFIER: {
 		auto &quantifier_expr = pattern.Cast<BoundQuantifierExpression>();
@@ -530,27 +538,30 @@ static vector<Match> MatchPattern(const Expression &pattern, idx_t input_size, c
 		auto max_offset = quantifier_expr.max_count.IsValid()
 		                      ? MinValue(input_size, quantifier_expr.max_count.GetIndex())
 		                      : input_size;
-		vector<Match> matches;
 		while (match_count < max_offset) {
-			auto res = MatchPattern(*quantifier_expr.child, input_size, child_start_idx, symbol_matches, classifiers);
-			if (!res.back().success) {
+			const auto repetition = matches.size();
+			if (!MatchPattern(*quantifier_expr.child, input_size, child_start_idx, symbol_matches, classifiers,
+			                  matches)) {
+				matches.resize(repetition);
 				break;
 			}
-			child_start_idx = res.back().end_idx.GetIndex();
+			child_start_idx = matches.back().end_idx.GetIndex();
 			match_count++;
 			// a repetition may only be given up if doing so still satisfies the minimum
 			auto is_optional =
 			    quantifier_expr.min_count.IsValid() ? match_count > quantifier_expr.min_count.GetIndex() : true;
+			// one entry per repetition, in place of whatever the child reported
+			matches.resize(repetition);
 			matches.emplace_back(Match(true, child_start_idx, is_optional));
 		}
-		if (!matches.empty() &&
+		if (matches.size() > mark &&
 		    (!quantifier_expr.min_count.IsValid() || match_count >= quantifier_expr.min_count.GetIndex())) {
-			return matches;
+			return true;
 		}
-		return {Match(false)};
+		matches.resize(mark);
+		return false;
 	}
 	case ExpressionType::VALUE_CONSTANT: {
-		// TODO cache those pointers in the map instead of the vector
 		const auto symbol = NumericCast<idx_t>(pattern.Cast<BoundConstantExpression>().GetValue().GetValue<uint64_t>());
 		// the row is tentatively this symbol while its condition is evaluated, which is what lets
 		// LAST(X.c) see the row being tested
@@ -558,9 +569,10 @@ static vector<Match> MatchPattern(const Expression &pattern, idx_t input_size, c
 		classifiers[offset] = symbol;
 		if (!symbol_matches(symbol, offset)) {
 			classifiers[offset] = previous;
-			return {Match(false)};
+			return false;
 		}
-		return {Match(true, offset + 1)};
+		matches.emplace_back(Match(true, offset + 1));
+		return true;
 	}
 	default:
 		throw InternalException("Unsupported pattern type");
@@ -756,6 +768,9 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		       UnifiedVectorFormat::GetData<bool>(result_data)[result_idx];
 	};
 
+	// reused by every match attempt rather than allocated per pattern node
+	vector<Match> matches;
+
 	// Partitions are independent, so every thread that reaches Finalize takes them from a shared
 	// cursor rather than one thread doing the whole hash group.
 	while (true) {
@@ -773,14 +788,17 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		auto row = partition_start;
 		while (row <= partition_end) {
 			current_match_start = row;
-			auto match = MatchPattern(*config.pattern, partition_end + 1, row, symbol_matches, classifiers).back();
+			matches.clear();
+			const auto matched =
+			    MatchPattern(*config.pattern, partition_end + 1, row, symbol_matches, classifiers, matches);
 			// a zero length match would never advance the scan
-			if (!match.success || !match.end_idx.IsValid() || match.end_idx.GetIndex() <= row) {
+			if (!matched || matches.empty() || !matches.back().end_idx.IsValid() ||
+			    matches.back().end_idx.GetIndex() <= row) {
 				row++;
 				continue;
 			}
 			// a match can never reach beyond its own partition
-			const auto match_end = MinValue(match.end_idx.GetIndex() - 1, partition_end);
+			const auto match_end = MinValue(matches.back().end_idx.GetIndex() - 1, partition_end);
 			match_number++;
 
 			for (idx_t match_row = row; match_row <= match_end; match_row++) {
