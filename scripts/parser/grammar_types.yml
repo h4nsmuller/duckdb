@@ -1602,7 +1602,6 @@ MatchRecognizeSubsetList:
 
 MeasureSemantics:
   type: "bool"
-  by_value: true
   rules:
     - MeasureSemantics
     - RunningSemantics
@@ -1610,7 +1609,6 @@ MeasureSemantics:
 
 MatchRecognizeRows:
   type: "MatchRecognizeRows"
-  by_value: true
   rules:
     - RowsPerMatch
     - OneRowPerMatch

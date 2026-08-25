@@ -14,7 +14,7 @@ namespace duckdb {
 unique_ptr<TableRef> PEGTransformerFactory::TransformMatchRecognizeBody(
     PEGTransformer &transformer, optional<vector<unique_ptr<ParsedExpression>>> window_partition,
     optional<vector<OrderByNode>> order_by_clause, vector<unique_ptr<ParsedExpression>> measures_clause,
-    optional<MatchRecognizeRows> rows_per_match, optional<MatchRecognizeAfterMatchClause> after_match_skip,
+    const optional<MatchRecognizeRows> &rows_per_match, optional<MatchRecognizeAfterMatchClause> after_match_skip,
     unique_ptr<ParsedExpression> pattern_clause, optional<vector<MatchRecognizeSubset>> subset_clause,
     vector<unique_ptr<ParsedExpression>> define_clause) {
 	auto config = make_uniq<MatchRecognizeConfig>();
@@ -66,7 +66,7 @@ bool PEGTransformerFactory::TransformFinalSemantics(PEGTransformer &transformer)
 }
 
 unique_ptr<ParsedExpression> PEGTransformerFactory::TransformMeasuresElement(PEGTransformer &transformer,
-                                                                             optional<bool> measure_semantics,
+                                                                             const optional<bool> &measure_semantics,
                                                                              unique_ptr<ParsedExpression> expression,
                                                                              const Identifier &col_label_or_string) {
 	if (measure_semantics) {
