@@ -141,19 +141,36 @@ SELECT start_day, bottom_day, end_day FROM signal_log MATCH_RECOGNIZE(
 10	12	13
 14	16	18
 
+# FINAL makes a measure span the whole match even under ALL ROWS PER MATCH, where the default is to
+# report it as it accumulates
+query IIII
+SELECT day, match_num, running_climbs, final_climbs FROM signal_log MATCH_RECOGNIZE(
+    PARTITION BY device ORDER BY day
+    MEASURES MATCH_NUMBER() AS match_num, RUNNING count(CLIMB.day) AS running_climbs,
+             FINAL count(CLIMB.day) AS final_climbs
+    ALL ROWS PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (ONSET DIP+ CLIMB+)
+    DEFINE DIP AS DIP.level < PREV(DIP.level), CLIMB AS CLIMB.level > PREV(CLIMB.level)
+) ORDER BY day
+----
+5	1	0	4
+6	1	0	4
+7	1	1	4
+8	1	2	4
+9	1	3	4
+10	1	4	4
+11	2	0	1
+12	2	0	1
+13	2	1	1
+14	3	0	2
+15	3	0	2
+16	3	0	2
+17	3	1	2
+18	3	2	2
+
 mode skip
 
 # Everything below is standard syntax we do not support yet.
-
-# RUNNING and FINAL do not parse. A measure is RUNNING under ALL ROWS PER MATCH and FINAL under
-# ONE ROW PER MATCH, which is the default in both cases, but the keywords cannot be written.
-statement ok
-SELECT 1 FROM signal_log MATCH_RECOGNIZE(
-    PARTITION BY device ORDER BY day
-    MEASURES FINAL LAST(DIP.day) AS bottom_day
-    ALL ROWS PER MATCH PATTERN (ONSET DIP+)
-    DEFINE DIP AS DIP.level < PREV(DIP.level)
-)
 
 # SUBSET, which names a union of pattern variables so a measure can span them
 statement ok

@@ -278,10 +278,20 @@ static unique_ptr<ParsedExpression> MatchScopedValue(const MatchRecognizeConfig 
 
 //! Rewrite a MEASURES expression into something evaluable next to the pattern window
 static void RewriteMeasure(Binder &binder, unique_ptr<ParsedExpression> &expr, const MatchRecognizeConfig &config,
-                           const case_insensitive_set_t &symbols, bool running, bool inside_aggregate = false) {
+                           const case_insensitive_set_t &symbols, bool running, bool one_row,
+                           bool inside_aggregate = false) {
 	if (expr->GetExpressionType() == ExpressionType::FUNCTION) {
 		auto &function = expr->Cast<FunctionExpression>();
 		auto function_name = StringUtil::Upper(function.FunctionName().GetIdentifierName());
+		// RUNNING and FINAL choose how much of the match the measure below them sees
+		const auto is_running = function.FunctionName() == MATCH_RECOGNIZE_RUNNING_MARKER;
+		if (is_running || function.FunctionName() == MATCH_RECOGNIZE_FINAL_MARKER) {
+			// ONE ROW PER MATCH reports a finished match, so its current row is the last one: the two
+			// are the same thing there and the keywords make no difference
+			expr = std::move(function.GetArgumentsMutable()[0].GetExpressionMutable());
+			RewriteMeasure(binder, expr, config, symbols, one_row ? false : is_running, one_row, inside_aggregate);
+			return;
+		}
 		if (function_name == "CLASSIFIER" && function.GetArguments().empty()) {
 			expr = CreateStructExtract("__pattern_window", "classifier");
 			return;
@@ -303,7 +313,7 @@ static void RewriteMeasure(Binder &binder, unique_ptr<ParsedExpression> &expr, c
 					inner = make_uniq<ColumnRefExpression>(colref.GetColumnName());
 				}
 			}
-			RewriteMeasure(binder, inner, config, symbols, running, inside_aggregate);
+			RewriteMeasure(binder, inner, config, symbols, running, one_row, inside_aggregate);
 			auto masked = symbol.empty() ? std::move(inner) : ClassifiedValue(symbol, std::move(inner));
 			expr = MatchScopedValue(config, std::move(masked), running, function_name == "FIRST");
 			return;
@@ -315,7 +325,7 @@ static void RewriteMeasure(Binder &binder, unique_ptr<ParsedExpression> &expr, c
 		if (entry && entry->type == CatalogType::AGGREGATE_FUNCTION_ENTRY) {
 			// the aggregate already spans the match, so inside it a variable only masks its rows
 			for (auto &argument : function.GetArgumentsMutable()) {
-				RewriteMeasure(binder, argument.GetExpressionMutable(), config, symbols, running, true);
+				RewriteMeasure(binder, argument.GetExpressionMutable(), config, symbols, running, one_row, true);
 			}
 			auto &qualified = function.GetQualifiedName();
 			auto window = make_uniq<WindowExpression>(qualified.Catalog().GetIdentifierName(),
@@ -564,7 +574,7 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 		measure_aliases.push_back(expr->GetAlias());
 		// rewriting can replace the expression wholesale, which would drop the MEASURES alias
 		auto alias = expr->GetAlias();
-		RewriteMeasure(*this, expr, *ref.config, pattern_symbols, all_rows);
+		RewriteMeasure(*this, expr, *ref.config, pattern_symbols, all_rows, !all_rows);
 		expr->SetAlias(std::move(alias));
 		measures_node->select_list.push_back(std::move(expr));
 	}
