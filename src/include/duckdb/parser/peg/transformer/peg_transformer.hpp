@@ -3744,6 +3744,11 @@ public:
 	                                                TransformStackFrame &frame);
 	static unique_ptr<TransformResultValue>
 	FinalizeRowPatternGroupTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
+	static void InitializeRowPatternExclusionTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                                    TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue> FinalizeRowPatternExclusionTrampoline(PEGTransformer &transformer,
+	                                                                              TransformStack &stack,
+	                                                                              TransformStackFrame &frame);
 	static void InitializeRowPatternLabelTrampoline(PEGTransformer &transformer, TransformStack &stack,
 	                                                TransformStackFrame &frame);
 	static unique_ptr<TransformResultValue>
@@ -7769,6 +7774,10 @@ public:
 	                                                                           ParseResult &parse_result);
 	static unique_ptr<TransformResultValue> TransformRowPatternGroupInternal(PEGTransformer &transformer,
 	                                                                         ParseResult &parse_result);
+	static unique_ptr<TransformResultValue> TransformRowPatternExclusionInternal(PEGTransformer &transformer,
+	                                                                             ParseResult &parse_result);
+	static unique_ptr<ParsedExpression> TransformRowPatternExclusion(PEGTransformer &transformer,
+	                                                                 unique_ptr<ParsedExpression> row_pattern);
 	static unique_ptr<TransformResultValue> TransformRowPatternLabelInternal(PEGTransformer &transformer,
 	                                                                         ParseResult &parse_result);
 	static unique_ptr<ParsedExpression> TransformRowPatternLabel(PEGTransformer &transformer,

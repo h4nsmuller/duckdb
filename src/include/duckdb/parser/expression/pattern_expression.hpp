@@ -82,6 +82,8 @@ public:
 
 	optional_idx min_count;
 	optional_idx max_count;
+	//! {- ... -}: the rows this matches take part in the match but are left out of the output
+	bool excluded = false;
 };
 
 class AlternationExpression : public PatternExpression {

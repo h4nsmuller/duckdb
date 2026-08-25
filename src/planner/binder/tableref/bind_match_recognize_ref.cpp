@@ -55,7 +55,7 @@ BindResult ExpressionBinder::BindPatternExpression(unique_ptr<ParsedExpression> 
 			return BindResult(bound_child.error);
 		}
 		return BindResult(make_uniq_base<Expression, BoundQuantifierExpression>(
-		    std::move(bound_child.expression), quantifier.min_count, quantifier.max_count));
+		    std::move(bound_child.expression), quantifier.min_count, quantifier.max_count, quantifier.excluded));
 	}
 	default:
 		throw NotImplementedException("Unimplemented pattern expression %s",
@@ -197,6 +197,17 @@ static void ExtractNavigation(unique_ptr<ParsedExpression> &expr, SelectNode &su
 }
 
 //! Pattern leaves only have to carry the symbol they name; there is no column behind them
+//! Whether any part of the pattern sits inside a {- -}
+static bool HasExclusion(const ParsedExpression &expr) {
+	if (expr.GetExpressionType() == ExpressionType::QUANTIFIER && expr.Cast<QuantifiedExpression>().excluded) {
+		return true;
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || HasExclusion(child); });
+	return found;
+}
+
 static void PatternSymbolsToConstants(unique_ptr<ParsedExpression> &expr) {
 	if (expr->GetExpressionType() == ExpressionType::COLUMN_REF) {
 		auto &colref = expr->Cast<ColumnRefExpression>();
@@ -384,6 +395,13 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	}
 	pattern_window->PartitionsMutable() = std::move(partitions);
 	pattern_window->OrderByMutable() = std::move(ref.config->order_by_expressions);
+
+	// {- -} only decides which of a match's rows reach the output, so it needs rows in the output to
+	// act on. ONE ROW PER MATCH reports the match rather than its rows, leaving it nothing to do.
+	const bool has_exclusion = HasExclusion(*ref.config->pattern);
+	if (has_exclusion && ref.config->rows_per_match != MatchRecognizeRows::MATCH_RECOGNIZE_ROWS_ALL) {
+		throw BinderException("Pattern exclusion syntax {- -} requires ALL ROWS PER MATCH");
+	}
 
 	// a union variable only stands for a set of rows after the match is assembled, so it is confined
 	// to MEASURES: the matcher works one symbol at a time and cannot yet navigate or skip to a union
@@ -624,6 +642,17 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	// ONE ROW PER MATCH reports one row per match, and reports the match rather than any of its rows:
 	// the output is the partitioning followed by the measures. Filtering has to happen above the
 	// measures rather than beside them, because they are computed across the whole match.
+	// an excluded row still belongs to the match, so it is dropped above the measures rather than
+	// before them: the aggregates over the match have to have seen it
+	if (all_rows && has_exclusion) {
+		auto measures_select = make_uniq<SelectStatement>(std::move(select_node));
+		auto filter_node = make_uniq<SelectNode>(make_uniq<SubqueryRef>(std::move(measures_select)));
+		filter_node->select_list.push_back(make_uniq<StarExpression>());
+		filter_node->where_clause = make_uniq<OperatorExpression>(
+		    ExpressionType::OPERATOR_NOT, CreateStructExtract("__pattern_window", "is_excluded"));
+		select_node = std::move(filter_node);
+	}
+
 	if (!all_rows) {
 		auto measures_select = make_uniq<SelectStatement>(std::move(select_node));
 		auto filter_node = make_uniq<SelectNode>(make_uniq<SubqueryRef>(std::move(measures_select)));
