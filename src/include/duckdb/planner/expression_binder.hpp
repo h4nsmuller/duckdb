@@ -71,7 +71,6 @@ struct BindResult {
 	ErrorData error;
 };
 
-
 class ExpressionBinder {
 	friend class StackChecker<ExpressionBinder>;
 
