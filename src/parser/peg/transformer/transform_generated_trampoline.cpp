@@ -2220,6 +2220,12 @@ static const TransformFrameOps QUANTIFIER_MAX_OPS = {"QuantifierMax",
 static const TransformFrameOps QUANTIFIER_EXACT_OPS = {"QuantifierExact",
                                                        &PEGTransformerFactory::InitializeQuantifierExactTrampoline,
                                                        &PEGTransformerFactory::FinalizeQuantifierExactTrampoline};
+static const TransformFrameOps SUBSET_CLAUSE_OPS = {"SubsetClause",
+                                                    &PEGTransformerFactory::InitializeSubsetClauseTrampoline,
+                                                    &PEGTransformerFactory::FinalizeSubsetClauseTrampoline};
+static const TransformFrameOps SUBSET_ELEMENT_OPS = {"SubsetElement",
+                                                     &PEGTransformerFactory::InitializeSubsetElementTrampoline,
+                                                     &PEGTransformerFactory::FinalizeSubsetElementTrampoline};
 static const TransformFrameOps DEFINE_CLAUSE_OPS = {"DefineClause",
                                                     &PEGTransformerFactory::InitializeDefineClauseTrampoline,
                                                     &PEGTransformerFactory::FinalizeDefineClauseTrampoline};
@@ -3788,6 +3794,8 @@ const case_insensitive_map_t<const TransformFrameOps *> &PEGTransformerFactory::
 	    {"QuantifierMin", &QUANTIFIER_MIN_OPS},
 	    {"QuantifierMax", &QUANTIFIER_MAX_OPS},
 	    {"QuantifierExact", &QUANTIFIER_EXACT_OPS},
+	    {"SubsetClause", &SUBSET_CLAUSE_OPS},
+	    {"SubsetElement", &SUBSET_ELEMENT_OPS},
 	    {"DefineClause", &DEFINE_CLAUSE_OPS},
 	    {"DefineElement", &DEFINE_ELEMENT_OPS},
 	    {"MergeIntoStatement", &MERGE_INTO_STATEMENT_OPS},
@@ -19387,8 +19395,13 @@ PEGTransformerFactory::FinalizeTableMatchRecognizeClauseTrampoline(PEGTransforme
 void PEGTransformerFactory::InitializeMatchRecognizeBodyTrampoline(PEGTransformer &transformer, TransformStack &stack,
                                                                    TransformStackFrame &frame) {
 	auto &list_pr = frame.parse_result.Cast<ListParseResult>();
-	frame.ReserveChildSlots(7);
-	stack.PushFrame(list_pr.GetChild(6), DEFINE_CLAUSE_OPS, TransformFrameResultTarget(frame.frame_index, 6));
+	frame.ReserveChildSlots(8);
+	stack.PushFrame(list_pr.GetChild(7), DEFINE_CLAUSE_OPS, TransformFrameResultTarget(frame.frame_index, 7));
+	auto &subset_clause_opt = list_pr.GetChild(6).Cast<OptionalParseResult>();
+	if (subset_clause_opt.HasResult()) {
+		stack.PushFrame(subset_clause_opt.GetResult(), SUBSET_CLAUSE_OPS,
+		                TransformFrameResultTarget(frame.frame_index, 6));
+	}
 	stack.PushFrame(list_pr.GetChild(5), PATTERN_CLAUSE_OPS, TransformFrameResultTarget(frame.frame_index, 5));
 	auto &after_match_skip_opt = list_pr.GetChild(4).Cast<OptionalParseResult>();
 	if (after_match_skip_opt.HasResult()) {
@@ -19434,10 +19447,15 @@ PEGTransformerFactory::FinalizeMatchRecognizeBodyTrampoline(PEGTransformer &tran
 		after_match_skip = frame.TakeResult<MatchRecognizeAfterMatchClause>(4);
 	}
 	auto pattern_clause = frame.TakeResult<unique_ptr<ParsedExpression>>(5);
-	auto define_clause = frame.TakeResult<vector<unique_ptr<ParsedExpression>>>(6);
-	auto result = TransformMatchRecognizeBody(
-	    transformer, std::move(window_partition), std::move(order_by_clause), std::move(measures_clause),
-	    std::move(rows_per_match), std::move(after_match_skip), std::move(pattern_clause), std::move(define_clause));
+	optional<vector<MatchRecognizeSubset>> subset_clause {};
+	if (frame.child_results[6]) {
+		subset_clause = frame.TakeResult<vector<MatchRecognizeSubset>>(6);
+	}
+	auto define_clause = frame.TakeResult<vector<unique_ptr<ParsedExpression>>>(7);
+	auto result =
+	    TransformMatchRecognizeBody(transformer, std::move(window_partition), std::move(order_by_clause),
+	                                std::move(measures_clause), std::move(rows_per_match), std::move(after_match_skip),
+	                                std::move(pattern_clause), std::move(subset_clause), std::move(define_clause));
 	return make_uniq<TypedTransformResult<unique_ptr<TableRef>>>(std::move(result));
 }
 
@@ -19989,6 +20007,62 @@ unique_ptr<TransformResultValue> PEGTransformerFactory::FinalizeQuantifierExactT
 	auto number_literal = TransformNumberLiteral(transformer, list_pr.GetChild(0));
 	auto result = TransformQuantifierExact(transformer, std::move(number_literal));
 	return make_uniq<TypedTransformResult<MatchRecognizeQuantifier>>(std::move(result));
+}
+
+void PEGTransformerFactory::InitializeSubsetClauseTrampoline(PEGTransformer &transformer, TransformStack &stack,
+                                                             TransformStackFrame &frame) {
+	auto &list_pr = frame.parse_result.Cast<ListParseResult>();
+	auto list_items = ExtractParseResultsFromList(list_pr.GetChild(1));
+	auto dynamic_child_count = list_items.size();
+	frame.ReserveChildSlots(1 + dynamic_child_count - 1);
+	for (idx_t i = list_items.size(); i > 0; i--) {
+		auto child_idx = i - 1;
+		stack.PushFrame(list_items[child_idx].get(), SUBSET_ELEMENT_OPS,
+		                TransformFrameResultTarget(frame.frame_index, 0 + child_idx));
+	}
+}
+
+unique_ptr<TransformResultValue> PEGTransformerFactory::FinalizeSubsetClauseTrampoline(PEGTransformer &transformer,
+                                                                                       TransformStack &stack,
+                                                                                       TransformStackFrame &frame) {
+	auto &list_pr = frame.parse_result.Cast<ListParseResult>();
+	auto dynamic_list_items = ExtractParseResultsFromList(list_pr.GetChild(1));
+	auto dynamic_child_count = dynamic_list_items.size();
+	vector<MatchRecognizeSubset> subset_element;
+	for (idx_t i = 0; i < 0 + dynamic_child_count; i++) {
+		subset_element.push_back(frame.TakeResult<MatchRecognizeSubset>(i));
+	}
+	auto result = TransformSubsetClause(transformer, std::move(subset_element));
+	return make_uniq<TypedTransformResult<vector<MatchRecognizeSubset>>>(std::move(result));
+}
+
+void PEGTransformerFactory::InitializeSubsetElementTrampoline(PEGTransformer &transformer, TransformStack &stack,
+                                                              TransformStackFrame &frame) {
+	auto &list_pr = frame.parse_result.Cast<ListParseResult>();
+	auto list_items = ExtractParseResultsFromList(ExtractResultFromParens(list_pr.GetChild(2)));
+	auto dynamic_child_count = list_items.size();
+	frame.ReserveChildSlots(2 + dynamic_child_count - 1);
+	for (idx_t i = list_items.size(); i > 0; i--) {
+		auto child_idx = i - 1;
+		stack.PushFrame(list_items[child_idx].get(), COL_LABEL_OR_STRING_OPS,
+		                TransformFrameResultTarget(frame.frame_index, 1 + child_idx));
+	}
+	stack.PushFrame(list_pr.GetChild(0), COL_LABEL_OR_STRING_OPS, TransformFrameResultTarget(frame.frame_index, 0));
+}
+
+unique_ptr<TransformResultValue> PEGTransformerFactory::FinalizeSubsetElementTrampoline(PEGTransformer &transformer,
+                                                                                        TransformStack &stack,
+                                                                                        TransformStackFrame &frame) {
+	auto &list_pr = frame.parse_result.Cast<ListParseResult>();
+	auto dynamic_list_items = ExtractParseResultsFromList(ExtractResultFromParens(list_pr.GetChild(2)));
+	auto dynamic_child_count = dynamic_list_items.size();
+	auto col_label_or_string = frame.TakeResult<Identifier>(0);
+	vector<Identifier> col_label_or_string_1;
+	for (idx_t i = 1; i < 1 + dynamic_child_count; i++) {
+		col_label_or_string_1.push_back(frame.TakeResult<Identifier>(i));
+	}
+	auto result = TransformSubsetElement(transformer, col_label_or_string, col_label_or_string_1);
+	return make_uniq<TypedTransformResult<MatchRecognizeSubset>>(std::move(result));
 }
 
 void PEGTransformerFactory::InitializeDefineClauseTrampoline(PEGTransformer &transformer, TransformStack &stack,

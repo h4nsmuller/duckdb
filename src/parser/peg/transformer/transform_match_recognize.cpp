@@ -15,7 +15,8 @@ unique_ptr<TableRef> PEGTransformerFactory::TransformMatchRecognizeBody(
     PEGTransformer &transformer, optional<vector<unique_ptr<ParsedExpression>>> window_partition,
     optional<vector<OrderByNode>> order_by_clause, vector<unique_ptr<ParsedExpression>> measures_clause,
     optional<MatchRecognizeRows> rows_per_match, optional<MatchRecognizeAfterMatchClause> after_match_skip,
-    unique_ptr<ParsedExpression> pattern_clause, vector<unique_ptr<ParsedExpression>> define_clause) {
+    unique_ptr<ParsedExpression> pattern_clause, optional<vector<MatchRecognizeSubset>> subset_clause,
+    vector<unique_ptr<ParsedExpression>> define_clause) {
 	auto config = make_uniq<MatchRecognizeConfig>();
 
 	if (window_partition) {
@@ -39,6 +40,9 @@ unique_ptr<TableRef> PEGTransformerFactory::TransformMatchRecognizeBody(
 	}
 
 	config->pattern = std::move(pattern_clause);
+	if (subset_clause) {
+		config->subsets = std::move(*subset_clause);
+	}
 
 	// the input table is attached by TransformTableRef
 	return make_uniq<MatchRecognizeRef>(nullptr, std::move(config));
@@ -87,6 +91,22 @@ vector<unique_ptr<ParsedExpression>>
 PEGTransformerFactory::TransformMeasuresClause(PEGTransformer &transformer,
                                                vector<unique_ptr<ParsedExpression>> measures_element) {
 	return measures_element;
+}
+
+MatchRecognizeSubset PEGTransformerFactory::TransformSubsetElement(PEGTransformer &transformer,
+                                                                   const Identifier &col_label_or_string,
+                                                                   const vector<Identifier> &col_label_or_string_1) {
+	MatchRecognizeSubset result;
+	result.name = col_label_or_string.GetIdentifierName();
+	for (auto &member : col_label_or_string_1) {
+		result.members.push_back(member.GetIdentifierName());
+	}
+	return result;
+}
+
+vector<MatchRecognizeSubset> PEGTransformerFactory::TransformSubsetClause(PEGTransformer &transformer,
+                                                                          vector<MatchRecognizeSubset> subset_element) {
+	return subset_element;
 }
 
 vector<unique_ptr<ParsedExpression>>

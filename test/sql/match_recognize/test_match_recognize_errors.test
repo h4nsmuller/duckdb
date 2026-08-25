@@ -108,3 +108,38 @@ CREATE TABLE measures(measures INTEGER)
 
 statement ok
 SELECT measures FROM measures
+
+# A SUBSET may only be built out of variables the pattern defines
+statement error
+SELECT 1 FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS n ONE ROW PER MATCH
+    PATTERN (A B+) SUBSET U = (A, NOSUCH) DEFINE B AS B.j > 0
+)
+----
+<REGEX>:Binder Error:.*SUBSET "U" refers to unknown pattern variable "NOSUCH".*
+
+# and it may not take a name that is already a pattern variable
+statement error
+SELECT 1 FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS n ONE ROW PER MATCH
+    PATTERN (A B+) SUBSET A = (A, B) DEFINE B AS B.j > 0
+)
+----
+<REGEX>:Binder Error:.*SUBSET name "A" is already a pattern variable.*
+
+# a union stands for a set of rows, which the matcher cannot navigate or skip to while matching
+statement error
+SELECT 1 FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS n ONE ROW PER MATCH
+    PATTERN (A B+) SUBSET U = (A, B) DEFINE B AS LAST(U.j) > 0
+)
+----
+<REGEX>:Not implemented Error:.*SUBSET variable cannot be referenced in DEFINE.*
+
+statement error
+SELECT 1 FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS n ONE ROW PER MATCH AFTER MATCH SKIP TO LAST U
+    PATTERN (A B+) SUBSET U = (A, B) DEFINE B AS B.j > 0
+)
+----
+<REGEX>:Not implemented Error:.*AFTER MATCH SKIP TO a SUBSET variable.*

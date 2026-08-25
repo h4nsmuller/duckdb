@@ -168,19 +168,72 @@ SELECT day, match_num, running_climbs, final_climbs FROM signal_log MATCH_RECOGN
 17	3	1	2
 18	3	2	2
 
+# SUBSET names a union of pattern variables, so a measure can span the rows of all of them at once.
+# FALLING covers the peak and the whole way down, which is the part of the V the CLIMB rows are not in.
+query IIII
+SELECT device, mean_level, first_day, last_day FROM signal_log MATCH_RECOGNIZE(
+    PARTITION BY device ORDER BY day
+    MEASURES avg(FALLING.level) AS mean_level, FIRST(FALLING.day) AS first_day, LAST(FALLING.day) AS last_day
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (ONSET DIP+ CLIMB+)
+    SUBSET FALLING = (ONSET, DIP)
+    DEFINE DIP AS DIP.level < PREV(DIP.level), CLIMB AS CLIMB.level > PREV(CLIMB.level)
+) ORDER BY first_day
+----
+sensor-a	59.5	5	6
+sensor-a	55.0	11	12
+sensor-a	55.0	14	16
+
+# a union that covers every variable in the pattern is the whole match
+query II
+SELECT n, whole FROM signal_log MATCH_RECOGNIZE(
+    PARTITION BY device ORDER BY day
+    MEASURES count(*) AS n, count(ALL_OF_IT.level) AS whole
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (ONSET DIP+ CLIMB+)
+    SUBSET ALL_OF_IT = (ONSET, DIP, CLIMB)
+    DEFINE DIP AS DIP.level < PREV(DIP.level), CLIMB AS CLIMB.level > PREV(CLIMB.level)
+) ORDER BY n DESC
+----
+6	6
+5	5
+3	3
+
+# several unions may be declared at once, and one may name a single variable
+query III
+SELECT bottom, top, n FROM signal_log MATCH_RECOGNIZE(
+    PARTITION BY device ORDER BY day
+    MEASURES min(LOW.level) AS bottom, max(HIGH.level) AS top, count(LOW.level) AS n
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (ONSET DIP+ CLIMB+)
+    SUBSET LOW = (DIP), HIGH = (ONSET, CLIMB)
+    DEFINE DIP AS DIP.level < PREV(DIP.level), CLIMB AS CLIMB.level > PREV(CLIMB.level)
+) ORDER BY n, bottom
+----
+40	79	1
+49	79	1
+40	79	2
+
+# ALL ROWS PER MATCH sees the union grow as the match is assembled
+query IIII
+SELECT day, c, running, final FROM signal_log MATCH_RECOGNIZE(
+    PARTITION BY device ORDER BY day
+    MEASURES CLASSIFIER() AS c, count(FALLING.level) AS running, FINAL count(FALLING.level) AS final
+    ALL ROWS PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (ONSET DIP+ CLIMB+)
+    SUBSET FALLING = (ONSET, DIP)
+    DEFINE DIP AS DIP.level < PREV(DIP.level), CLIMB AS CLIMB.level > PREV(CLIMB.level)
+) WHERE day BETWEEN 14 AND 18 ORDER BY day
+----
+14	ONSET	1	3
+15	DIP	2	3
+16	DIP	3	3
+17	CLIMB	3	3
+18	CLIMB	3	3
+
 mode skip
 
 # Everything below is standard syntax we do not support yet.
-
-# SUBSET, which names a union of pattern variables so a measure can span them
-statement ok
-SELECT 1 FROM signal_log MATCH_RECOGNIZE(
-    PARTITION BY device ORDER BY day
-    MEASURES avg(FALLING.level) AS mean_level
-    ONE ROW PER MATCH PATTERN (ONSET DIP+ CLIMB+)
-    SUBSET FALLING = (ONSET, DIP)
-    DEFINE DIP AS DIP.level < PREV(DIP.level), CLIMB AS CLIMB.level > PREV(CLIMB.level)
-)
 
 # Exclusion syntax, which matches rows but leaves them out of ALL ROWS PER MATCH output
 statement ok
