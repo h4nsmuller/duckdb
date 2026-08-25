@@ -87,6 +87,8 @@ SELECT x FROM q MATCH_RECOGNIZE(
 ----
 1
 2
+2
+3
 3
 4
 

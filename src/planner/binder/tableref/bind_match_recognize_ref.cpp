@@ -527,12 +527,24 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 
 	auto define_select = make_uniq<SelectStatement>(std::move(define_select_node));
 	select_node->from_table = make_uniq<SubqueryRef>(std::move(define_select));
-	pattern_window->SetAlias("__pattern_window");
+	pattern_window->SetAlias("__pattern_window_spans");
 	select_node->select_list.push_back(std::move(pattern_window));
 
-	// keep every row of every match: the measures below are computed across the match. Rows outside a
-	// match have a NULL struct, which discards them.
-	select_node->qualify = CreateStructExtract("__pattern_window", "in_match");
+	// The window reports every match a row takes part in, so overlapping matches each get their own
+	// row here. Unnesting also drops the rows that matched nothing, since their list is empty.
+	auto spans_select = make_uniq<SelectStatement>(std::move(select_node));
+	auto unnest_node = make_uniq<SelectNode>(make_uniq<SubqueryRef>(std::move(spans_select)));
+	auto spans_star = make_uniq<StarExpression>();
+	spans_star->ExcludeListMutable().insert(QualifiedColumnName(Identifier("__pattern_window_spans")));
+	unnest_node->select_list.push_back(std::move(spans_star));
+
+	vector<unique_ptr<ParsedExpression>> spans_argument;
+	spans_argument.push_back(make_uniq<ColumnRefExpression>(Identifier("__pattern_window_spans")));
+	auto unnest_spans = make_uniq<FunctionExpression>("unnest", std::move(spans_argument));
+
+	unnest_spans->SetAlias("__pattern_window");
+	unnest_node->select_list.push_back(std::move(unnest_spans));
+	select_node = std::move(unnest_node);
 
 	// MEASURES are projected on top of the pattern window, where the match a row belongs to is known
 	const auto all_rows = ref.config->rows_per_match == MatchRecognizeRows::MATCH_RECOGNIZE_ROWS_ALL;
