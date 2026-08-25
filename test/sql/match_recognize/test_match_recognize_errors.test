@@ -143,3 +143,12 @@ SELECT 1 FROM q MATCH_RECOGNIZE(
 )
 ----
 <REGEX>:Not implemented Error:.*AFTER MATCH SKIP TO a SUBSET variable.*
+
+# an exclusion decides which of a match's rows reach the output, so it needs rows in the output
+statement error
+SELECT 1 FROM q MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS n ONE ROW PER MATCH
+    PATTERN ({- A -} B+) DEFINE B AS B.j > 0
+)
+----
+<REGEX>:Binder Error:.*exclusion syntax \{- -\} requires ALL ROWS PER MATCH.*

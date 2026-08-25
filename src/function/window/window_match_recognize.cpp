@@ -16,7 +16,7 @@
 namespace duckdb {
 
 //	Column indexes into the result struct
-enum MatchRecognizeResult : idx_t { CLASSIFIER = 0, MATCH_NUMBER, IS_MATCH_START, MATCH_START, MATCH_END };
+enum MatchRecognizeResult : idx_t { CLASSIFIER = 0, MATCH_NUMBER, IS_MATCH_START, MATCH_START, MATCH_END, IS_EXCLUDED };
 
 //	MATCH_NUMBER() is the first field of the packed column struct
 static constexpr idx_t MATCH_NUMBER_FIELD = 0;
@@ -32,6 +32,7 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 			values.assign(payload_count, 0);
 		}
 		classifiers.resize(payload_count);
+		excluded_rows.resize(payload_count);
 		D_ASSERT(result_vec.GetType().id() == LogicalTypeId::LIST);
 	}
 
@@ -42,6 +43,7 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 		bool is_match_start;
 		idx_t match_start;
 		idx_t match_end;
+		bool excluded;
 	};
 
 	//! Build the list vector the operator reads from the spans collected during matching
@@ -66,6 +68,7 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 				fields[IS_MATCH_START].SetValue(offset, Value::BOOLEAN(span.is_match_start));
 				fields[MATCH_START].SetValue(offset, Value::UBIGINT(span.match_start));
 				fields[MATCH_END].SetValue(offset, Value::UBIGINT(span.match_end));
+				fields[IS_EXCLUDED].SetValue(offset, Value::BOOLEAN(span.excluded));
 				offset++;
 			}
 		}
@@ -80,6 +83,8 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 	atomic<idx_t> completed_partitions {0};
 	//! The variable that classified each row, written only by the thread that owns the partition
 	vector<idx_t> classifiers;
+	//! Whether the pattern matched each row inside a {- -}, written alongside the classifier above
+	vector<uint8_t> excluded_rows;
 	//! Materialised only when a condition has to be settled per row, and then shared by the threads
 	DataChunk rows;
 	//! One boolean per symbol per row. Sink fills these as rows arrive, over disjoint ranges, so the
@@ -97,7 +102,8 @@ LogicalType WindowMatchRecognizeExecutor::ResultType() {
 	                                              {"match_number", LogicalType::UBIGINT},
 	                                              {"is_match_start", LogicalType::BOOLEAN},
 	                                              {"match_start", LogicalType::UBIGINT},
-	                                              {"match_end", LogicalType::UBIGINT}}));
+	                                              {"match_end", LogicalType::UBIGINT},
+	                                              {"is_excluded", LogicalType::BOOLEAN}}));
 }
 
 //===--------------------------------------------------------------------===//
@@ -260,6 +266,7 @@ static void SerializePattern(Serializer &serializer, const Expression &pattern) 
 		serializer.WriteObject(101, "child", [&](Serializer &child) { SerializePattern(child, *quantifier.child); });
 		serializer.WriteProperty(102, "min_count", quantifier.min_count);
 		serializer.WriteProperty(103, "max_count", quantifier.max_count);
+		serializer.WriteProperty(104, "excluded", quantifier.excluded);
 		break;
 	}
 	case ExpressionType::VALUE_CONSTANT:
@@ -292,7 +299,8 @@ static unique_ptr<Expression> DeserializePattern(Deserializer &deserializer) {
 		deserializer.ReadObject(101, "child", [&](Deserializer &inner) { child = DeserializePattern(inner); });
 		auto min_count = deserializer.ReadProperty<optional_idx>(102, "min_count");
 		auto max_count = deserializer.ReadProperty<optional_idx>(103, "max_count");
-		return make_uniq_base<Expression, BoundQuantifierExpression>(std::move(child), min_count, max_count);
+		auto excluded = deserializer.ReadProperty<bool>(104, "excluded");
+		return make_uniq_base<Expression, BoundQuantifierExpression>(std::move(child), min_count, max_count, excluded);
 	}
 	case ExpressionType::VALUE_CONSTANT:
 		return make_uniq_base<Expression, BoundConstantExpression>(deserializer.ReadProperty<Value>(101, "symbol"));
@@ -475,7 +483,8 @@ using SymbolMatcher = std::function<bool(idx_t symbol, idx_t row)>;
 // The matches a successful call produces are appended to `matches`, which the caller reuses across
 // rows rather than every node handing back a fresh vector. A failed call leaves it as it found it.
 static bool MatchPattern(const Expression &pattern, idx_t input_size, const idx_t offset,
-                         const SymbolMatcher &symbol_matches, vector<idx_t> &classifiers, vector<Match> &matches) {
+                         const SymbolMatcher &symbol_matches, vector<idx_t> &classifiers,
+                         vector<uint8_t> &excluded_rows, vector<Match> &matches, bool excluded = false) {
 	if (offset >= input_size) {
 		return false;
 	}
@@ -489,7 +498,8 @@ static bool MatchPattern(const Expression &pattern, idx_t input_size, const idx_
 
 		while (token_idx < concatenation_expr.children.size()) {
 			auto &child_pattern = *concatenation_expr.children[token_idx];
-			if (MatchPattern(child_pattern, input_size, child_start_idx, symbol_matches, classifiers, matches)) {
+			if (MatchPattern(child_pattern, input_size, child_start_idx, symbol_matches, classifiers, excluded_rows,
+			                 matches, excluded)) {
 				child_start_idx = matches.back().end_idx.GetIndex();
 				token_idx++;
 			} else {
@@ -523,11 +533,13 @@ static bool MatchPattern(const Expression &pattern, idx_t input_size, const idx_
 	case ExpressionType::ALTERNATION: {
 		// ordered choice: the left alternative wins if it matches
 		auto &alternation_expr = pattern.Cast<BoundAlternationExpression>();
-		if (MatchPattern(*alternation_expr.child_left, input_size, offset, symbol_matches, classifiers, matches)) {
+		if (MatchPattern(*alternation_expr.child_left, input_size, offset, symbol_matches, classifiers, excluded_rows,
+		                 matches, excluded)) {
 			return true;
 		}
 		matches.resize(mark);
-		return MatchPattern(*alternation_expr.child_right, input_size, offset, symbol_matches, classifiers, matches);
+		return MatchPattern(*alternation_expr.child_right, input_size, offset, symbol_matches, classifiers,
+		                    excluded_rows, matches, excluded);
 	}
 	case ExpressionType::QUANTIFIER: {
 		auto &quantifier_expr = pattern.Cast<BoundQuantifierExpression>();
@@ -539,7 +551,7 @@ static bool MatchPattern(const Expression &pattern, idx_t input_size, const idx_
 		while (match_count < max_offset) {
 			const auto repetition = matches.size();
 			if (!MatchPattern(*quantifier_expr.child, input_size, child_start_idx, symbol_matches, classifiers,
-			                  matches)) {
+			                  excluded_rows, matches, excluded || quantifier_expr.excluded)) {
 				matches.resize(repetition);
 				break;
 			}
@@ -565,6 +577,7 @@ static bool MatchPattern(const Expression &pattern, idx_t input_size, const idx_
 		// LAST(X.c) see the row being tested
 		auto previous = classifiers[offset];
 		classifiers[offset] = symbol;
+		excluded_rows[offset] = excluded ? 1 : 0;
 		if (!symbol_matches(symbol, offset)) {
 			classifiers[offset] = previous;
 			return false;
@@ -796,8 +809,8 @@ static void ScanPartitions(ExecutionContext &context, WindowMatchRecognizeGlobal
 		while (row <= partition_end) {
 			row_conditions.BeginMatch(row, match_number + 1);
 			matches.clear();
-			const auto matched =
-			    MatchPattern(*config.pattern, partition_end + 1, row, symbol_matches, classifiers, matches);
+			const auto matched = MatchPattern(*config.pattern, partition_end + 1, row, symbol_matches, classifiers,
+			                                  gstate.excluded_rows, matches);
 			// a zero length match would never advance the scan
 			if (!matched || matches.empty() || !matches.back().end_idx.IsValid() ||
 			    matches.back().end_idx.GetIndex() <= row) {
@@ -809,8 +822,9 @@ static void ScanPartitions(ExecutionContext &context, WindowMatchRecognizeGlobal
 			match_number++;
 
 			for (idx_t match_row = row; match_row <= match_end; match_row++) {
-				gstate.spans[match_row].push_back(WindowMatchRecognizeGlobalState::Span {
-				    classifiers[match_row], match_number, match_row == row, row, match_end});
+				gstate.spans[match_row].push_back(
+				    WindowMatchRecognizeGlobalState::Span {classifiers[match_row], match_number, match_row == row, row,
+				                                           match_end, gstate.excluded_rows[match_row] != 0});
 			}
 			row = SkipTo(config, row_conditions.SkipSymbol(), row, match_end, classifiers);
 		}

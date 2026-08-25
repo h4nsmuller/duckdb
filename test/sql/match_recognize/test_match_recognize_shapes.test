@@ -231,17 +231,67 @@ SELECT day, c, running, final FROM signal_log MATCH_RECOGNIZE(
 17	CLIMB	3	3
 18	CLIMB	3	3
 
-mode skip
+# {- -} leaves rows out of the ALL ROWS PER MATCH output while still matching them. ONSET is the row
+# each rise starts from: it anchors the match but is not itself part of the rise. The FINAL count
+# still sees it, so an excluded row is in the match - just not in the output.
+query IIII
+SELECT day, var_name, match_num, n FROM signal_log MATCH_RECOGNIZE(
+    PARTITION BY device ORDER BY day
+    MEASURES CLASSIFIER() AS var_name, MATCH_NUMBER() AS match_num, FINAL count(*) AS n
+    ALL ROWS PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN ({- ONSET -} CLIMB+)
+    DEFINE CLIMB AS CLIMB.level > PREV(CLIMB.level)
+) ORDER BY day
+----
+2	CLIMB	1	5
+3	CLIMB	1	5
+4	CLIMB	1	5
+5	CLIMB	1	5
+7	CLIMB	2	5
+8	CLIMB	2	5
+9	CLIMB	2	5
+10	CLIMB	2	5
+13	CLIMB	3	2
+17	CLIMB	4	3
+18	CLIMB	4	3
 
-# Everything below is standard syntax we do not support yet.
-
-# Exclusion syntax, which matches rows but leaves them out of ALL ROWS PER MATCH output
-statement ok
-SELECT 1 FROM signal_log MATCH_RECOGNIZE(
+# an exclusion may cover several variables, and the whole match may be excluded except one tail
+query II
+SELECT day, var_name FROM signal_log MATCH_RECOGNIZE(
     PARTITION BY device ORDER BY day
     MEASURES CLASSIFIER() AS var_name
-    ALL ROWS PER MATCH PATTERN ({- ONSET -} CLIMB+)
-    DEFINE CLIMB AS CLIMB.level > PREV(CLIMB.level)
-)
+    ALL ROWS PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN ({- ONSET DIP+ -} CLIMB+)
+    DEFINE DIP AS DIP.level < PREV(DIP.level), CLIMB AS CLIMB.level > PREV(CLIMB.level)
+) ORDER BY day
+----
+7	CLIMB
+8	CLIMB
+9	CLIMB
+10	CLIMB
+13	CLIMB
+17	CLIMB
+18	CLIMB
 
-mode unskip
+# a SUBSET may span an excluded variable: the rows are in the match, so the measure still sees them
+query III
+SELECT day, var_name, seen FROM signal_log MATCH_RECOGNIZE(
+    PARTITION BY device ORDER BY day
+    MEASURES CLASSIFIER() AS var_name, FINAL count(BOTH_OF_THEM.level) AS seen
+    ALL ROWS PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN ({- ONSET -} CLIMB+)
+    SUBSET BOTH_OF_THEM = (ONSET, CLIMB)
+    DEFINE CLIMB AS CLIMB.level > PREV(CLIMB.level)
+) ORDER BY day
+----
+2	CLIMB	5
+3	CLIMB	5
+4	CLIMB	5
+5	CLIMB	5
+7	CLIMB	5
+8	CLIMB	5
+9	CLIMB	5
+10	CLIMB	5
+13	CLIMB	2
+17	CLIMB	3
+18	CLIMB	3

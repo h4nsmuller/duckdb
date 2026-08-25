@@ -1650,8 +1650,9 @@ RowPattern <- RowPatternTerm RowPatternAlternative*
 RowPatternAlternative <- '|' RowPatternTerm
 RowPatternTerm <- RowPatternFactor+
 RowPatternFactor <- RowPatternPrimary RowPatternQuantifier?
-RowPatternPrimary <- RowPatternGroup / RowPatternLabel
+RowPatternPrimary <- RowPatternExclusion / RowPatternGroup / RowPatternLabel
 RowPatternGroup <- Parens(RowPattern)
+RowPatternExclusion <- '{' '-' RowPattern '-' '}'
 RowPatternLabel <- ColLabelOrString
 
 RowPatternQuantifier <- QuantifierStar / QuantifierPlus / QuantifierRange

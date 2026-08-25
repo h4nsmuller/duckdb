@@ -192,6 +192,15 @@ PEGTransformerFactory::TransformRowPatternFactor(PEGTransformer &transformer,
 	                                                              quantifier.max_count);
 }
 
+//! {- P -} matches P and takes part in the match, but its rows are left out of the output
+unique_ptr<ParsedExpression>
+PEGTransformerFactory::TransformRowPatternExclusion(PEGTransformer &transformer,
+                                                    unique_ptr<ParsedExpression> row_pattern) {
+	auto result = make_uniq<QuantifiedExpression>(std::move(row_pattern), 1, 1);
+	result->excluded = true;
+	return std::move(result);
+}
+
 unique_ptr<ParsedExpression> PEGTransformerFactory::TransformRowPatternLabel(PEGTransformer &transformer,
                                                                              const Identifier &col_label_or_string) {
 	return make_uniq_base<ParsedExpression, ColumnRefExpression>(col_label_or_string);

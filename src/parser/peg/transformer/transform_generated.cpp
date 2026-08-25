@@ -8049,6 +8049,14 @@ unique_ptr<TransformResultValue> PEGTransformerFactory::TransformRowPatternGroup
 	return make_uniq<TypedTransformResult<unique_ptr<ParsedExpression>>>(std::move(result));
 }
 
+unique_ptr<TransformResultValue>
+PEGTransformerFactory::TransformRowPatternExclusionInternal(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list_pr = parse_result.Cast<ListParseResult>();
+	auto row_pattern = transformer.Transform<unique_ptr<ParsedExpression>>(list_pr.GetChild(2));
+	auto result = TransformRowPatternExclusion(transformer, std::move(row_pattern));
+	return make_uniq<TypedTransformResult<unique_ptr<ParsedExpression>>>(std::move(result));
+}
+
 unique_ptr<TransformResultValue> PEGTransformerFactory::TransformRowPatternLabelInternal(PEGTransformer &transformer,
                                                                                          ParseResult &parse_result) {
 	auto &list_pr = parse_result.Cast<ListParseResult>();
@@ -11930,6 +11938,7 @@ void PEGTransformerFactory::RegisterGenerated() {
 	    {"RowPatternFactor", &PEGTransformerFactory::TransformRowPatternFactorInternal},
 	    {"RowPatternPrimary", &PEGTransformerFactory::TransformRowPatternPrimaryInternal},
 	    {"RowPatternGroup", &PEGTransformerFactory::TransformRowPatternGroupInternal},
+	    {"RowPatternExclusion", &PEGTransformerFactory::TransformRowPatternExclusionInternal},
 	    {"RowPatternLabel", &PEGTransformerFactory::TransformRowPatternLabelInternal},
 	    {"RowPatternQuantifier", &PEGTransformerFactory::TransformRowPatternQuantifierInternal},
 	    {"QuantifierStar", &PEGTransformerFactory::TransformQuantifierStarInternal},
