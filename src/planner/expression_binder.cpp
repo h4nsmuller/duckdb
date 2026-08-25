@@ -1,3 +1,4 @@
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 
 #include "duckdb/parser/expression/list.hpp"

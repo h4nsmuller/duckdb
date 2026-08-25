@@ -14,6 +14,7 @@
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/tableref/list.hpp"
+#include "duckdb/parser/tableref/match_recognize_ref.hpp"
 
 namespace duckdb {
 
@@ -77,6 +78,28 @@ void ParsedExpressionIterator::EnumerateTableRefChildren(
     TableRef &ref, const std::function<void(unique_ptr<ParsedExpression> &child)> &expr_callback,
     const std::function<void(TableRef &ref)> &ref_callback) {
 	switch (ref.type) {
+	case TableReferenceType::MATCH_RECOGNIZE: {
+		auto &mr_ref = ref.Cast<MatchRecognizeRef>();
+		for (auto &expr : mr_ref.config->partition_expressions) {
+			expr_callback(expr);
+		}
+		for (auto &order : mr_ref.config->order_by_expressions) {
+			expr_callback(order.expression);
+		}
+		for (auto &expr : mr_ref.config->measures_expression_list) {
+			expr_callback(expr);
+		}
+		for (auto &expr : mr_ref.config->defines_expression_list) {
+			expr_callback(expr);
+		}
+		if (mr_ref.config->pattern) {
+			expr_callback(mr_ref.config->pattern);
+		}
+		if (mr_ref.input) {
+			ref_callback(*mr_ref.input);
+		}
+		break;
+	}
 	case TableReferenceType::EXPRESSION_LIST: {
 		auto &el_ref = ref.Cast<ExpressionListRef>();
 		for (idx_t i = 0; i < el_ref.values.size(); i++) {
