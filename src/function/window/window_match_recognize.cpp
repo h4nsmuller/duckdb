@@ -34,7 +34,7 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 
 	//! One row of the result list
 	struct Span {
-		string classifier;
+		idx_t symbol;
 		idx_t match_number;
 		bool is_match_start;
 		idx_t match_start;
@@ -42,7 +42,7 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 	};
 
 	//! Build the list vector the operator reads from the spans collected during matching
-	void MaterializeSpans() {
+	void MaterializeSpans(const vector<string> &symbols) {
 		idx_t total = 0;
 		for (auto &row : spans) {
 			total += row.size();
@@ -58,7 +58,7 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 			list_data[row].offset = offset;
 			list_data[row].length = spans[row].size();
 			for (auto &span : spans[row]) {
-				fields[CLASSIFIER].SetValue(offset, Value(span.classifier));
+				fields[CLASSIFIER].SetValue(offset, Value(MatchRecognizeSymbolName(symbols[span.symbol])));
 				fields[MATCH_NUMBER].SetValue(offset, Value::UBIGINT(span.match_number));
 				fields[IS_MATCH_START].SetValue(offset, Value::BOOLEAN(span.is_match_start));
 				fields[MATCH_START].SetValue(offset, Value::UBIGINT(span.match_start));
@@ -77,7 +77,7 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 	atomic<idx_t> next_partition {0};
 	atomic<idx_t> completed_partitions {0};
 	//! The variable that classified each row, written only by the thread that owns the partition
-	vector<string> classifiers;
+	vector<idx_t> classifiers;
 	//! Materialised only when a condition has to be settled per row, and then shared by the threads
 	DataChunk rows;
 	//! One boolean per symbol per row. Sink fills these as rows arrive, over disjoint ranges, so the
@@ -120,6 +120,37 @@ static void RebindToArguments(unique_ptr<Expression> &expr, const expression_map
 	ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
 		RebindToArguments(child, argument_index, match_number_index, reads_match_number);
 	});
+}
+
+//! Replace each pattern leaf's symbol name with its index
+static void ResolvePatternSymbols(unique_ptr<Expression> &pattern, const unordered_map<string, idx_t> &symbol_index) {
+	if (pattern->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
+		auto &constant = pattern->Cast<BoundConstantExpression>();
+		if (constant.GetValue().type().id() == LogicalTypeId::VARCHAR) {
+			auto entry = symbol_index.find(constant.GetValue().GetValue<string>());
+			D_ASSERT(entry != symbol_index.end());
+			pattern = make_uniq<BoundConstantExpression>(Value::UBIGINT(entry->second));
+		}
+		return;
+	}
+	switch (pattern->GetExpressionType()) {
+	case ExpressionType::ALTERNATION: {
+		auto &alternation = pattern->Cast<BoundAlternationExpression>();
+		ResolvePatternSymbols(alternation.child_left, symbol_index);
+		ResolvePatternSymbols(alternation.child_right, symbol_index);
+		break;
+	}
+	case ExpressionType::CONCATENATION:
+		for (auto &child : pattern->Cast<BoundConcatenationExpression>().children) {
+			ResolvePatternSymbols(child, symbol_index);
+		}
+		break;
+	case ExpressionType::QUANTIFIER:
+		ResolvePatternSymbols(pattern->Cast<BoundQuantifierExpression>().child, symbol_index);
+		break;
+	default:
+		break;
+	}
 }
 
 unique_ptr<FunctionData> WindowMatchRecognizeExecutor::Bind(BindWindowFunctionInput &input) {
@@ -185,6 +216,14 @@ unique_ptr<FunctionData> WindowMatchRecognizeExecutor::Bind(BindWindowFunctionIn
 	if (bind_data->conditions.size() != bind_data->symbols.size()) {
 		throw BinderException("MATCH_RECOGNIZE has a condition for every pattern symbol");
 	}
+
+	// the matcher compares symbols on every candidate row, so the leaves carry an index into
+	// symbols rather than the name itself
+	unordered_map<string, idx_t> symbol_index;
+	for (idx_t i = 0; i < bind_data->symbols.size(); i++) {
+		symbol_index[bind_data->symbols[i]] = i;
+	}
+	ResolvePatternSymbols(bind_data->pattern, symbol_index);
 
 	auto &bound_function = input.GetBoundFunction();
 	bound_function.GetArguments().resize(1);
@@ -431,10 +470,10 @@ struct Match {
 // Successful symbol matches record the matching variable at their row offset. Failed branches may leave
 // stale entries behind, but every offset a successful match covers is written by that match, so reading
 // the range of a successful match is well defined.
-using SymbolMatcher = std::function<bool(const string &symbol, idx_t row)>;
+using SymbolMatcher = std::function<bool(idx_t symbol, idx_t row)>;
 
 static vector<Match> MatchPattern(const Expression &pattern, idx_t input_size, const idx_t offset,
-                                  const SymbolMatcher &symbol_matches, vector<string> &classifiers) {
+                                  const SymbolMatcher &symbol_matches, vector<idx_t> &classifiers) {
 	if (offset >= input_size) {
 		return {Match(false)};
 	}
@@ -512,7 +551,7 @@ static vector<Match> MatchPattern(const Expression &pattern, idx_t input_size, c
 	}
 	case ExpressionType::VALUE_CONSTANT: {
 		// TODO cache those pointers in the map instead of the vector
-		auto symbol = pattern.Cast<BoundConstantExpression>().GetValue().GetValue<string>();
+		const auto symbol = NumericCast<idx_t>(pattern.Cast<BoundConstantExpression>().GetValue().GetValue<uint64_t>());
 		// the row is tentatively this symbol while its condition is evaluated, which is what lets
 		// LAST(X.c) see the row being tested
 		auto previous = classifiers[offset];
@@ -529,8 +568,8 @@ static vector<Match> MatchPattern(const Expression &pattern, idx_t input_size, c
 }
 
 //! Where to resume scanning after a match spanning [match_start, match_end]
-static idx_t SkipTo(const MatchRecognizeFunctionData &config, idx_t match_start, idx_t match_end,
-                    const vector<string> &classifiers) {
+static idx_t SkipTo(const MatchRecognizeFunctionData &config, idx_t skip_symbol, idx_t match_start, idx_t match_end,
+                    const vector<idx_t> &classifiers) {
 	auto resume = match_end + 1;
 	switch (config.after_match) {
 	case MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_NEXT_ROW:
@@ -541,7 +580,7 @@ static idx_t SkipTo(const MatchRecognizeFunctionData &config, idx_t match_start,
 		const auto first = config.after_match == MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_FIRST_VAR;
 		optional_idx target;
 		for (idx_t row = match_start; row <= match_end; row++) {
-			if (classifiers[row] != config.after_match_variable) {
+			if (classifiers[row] != skip_symbol) {
 				continue;
 			}
 			target = row;
@@ -616,8 +655,19 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 
 	auto &condition_values = gstate.condition_values;
 	unordered_map<string, idx_t> symbol_index;
-	for (idx_t i = 0; i < conditions.size(); i++) {
+	for (idx_t i = 0; i < config.symbols.size(); i++) {
 		symbol_index[config.symbols[i]] = i;
+	}
+	// the skip target and the navigations name symbols too, resolved here so the matcher compares
+	// indices rather than strings
+	auto lookup_symbol = [&](const string &name) -> idx_t {
+		auto entry = symbol_index.find(name);
+		return entry == symbol_index.end() ? DConstants::INVALID_INDEX : entry->second;
+	};
+	const auto skip_symbol = lookup_symbol(config.after_match_variable);
+	vector<idx_t> navigation_symbols;
+	for (auto &navigation : config.navigations) {
+		navigation_symbols.push_back(lookup_symbol(navigation.symbol));
 	}
 
 	// state of the attempt in progress, needed to resolve FIRST()/LAST()
@@ -631,7 +681,7 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 
 	//	The row FIRST()/LAST() navigates to, or an invalid index when the match has no such row
 	auto navigate = [&](const MatchRecognizeFunctionData::Navigation &navigation, idx_t row,
-	                    const vector<string> &assignment) -> optional_idx {
+	                    const vector<idx_t> &assignment) -> optional_idx {
 		if (navigation.symbol.empty()) {
 			// the match as a whole, counted from whichever end
 			if (navigation.last) {
@@ -644,13 +694,15 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		idx_t seen = 0;
 		if (navigation.last) {
 			for (idx_t candidate = row + 1; candidate > current_match_start; candidate--) {
-				if (assignment[candidate - 1] == navigation.symbol && seen++ == navigation.offset) {
+				if (assignment[candidate - 1] == navigation_symbols[&navigation - config.navigations.data()] &&
+				    seen++ == navigation.offset) {
 					return candidate - 1;
 				}
 			}
 		} else {
 			for (idx_t candidate = current_match_start; candidate <= row; candidate++) {
-				if (assignment[candidate] == navigation.symbol && seen++ == navigation.offset) {
+				if (assignment[candidate] == navigation_symbols[&navigation - config.navigations.data()] &&
+				    seen++ == navigation.offset) {
 					return candidate;
 				}
 			}
@@ -658,10 +710,8 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		return optional_idx();
 	};
 
-	SymbolMatcher symbol_matches = [&](const string &symbol, idx_t row) -> bool {
-		auto entry = symbol_index.find(symbol);
-		D_ASSERT(entry != symbol_index.end());
-		const auto index = entry->second;
+	SymbolMatcher symbol_matches = [&](idx_t index, idx_t row) -> bool {
+		D_ASSERT(index < config.symbols.size());
 		if (index >= config.row_scoped.size() || !config.row_scoped[index]) {
 			return condition_values[index][row] != 0;
 		}
@@ -735,15 +785,15 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 
 			for (idx_t match_row = row; match_row <= match_end; match_row++) {
 				gstate.spans[match_row].push_back(WindowMatchRecognizeGlobalState::Span {
-				    MatchRecognizeSymbolName(classifiers[match_row]), match_number, match_row == row, row, match_end});
+				    classifiers[match_row], match_number, match_row == row, row, match_end});
 			}
-			row = SkipTo(config, row, match_end, classifiers);
+			row = SkipTo(config, skip_symbol, row, match_end, classifiers);
 			current_match_number = match_number + 1;
 		}
 
 		// the thread that finishes the last partition publishes the result
 		if (++gstate.completed_partitions == gstate.partitions.size()) {
-			gstate.MaterializeSpans();
+			gstate.MaterializeSpans(config.symbols);
 		}
 	}
 }
