@@ -214,3 +214,140 @@ statement ok
 SELECT count(*) FROM seq MATCH_RECOGNIZE(
     MEASURES i AS x PATTERN (A+ B* A{1,2} B{3,} A{,4}) DEFINE A as v=1, B as v=0
 )
+
+# A greedy quantifier has to give back as many rows as the rest of the pattern needs, not just one.
+# All but the first of these need it to give back two or more. Grouping the tail must not change the
+# answer either: parentheses do not change the language a pattern matches.
+
+statement ok
+create table five as select i::integer as i, 'a' as v from range(0,5) g(i);
+
+query II
+SELECT count(*), max(len) FROM five MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS len
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A+ B)
+    DEFINE A AS A.v = 'a', B AS B.v = 'a', C AS C.v = 'a'
+)
+----
+1	5
+
+query II
+SELECT count(*), max(len) FROM five MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS len
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A+ B B)
+    DEFINE A AS A.v = 'a', B AS B.v = 'a', C AS C.v = 'a'
+)
+----
+1	5
+
+query II
+SELECT count(*), max(len) FROM five MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS len
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A+ B B B)
+    DEFINE A AS A.v = 'a', B AS B.v = 'a', C AS C.v = 'a'
+)
+----
+1	5
+
+query II
+SELECT count(*), max(len) FROM five MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS len
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A+ B C)
+    DEFINE A AS A.v = 'a', B AS B.v = 'a', C AS C.v = 'a'
+)
+----
+1	5
+
+query II
+SELECT count(*), max(len) FROM five MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS len
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A+ B+ C)
+    DEFINE A AS A.v = 'a', B AS B.v = 'a', C AS C.v = 'a'
+)
+----
+1	5
+
+query II
+SELECT count(*), max(len) FROM five MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS len
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A* B B)
+    DEFINE A AS A.v = 'a', B AS B.v = 'a', C AS C.v = 'a'
+)
+----
+1	5
+
+query II
+SELECT count(*), max(len) FROM five MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS len
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A{2,4} B B)
+    DEFINE A AS A.v = 'a', B AS B.v = 'a', C AS C.v = 'a'
+)
+----
+1	5
+
+query II
+SELECT count(*), max(len) FROM five MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS len
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A+ (B C))
+    DEFINE A AS A.v = 'a', B AS B.v = 'a', C AS C.v = 'a'
+)
+----
+1	5
+
+query II
+SELECT count(*), max(len) FROM five MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS len
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN ((A|B)+ C)
+    DEFINE A AS A.v = 'a', B AS B.v = 'a', C AS C.v = 'a'
+)
+----
+1	5
+
+query II
+SELECT count(*), max(len) FROM five MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS len
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A B+ C C)
+    DEFINE A AS A.v = 'a', B AS B.v = 'a', C AS C.v = 'a'
+)
+----
+1	5
+
+# the same thing where the variables overlap on real data rather than matching everything: RISE
+# takes the whole climb and then has to give two rows back, one for PEAK and one for DROP
+statement ok
+create table climbs(day integer, level integer);
+
+statement ok
+insert into climbs values (1,40),(2,55),(3,61),(4,67),(5,79),(6,40),(7,49),(8,64),(9,76),(10,79);
+
+query III
+SELECT count(*), max(first_day), max(len) FROM climbs MATCH_RECOGNIZE(
+    ORDER BY day MEASURES FIRST(day) AS first_day, count(*) AS len
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (RISE+ PEAK DROP)
+    DEFINE RISE AS RISE.level > PREV(RISE.level), PEAK AS true,
+           DROP AS DROP.level < PREV(DROP.level)
+)
+----
+1	2	5
+
+query III
+SELECT count(*), max(first_day), max(len) FROM climbs MATCH_RECOGNIZE(
+    ORDER BY day MEASURES FIRST(day) AS first_day, count(*) AS len
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (RISE+ (PEAK DROP))
+    DEFINE RISE AS RISE.level > PREV(RISE.level), PEAK AS true,
+           DROP AS DROP.level < PREV(DROP.level)
+)
+----
+1	2	5

@@ -466,133 +466,185 @@ static void FetchHashGroup(ColumnDataCollection &input, DataChunk &result_chunk)
 	}
 }
 
-struct Match {
-	Match() : success(false), optional(false) {
-	}
-	Match(bool success_p, optional_idx end_idx_p = optional_idx::Invalid(), bool optional_p = false)
-	    : success(success_p), end_idx(end_idx_p), optional(optional_p) {
-	}
+//! An instruction of the compiled pattern. Compiling the tree into a program makes "what to do
+//! after this node" a position in that program rather than a place in a recursive walk, which is
+//! what lets the matcher recognise a state it has already explored.
+enum class PatternOp : uint8_t { SYMBOL, SPLIT, JUMP, MATCH };
 
-	bool success;
-	optional_idx end_idx;
-	bool optional;
+struct PatternInstruction {
+	PatternOp op = PatternOp::MATCH;
+	//! SYMBOL: the variable to test, and whether it sits inside a {- -}
+	idx_t symbol = 0;
+	bool excluded = false;
+	//! SPLIT: where to go first, then where to go if that fails. JUMP: where to go.
+	idx_t target = 0;
+	idx_t alternative = 0;
 };
 
-// simplistic backtracking pattern matcher
-// Successful symbol matches record the matching variable at their row offset. Failed branches may leave
-// stale entries behind, but every offset a successful match covers is written by that match, so reading
-// the range of a successful match is well defined.
 using SymbolMatcher = std::function<bool(idx_t symbol, idx_t row)>;
 
-// The matches a successful call produces are appended to `matches`, which the caller reuses across
-// rows rather than every node handing back a fresh vector. A failed call leaves it as it found it.
-static bool MatchPattern(const Expression &pattern, idx_t input_size, const idx_t offset,
-                         const SymbolMatcher &symbol_matches, vector<idx_t> &classifiers,
-                         vector<uint8_t> &excluded_rows, vector<Match> &matches, bool excluded = false) {
-	if (offset >= input_size) {
-		return false;
-	}
-	const auto mark = matches.size();
-	switch (pattern.GetExpressionType()) {
-	case ExpressionType::CONCATENATION: {
-		auto &concatenation_expr = pattern.Cast<BoundConcatenationExpression>();
+struct PatternProgram {
+	vector<PatternInstruction> code;
 
-		auto child_start_idx = offset;
-		idx_t token_idx = 0;
-
-		while (token_idx < concatenation_expr.children.size()) {
-			auto &child_pattern = *concatenation_expr.children[token_idx];
-			if (MatchPattern(child_pattern, input_size, child_start_idx, symbol_matches, classifiers, excluded_rows,
-			                 matches, excluded)) {
-				child_start_idx = matches.back().end_idx.GetIndex();
-				token_idx++;
-			} else {
-				auto token_is_optional = false;
-				if (child_pattern.GetExpressionType() == ExpressionType::QUANTIFIER) {
-					auto &quantifier_expr = child_pattern.Cast<BoundQuantifierExpression>();
-					if (!quantifier_expr.min_count.IsValid() || quantifier_expr.min_count.GetIndex() == 0) {
-						token_is_optional = true;
-					}
-				}
-				if (token_is_optional) {
-					token_idx++;
-					continue;
-				}
-				if (matches.size() > mark && matches.back().optional) {
-					child_start_idx = matches.back().end_idx.GetIndex();
-					matches.pop_back();
-					continue;
-				}
+	//! `limit` bounds a counted quantifier: no repetition can match fewer than one row, so more
+	//! repetitions than there are rows can never be reached
+	void Compile(const Expression &node, idx_t limit, bool excluded = false) {
+		switch (node.GetExpressionType()) {
+		case ExpressionType::VALUE_CONSTANT: {
+			PatternInstruction symbol;
+			symbol.op = PatternOp::SYMBOL;
+			symbol.symbol = NumericCast<idx_t>(node.Cast<BoundConstantExpression>().GetValue().GetValue<uint64_t>());
+			symbol.excluded = excluded;
+			code.push_back(symbol);
+			break;
+		}
+		case ExpressionType::CONCATENATION:
+			for (auto &child : node.Cast<BoundConcatenationExpression>().children) {
+				Compile(*child, limit, excluded);
+			}
+			break;
+		case ExpressionType::ALTERNATION: {
+			auto &alternation = node.Cast<BoundAlternationExpression>();
+			auto split = Emit(PatternOp::SPLIT);
+			code[split].target = code.size();
+			Compile(*alternation.child_left, limit, excluded);
+			auto jump = Emit(PatternOp::JUMP);
+			code[split].alternative = code.size();
+			Compile(*alternation.child_right, limit, excluded);
+			code[jump].target = code.size();
+			break;
+		}
+		case ExpressionType::QUANTIFIER: {
+			auto &quantifier = node.Cast<BoundQuantifierExpression>();
+			const auto inner = excluded || quantifier.excluded;
+			// more mandatory repetitions than there are rows can never be satisfied, and one past the
+			// row count is already enough to be sure of that
+			const idx_t declared_min = quantifier.min_count.IsValid() ? quantifier.min_count.GetIndex() : 0;
+			const idx_t min_count = MinValue(declared_min, limit + 1);
+			for (idx_t i = 0; i < min_count; i++) {
+				Compile(*quantifier.child, limit, inner);
+			}
+			if (!quantifier.max_count.IsValid()) {
+				// greedy: going round again is preferred over leaving the loop
+				const auto loop = code.size();
+				auto split = Emit(PatternOp::SPLIT);
+				code[split].target = code.size();
+				Compile(*quantifier.child, limit, inner);
+				code[Emit(PatternOp::JUMP)].target = loop;
+				code[split].alternative = code.size();
 				break;
 			}
-		}
-		// the concatenation reports one match spanning its children
-		matches.resize(mark);
-		if (token_idx != concatenation_expr.children.size()) {
-			return false;
-		}
-		matches.emplace_back(Match(true, child_start_idx));
-		return true;
-	}
-	case ExpressionType::ALTERNATION: {
-		// ordered choice: the left alternative wins if it matches
-		auto &alternation_expr = pattern.Cast<BoundAlternationExpression>();
-		if (MatchPattern(*alternation_expr.child_left, input_size, offset, symbol_matches, classifiers, excluded_rows,
-		                 matches, excluded)) {
-			return true;
-		}
-		matches.resize(mark);
-		return MatchPattern(*alternation_expr.child_right, input_size, offset, symbol_matches, classifiers,
-		                    excluded_rows, matches, excluded);
-	}
-	case ExpressionType::QUANTIFIER: {
-		auto &quantifier_expr = pattern.Cast<BoundQuantifierExpression>();
-		idx_t match_count = 0;
-		auto child_start_idx = offset;
-		auto max_offset = quantifier_expr.max_count.IsValid()
-		                      ? MinValue(input_size, quantifier_expr.max_count.GetIndex())
-		                      : input_size;
-		while (match_count < max_offset) {
-			const auto repetition = matches.size();
-			if (!MatchPattern(*quantifier_expr.child, input_size, child_start_idx, symbol_matches, classifiers,
-			                  excluded_rows, matches, excluded || quantifier_expr.excluded)) {
-				matches.resize(repetition);
-				break;
+			const auto max_count = MinValue(quantifier.max_count.GetIndex(), min_count + limit);
+			vector<idx_t> exits;
+			for (idx_t i = min_count; i < max_count; i++) {
+				auto split = Emit(PatternOp::SPLIT);
+				code[split].target = code.size();
+				exits.push_back(split);
+				Compile(*quantifier.child, limit, inner);
 			}
-			child_start_idx = matches.back().end_idx.GetIndex();
-			match_count++;
-			// a repetition may only be given up if doing so still satisfies the minimum
-			auto is_optional =
-			    quantifier_expr.min_count.IsValid() ? match_count > quantifier_expr.min_count.GetIndex() : true;
-			// one entry per repetition, in place of whatever the child reported
-			matches.resize(repetition);
-			matches.emplace_back(Match(true, child_start_idx, is_optional));
+			for (auto exit_split : exits) {
+				code[exit_split].alternative = code.size();
+			}
+			break;
 		}
-		if (matches.size() > mark &&
-		    (!quantifier_expr.min_count.IsValid() || match_count >= quantifier_expr.min_count.GetIndex())) {
-			return true;
+		default:
+			throw InternalException("Unsupported MATCH_RECOGNIZE pattern node");
 		}
-		matches.resize(mark);
+	}
+
+	void Finish() {
+		Emit(PatternOp::MATCH);
+	}
+
+private:
+	idx_t Emit(PatternOp op) {
+		PatternInstruction instruction;
+		instruction.op = op;
+		code.push_back(instruction);
+		return code.size() - 1;
+	}
+};
+
+//! Walks the compiled program depth first, preferring the branch a greedy quantifier wants, and
+//! stops at the first way through - which is the match the standard asks for.
+//!
+//! A (instruction, row) pair that has been explored once and did not lead to a match cannot lead to
+//! one later, so it is never explored again. That is what keeps the search polynomial where plain
+//! backtracking is exponential, and it holds only while a variable's condition depends on nothing
+//! but the row it is testing. A condition that navigates the match being assembled, or reads
+//! MATCH_NUMBER(), depends on the rows matched so far, so for those the record is dropped between
+//! attempts and the matcher backtracks in the ordinary way.
+struct PatternMatcher {
+	PatternMatcher(const PatternProgram &program_p, const SymbolMatcher &symbol_matches_p, vector<idx_t> &classifiers_p,
+	               vector<uint8_t> &excluded_rows_p, bool conditions_are_row_local_p)
+	    : program(program_p), symbol_matches(symbol_matches_p), classifiers(classifiers_p),
+	      excluded_rows(excluded_rows_p), conditions_are_row_local(conditions_are_row_local_p),
+	      row_count(classifiers_p.size()), explored(program_p.code.size() * (classifiers_p.size() + 1), 0) {
+	}
+
+	//! Match starting at `start`, with `input_size` the first row beyond the partition
+	bool Match(idx_t start, idx_t input_size) {
+		if (!conditions_are_row_local) {
+			std::fill(explored.begin(), explored.end(), 0);
+		}
+		pending.clear();
+		pending.emplace_back(0, start);
+		while (!pending.empty()) {
+			auto state = pending.back();
+			pending.pop_back();
+			auto pc = state.first;
+			auto offset = state.second;
+			while (true) {
+				auto &slot = explored[pc * (row_count + 1) + offset];
+				if (slot) {
+					break;
+				}
+				slot = 1;
+				auto &instruction = program.code[pc];
+				if (instruction.op == PatternOp::MATCH) {
+					match_end = offset;
+					return true;
+				}
+				if (instruction.op == PatternOp::JUMP) {
+					pc = instruction.target;
+					continue;
+				}
+				if (instruction.op == PatternOp::SPLIT) {
+					pending.emplace_back(instruction.alternative, offset);
+					pc = instruction.target;
+					continue;
+				}
+				if (offset >= input_size) {
+					break;
+				}
+				// the row is tentatively this symbol while its condition is evaluated, which is what
+				// lets LAST(X.c) see the row being tested
+				classifiers[offset] = instruction.symbol;
+				if (!symbol_matches(instruction.symbol, offset)) {
+					break;
+				}
+				excluded_rows[offset] = instruction.excluded ? 1 : 0;
+				pc++;
+				offset++;
+			}
+		}
 		return false;
 	}
-	case ExpressionType::VALUE_CONSTANT: {
-		const auto symbol = NumericCast<idx_t>(pattern.Cast<BoundConstantExpression>().GetValue().GetValue<uint64_t>());
-		// the row is tentatively this symbol while its condition is evaluated, which is what lets
-		// LAST(X.c) see the row being tested
-		auto previous = classifiers[offset];
-		classifiers[offset] = symbol;
-		excluded_rows[offset] = excluded ? 1 : 0;
-		if (!symbol_matches(symbol, offset)) {
-			classifiers[offset] = previous;
-			return false;
-		}
-		matches.emplace_back(Match(true, offset + 1));
-		return true;
-	}
-	default:
-		throw InternalException("Unsupported pattern type");
-	}
-}
+
+	//! One past the last row of the match, valid after Match() returned true
+	idx_t match_end = 0;
+
+private:
+	const PatternProgram &program;
+	const SymbolMatcher &symbol_matches;
+	vector<idx_t> &classifiers;
+	vector<uint8_t> &excluded_rows;
+	bool conditions_are_row_local;
+	idx_t row_count;
+	//! One flag per (instruction, row): whether that state has been walked already
+	vector<uint8_t> explored;
+	vector<pair<idx_t, idx_t>> pending;
+};
 
 //! Where to resume scanning after a match spanning [match_start, match_end]
 static idx_t SkipTo(const MatchRecognizeFunctionData &config, idx_t skip_symbol, idx_t match_start, idx_t match_end,
@@ -793,8 +845,17 @@ static void ScanPartitions(ExecutionContext &context, WindowMatchRecognizeGlobal
 		return row_conditions.Matches(index, row);
 	};
 
-	// reused by every match attempt rather than allocated per pattern node
-	vector<Match> matches;
+	// a condition that navigates the match, or reads MATCH_NUMBER(), depends on the rows matched so
+	// far rather than only on the row it is testing
+	bool conditions_are_row_local = true;
+	for (auto scoped : config.row_scoped) {
+		conditions_are_row_local = conditions_are_row_local && !scoped;
+	}
+
+	PatternProgram program;
+	program.Compile(*config.pattern, classifiers.size());
+	program.Finish();
+	PatternMatcher matcher(program, symbol_matches, classifiers, gstate.excluded_rows, conditions_are_row_local);
 
 	// Partitions are independent, so every thread that reaches Finalize takes them from a shared
 	// cursor rather than one thread doing the whole hash group.
@@ -812,17 +873,13 @@ static void ScanPartitions(ExecutionContext &context, WindowMatchRecognizeGlobal
 		auto row = partition_start;
 		while (row <= partition_end) {
 			row_conditions.BeginMatch(row, match_number + 1);
-			matches.clear();
-			const auto matched = MatchPattern(*config.pattern, partition_end + 1, row, symbol_matches, classifiers,
-			                                  gstate.excluded_rows, matches);
 			// a zero length match would never advance the scan
-			if (!matched || matches.empty() || !matches.back().end_idx.IsValid() ||
-			    matches.back().end_idx.GetIndex() <= row) {
+			if (!matcher.Match(row, partition_end + 1) || matcher.match_end <= row) {
 				row++;
 				continue;
 			}
 			// a match can never reach beyond its own partition
-			const auto match_end = MinValue(matches.back().end_idx.GetIndex() - 1, partition_end);
+			const auto match_end = MinValue(matcher.match_end - 1, partition_end);
 			match_number++;
 
 			for (idx_t match_row = row; match_row <= match_end; match_row++) {
