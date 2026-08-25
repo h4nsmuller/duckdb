@@ -126,14 +126,8 @@ SELECT day, match_num, level FROM signal_log MATCH_RECOGNIZE(
 17	4	46
 18	4	76
 
-mode skip
-
-# Everything below is standard syntax we do not support yet.
-
-# AFTER MATCH SKIP TO LAST <var> lets consecutive matches share the row the skip lands on. A row
-# carries a single match number here, so the later match claims it and the earlier one loses its last
-# row - the first match reports 9 rather than 10 below. Representing this needs the window to emit a
-# row per (row, match) pair rather than per row.
+# AFTER MATCH SKIP TO LAST <var> lets consecutive matches share the row the skip lands on, so the
+# second match starts on the day the first one ended
 query III
 SELECT start_day, bottom_day, end_day FROM signal_log MATCH_RECOGNIZE(
     PARTITION BY device ORDER BY day
@@ -144,8 +138,12 @@ SELECT start_day, bottom_day, end_day FROM signal_log MATCH_RECOGNIZE(
 ) ORDER BY start_day
 ----
 5	6	10
-10	40	13
+10	12	13
 14	16	18
+
+mode skip
+
+# Everything below is standard syntax we do not support yet.
 
 # RUNNING and FINAL do not parse. A measure is RUNNING under ALL ROWS PER MATCH and FINAL under
 # ONE ROW PER MATCH, which is the default in both cases, but the keywords cannot be written.

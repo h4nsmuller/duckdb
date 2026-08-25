@@ -31,11 +31,10 @@ ORDER BY p,o
 1	2	1	2
 1	3	1	2
 2	1	0	1
+2	2	0	1
 2	2	1	2
 2	3	1	2
 
-# NOTE: SKIP TO NEXT ROW makes matches overlap, and a row can only carry one match number, so the
-# later match claims the shared row. The earlier match then no longer sees a B, hence the NULL.
 query IIII
 SELECT s.p, s.mn, s.a_val, s.b_val
 FROM test AS t MATCH_RECOGNIZE(
@@ -50,7 +49,7 @@ FROM test AS t MATCH_RECOGNIZE(
 ORDER BY s.p, s.mn
 ----
 1	1	1.2	1.3
-2	1	2.1	NULL
+2	1	2.1	2.2
 2	2	2.2	2.3
 
 

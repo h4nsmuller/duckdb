@@ -4,6 +4,7 @@
 #include "duckdb/function/window/match_recognize_functions.hpp"
 #include "duckdb/function/window/window_shared_expressions.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -14,15 +15,50 @@
 
 namespace duckdb {
 
+//	Column indexes into the result struct
+enum MatchRecognizeResult : idx_t { CLASSIFIER = 0, MATCH_NUMBER, IS_MATCH_START, MATCH_START, MATCH_END };
+
 struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 	WindowMatchRecognizeGlobalState(ClientContext &client, const WindowExecutor &executor, const idx_t payload_count,
 	                                const ValidityMask &partition_mask, const ValidityMask &order_mask)
 	    : WindowExecutorGlobalState(client, executor, payload_count, partition_mask, order_mask),
-	      result_vec(executor.wexpr.GetReturnType(), payload_count) {
-		FlatVector::ValidityMutable(result_vec).SetAllInvalid(payload_count);
-		D_ASSERT(result_vec.GetType().id() == LogicalTypeId::STRUCT);
-		for (auto &struct_entry : StructVector::GetEntries(result_vec)) {
-			FlatVector::ValidityMutable(struct_entry).SetAllInvalid(payload_count);
+	      result_vec(executor.wexpr.GetReturnType(), payload_count), spans(payload_count) {
+		D_ASSERT(result_vec.GetType().id() == LogicalTypeId::LIST);
+	}
+
+	//! One row of the result list
+	struct Span {
+		string classifier;
+		idx_t match_number;
+		bool is_match_start;
+		idx_t match_start;
+		idx_t match_end;
+	};
+
+	//! Build the list vector the operator reads from the spans collected during matching
+	void MaterializeSpans() {
+		idx_t total = 0;
+		for (auto &row : spans) {
+			total += row.size();
+		}
+		ListVector::Reserve(result_vec, total);
+		ListVector::SetListSize(result_vec, total);
+		auto list_data = FlatVector::GetDataMutable<list_entry_t>(result_vec);
+		auto &child = ListVector::GetEntry(result_vec);
+		auto &fields = StructVector::GetEntries(child);
+
+		idx_t offset = 0;
+		for (idx_t row = 0; row < spans.size(); row++) {
+			list_data[row].offset = offset;
+			list_data[row].length = spans[row].size();
+			for (auto &span : spans[row]) {
+				fields[CLASSIFIER].SetValue(offset, Value(span.classifier));
+				fields[MATCH_NUMBER].SetValue(offset, Value::UBIGINT(span.match_number));
+				fields[IS_MATCH_START].SetValue(offset, Value::BOOLEAN(span.is_match_start));
+				fields[MATCH_START].SetValue(offset, Value::UBIGINT(span.match_start));
+				fields[MATCH_END].SetValue(offset, Value::UBIGINT(span.match_end));
+				offset++;
+			}
 		}
 	}
 
@@ -30,18 +66,19 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 	mutex state_lock;
 
 	Vector result_vec;
+	vector<vector<Span>> spans;
 };
 
 //	Column indexes into the result struct
-enum MatchRecognizeResult : idx_t { CLASSIFIER = 0, MATCH_NUMBER, IN_MATCH, IS_MATCH_START, MATCH_START, MATCH_END };
 
 LogicalType WindowMatchRecognizeExecutor::ResultType() {
-	return LogicalType::STRUCT({{"classifier", LogicalType::VARCHAR},
-	                            {"match_number", LogicalType::UBIGINT},
-	                            {"in_match", LogicalType::BOOLEAN},
-	                            {"is_match_start", LogicalType::BOOLEAN},
-	                            {"match_start", LogicalType::UBIGINT},
-	                            {"match_end", LogicalType::UBIGINT}});
+	// One entry per match a row takes part in: overlapping matches each keep their own, and the plan
+	// unnests the list. Rows that matched nothing get an empty list, which unnest drops.
+	return LogicalType::LIST(LogicalType::STRUCT({{"classifier", LogicalType::VARCHAR},
+	                                              {"match_number", LogicalType::UBIGINT},
+	                                              {"is_match_start", LogicalType::BOOLEAN},
+	                                              {"match_start", LogicalType::UBIGINT},
+	                                              {"match_end", LogicalType::UBIGINT}}));
 }
 
 //===--------------------------------------------------------------------===//
@@ -608,7 +645,6 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 
 		// scan the partition left to right, applying AFTER MATCH SKIP after every match. Rows that are
 		// not part of any match keep a NULL struct, which filters them out downstream.
-		auto &struct_entries = StructVector::GetEntries(gstate.result_vec);
 		idx_t match_number = 0;
 		current_match_number = 1;
 		current_match_number = 1;
@@ -627,13 +663,8 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 			match_number++;
 
 			for (idx_t match_row = row; match_row <= match_end; match_row++) {
-				FlatVector::ValidityMutable(gstate.result_vec).SetValid(match_row);
-				struct_entries[CLASSIFIER].SetValue(match_row, Value(MatchRecognizeSymbolName(classifiers[match_row])));
-				struct_entries[MATCH_NUMBER].SetValue(match_row, Value::UBIGINT(match_number));
-				struct_entries[IN_MATCH].SetValue(match_row, Value::BOOLEAN(true));
-				struct_entries[IS_MATCH_START].SetValue(match_row, Value::BOOLEAN(match_row == row));
-				struct_entries[MATCH_START].SetValue(match_row, Value::UBIGINT(row));
-				struct_entries[MATCH_END].SetValue(match_row, Value::UBIGINT(match_end));
+				gstate.spans[match_row].push_back(WindowMatchRecognizeGlobalState::Span {
+				    MatchRecognizeSymbolName(classifiers[match_row]), match_number, match_row == row, row, match_end});
 			}
 			row = SkipTo(config, row, match_end, classifiers);
 			current_match_number = match_number + 1;
@@ -644,6 +675,8 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		}
 		partition_start = payload_idx;
 	}
+
+	gstate.MaterializeSpans();
 }
 
 // this should actually be it yay!
