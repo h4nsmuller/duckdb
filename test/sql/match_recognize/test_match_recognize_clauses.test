@@ -230,3 +230,49 @@ SELECT count(*) FROM q MATCH_RECOGNIZE(
     ORDER BY i MEASURES i AS x PATTERN (A)
     DEFINE A as PREV(i) IS NOT NULL AND NEXT(i) IS NOT NULL AND FIRST(i) IS NOT NULL AND LAST(i) IS NOT NULL
 )
+
+# Pattern variables are SQL identifiers, so PATTERN, DEFINE, MEASURES, the navigation inside a
+# condition and the AFTER MATCH SKIP target all resolve to the same variable whatever case they are
+# written in.
+
+statement ok
+create table wave(day integer, level integer);
+
+statement ok
+insert into wave values (1,40),(2,55),(3,61),(4,67),(5,79),(6,40),(7,49),(8,64),(9,76),(10,79),
+                        (11,61),(12,49),(13,79),(14,79),(15,46),(16,40),(17,46),(18,76),(19,73),(20,70);
+
+query I
+SELECT start_day FROM wave MATCH_RECOGNIZE(
+    ORDER BY day MEASURES ONSET.day AS start_day
+    ONE ROW PER MATCH AFTER MATCH SKIP TO LAST CLIMB
+    PATTERN (ONSET DIP+ CLIMB+)
+    DEFINE DIP AS DIP.level < PREV(DIP.level), CLIMB AS CLIMB.level > PREV(CLIMB.level)
+) ORDER BY start_day
+----
+5
+10
+14
+
+# the same query with every mention of a variable written in a different case
+query I
+SELECT start_day FROM wave MATCH_RECOGNIZE(
+    ORDER BY day MEASURES onset.day AS start_day
+    ONE ROW PER MATCH AFTER MATCH SKIP TO LAST Climb
+    PATTERN (ONSET DIP+ CLIMB+)
+    DEFINE dip AS DIP.level < PREV(Dip.level), Climb AS climb.level > PREV(CLIMB.level)
+) ORDER BY start_day
+----
+5
+10
+14
+
+# a pattern variable whose only mention in DEFINE differs in case still gets its condition, rather
+# than defaulting to a variable that matches every row
+query I
+SELECT count(*) FROM wave MATCH_RECOGNIZE(
+    ORDER BY day MEASURES day AS x ALL ROWS PER MATCH
+    PATTERN (RISE+) DEFINE rise AS rise.level > PREV(rise.level)
+)
+----
+11

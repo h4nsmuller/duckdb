@@ -3,6 +3,7 @@
 #include "duckdb/function/match_recognize.hpp"
 #include "duckdb/function/window/match_recognize_functions.hpp"
 #include "duckdb/function/window/window_shared_expressions.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -129,12 +130,15 @@ static void RebindToArguments(unique_ptr<Expression> &expr, const expression_map
 }
 
 //! Replace each pattern leaf's symbol name with its index
-static void ResolvePatternSymbols(unique_ptr<Expression> &pattern, const unordered_map<string, idx_t> &symbol_index) {
+static void ResolvePatternSymbols(unique_ptr<Expression> &pattern, const case_insensitive_map_t<idx_t> &symbol_index) {
 	if (pattern->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
 		auto &constant = pattern->Cast<BoundConstantExpression>();
 		if (constant.GetValue().type().id() == LogicalTypeId::VARCHAR) {
-			auto entry = symbol_index.find(constant.GetValue().GetValue<string>());
-			D_ASSERT(entry != symbol_index.end());
+			auto symbol = constant.GetValue().GetValue<string>();
+			auto entry = symbol_index.find(symbol);
+			if (entry == symbol_index.end()) {
+				throw InternalException("MATCH_RECOGNIZE pattern symbol %s has no condition", symbol);
+			}
 			pattern = make_uniq<BoundConstantExpression>(Value::UBIGINT(entry->second));
 		}
 		return;
@@ -225,7 +229,7 @@ unique_ptr<FunctionData> WindowMatchRecognizeExecutor::Bind(BindWindowFunctionIn
 
 	// the matcher compares symbols on every candidate row, so the leaves carry an index into
 	// symbols rather than the name itself
-	unordered_map<string, idx_t> symbol_index;
+	case_insensitive_map_t<idx_t> symbol_index;
 	for (idx_t i = 0; i < bind_data->symbols.size(); i++) {
 		symbol_index[bind_data->symbols[i]] = i;
 	}
@@ -668,7 +672,7 @@ public:
 		for (auto &condition : config.conditions) {
 			conditions.push_back(condition->Copy());
 		}
-		unordered_map<string, idx_t> symbol_index;
+		case_insensitive_map_t<idx_t> symbol_index;
 		for (idx_t i = 0; i < config.symbols.size(); i++) {
 			symbol_index[config.symbols[i]] = i;
 		}
