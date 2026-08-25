@@ -20,13 +20,6 @@
 
 namespace duckdb {
 
-// TODO make abstract superclass
-// class BoundPatternExpression : public Expression {
-//
-// 	vector<unique_ptr<Expression>> children;
-//
-// };
-
 BindResult ExpressionBinder::BindPatternExpression(unique_ptr<ParsedExpression> &expr, idx_t depth) {
 	switch (expr->GetExpressionType()) {
 	case ExpressionType::ALTERNATION: {
@@ -419,7 +412,6 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 
 	for (auto &expr : ref.config->defines_expression_list) {
 		auto define_name = expr->GetAlias().GetIdentifierName();
-		// TODO can this happen?
 		D_ASSERT(!define_name.empty());
 		D_ASSERT(pattern_symbols.find(define_name) == pattern_symbols.end());
 
