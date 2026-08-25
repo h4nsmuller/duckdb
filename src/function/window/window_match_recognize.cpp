@@ -28,12 +28,13 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 		for (auto &values : condition_values) {
 			values.assign(payload_count, 0);
 		}
+		classifiers.resize(payload_count);
 		D_ASSERT(result_vec.GetType().id() == LogicalTypeId::LIST);
 	}
 
 	//! One row of the result list
 	struct Span {
-		string classifier;
+		idx_t symbol;
 		idx_t match_number;
 		bool is_match_start;
 		idx_t match_start;
@@ -41,7 +42,7 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 	};
 
 	//! Build the list vector the operator reads from the spans collected during matching
-	void MaterializeSpans() {
+	void MaterializeSpans(const vector<string> &symbols) {
 		idx_t total = 0;
 		for (auto &row : spans) {
 			total += row.size();
@@ -57,7 +58,7 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 			list_data[row].offset = offset;
 			list_data[row].length = spans[row].size();
 			for (auto &span : spans[row]) {
-				fields[CLASSIFIER].SetValue(offset, Value(span.classifier));
+				fields[CLASSIFIER].SetValue(offset, Value(MatchRecognizeSymbolName(symbols[span.symbol])));
 				fields[MATCH_NUMBER].SetValue(offset, Value::UBIGINT(span.match_number));
 				fields[IS_MATCH_START].SetValue(offset, Value::BOOLEAN(span.is_match_start));
 				fields[MATCH_START].SetValue(offset, Value::UBIGINT(span.match_start));
@@ -69,9 +70,16 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 
 	// TODO can we get away with putting this into the local state?
 	mutex state_lock;
-	//! Finalize runs on every thread, but the matching is over the whole hash group and only has to
-	//! happen once
-	bool finalized = false;
+	//! Set up once; the threads then take partitions from the cursor below
+	bool prepared = false;
+	//! Partitions are independent, so the threads that reach Finalize share them out
+	vector<pair<idx_t, idx_t>> partitions;
+	atomic<idx_t> next_partition {0};
+	atomic<idx_t> completed_partitions {0};
+	//! The variable that classified each row, written only by the thread that owns the partition
+	vector<idx_t> classifiers;
+	//! Materialised only when a condition has to be settled per row, and then shared by the threads
+	DataChunk rows;
 	//! One boolean per symbol per row. Sink fills these as rows arrive, over disjoint ranges, so the
 	//! threads do not need to coordinate.
 	vector<vector<uint8_t>> condition_values;
@@ -112,6 +120,37 @@ static void RebindToArguments(unique_ptr<Expression> &expr, const expression_map
 	ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
 		RebindToArguments(child, argument_index, match_number_index, reads_match_number);
 	});
+}
+
+//! Replace each pattern leaf's symbol name with its index
+static void ResolvePatternSymbols(unique_ptr<Expression> &pattern, const unordered_map<string, idx_t> &symbol_index) {
+	if (pattern->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
+		auto &constant = pattern->Cast<BoundConstantExpression>();
+		if (constant.GetValue().type().id() == LogicalTypeId::VARCHAR) {
+			auto entry = symbol_index.find(constant.GetValue().GetValue<string>());
+			D_ASSERT(entry != symbol_index.end());
+			pattern = make_uniq<BoundConstantExpression>(Value::UBIGINT(entry->second));
+		}
+		return;
+	}
+	switch (pattern->GetExpressionType()) {
+	case ExpressionType::ALTERNATION: {
+		auto &alternation = pattern->Cast<BoundAlternationExpression>();
+		ResolvePatternSymbols(alternation.child_left, symbol_index);
+		ResolvePatternSymbols(alternation.child_right, symbol_index);
+		break;
+	}
+	case ExpressionType::CONCATENATION:
+		for (auto &child : pattern->Cast<BoundConcatenationExpression>().children) {
+			ResolvePatternSymbols(child, symbol_index);
+		}
+		break;
+	case ExpressionType::QUANTIFIER:
+		ResolvePatternSymbols(pattern->Cast<BoundQuantifierExpression>().child, symbol_index);
+		break;
+	default:
+		break;
+	}
 }
 
 unique_ptr<FunctionData> WindowMatchRecognizeExecutor::Bind(BindWindowFunctionInput &input) {
@@ -177,6 +216,14 @@ unique_ptr<FunctionData> WindowMatchRecognizeExecutor::Bind(BindWindowFunctionIn
 	if (bind_data->conditions.size() != bind_data->symbols.size()) {
 		throw BinderException("MATCH_RECOGNIZE has a condition for every pattern symbol");
 	}
+
+	// the matcher compares symbols on every candidate row, so the leaves carry an index into
+	// symbols rather than the name itself
+	unordered_map<string, idx_t> symbol_index;
+	for (idx_t i = 0; i < bind_data->symbols.size(); i++) {
+		symbol_index[bind_data->symbols[i]] = i;
+	}
+	ResolvePatternSymbols(bind_data->pattern, symbol_index);
 
 	auto &bound_function = input.GetBoundFunction();
 	bound_function.GetArguments().resize(1);
@@ -409,6 +456,8 @@ static void FetchHashGroup(ColumnDataCollection &input, DataChunk &result_chunk)
 }
 
 struct Match {
+	Match() : success(false), optional(false) {
+	}
 	Match(bool success_p, optional_idx end_idx_p = optional_idx::Invalid(), bool optional_p = false)
 	    : success(success_p), end_idx(end_idx_p), optional(optional_p) {
 	}
@@ -423,27 +472,27 @@ struct Match {
 // Successful symbol matches record the matching variable at their row offset. Failed branches may leave
 // stale entries behind, but every offset a successful match covers is written by that match, so reading
 // the range of a successful match is well defined.
-using SymbolMatcher = std::function<bool(const string &symbol, idx_t row)>;
+using SymbolMatcher = std::function<bool(idx_t symbol, idx_t row)>;
 
-static vector<Match> MatchPattern(const Expression &pattern, idx_t input_size, const idx_t offset,
-                                  const SymbolMatcher &symbol_matches, vector<string> &classifiers) {
+// The matches a successful call produces are appended to `matches`, which the caller reuses across
+// rows rather than every node handing back a fresh vector. A failed call leaves it as it found it.
+static bool MatchPattern(const Expression &pattern, idx_t input_size, const idx_t offset,
+                         const SymbolMatcher &symbol_matches, vector<idx_t> &classifiers, vector<Match> &matches) {
 	if (offset >= input_size) {
-		return {Match(false)};
+		return false;
 	}
+	const auto mark = matches.size();
 	switch (pattern.GetExpressionType()) {
 	case ExpressionType::CONCATENATION: {
 		auto &concatenation_expr = pattern.Cast<BoundConcatenationExpression>();
 
 		auto child_start_idx = offset;
 		idx_t token_idx = 0;
-		vector<Match> matches;
 
 		while (token_idx < concatenation_expr.children.size()) {
 			auto &child_pattern = *concatenation_expr.children[token_idx];
-			auto res = MatchPattern(child_pattern, input_size, child_start_idx, symbol_matches, classifiers);
-			if (res.back().success) {
-				matches.insert(matches.end(), res.begin(), res.end());
-				child_start_idx = res.back().end_idx.GetIndex();
+			if (MatchPattern(child_pattern, input_size, child_start_idx, symbol_matches, classifiers, matches)) {
+				child_start_idx = matches.back().end_idx.GetIndex();
 				token_idx++;
 			} else {
 				auto token_is_optional = false;
@@ -457,7 +506,7 @@ static vector<Match> MatchPattern(const Expression &pattern, idx_t input_size, c
 					token_idx++;
 					continue;
 				}
-				if (!matches.empty() && matches.back().optional) {
+				if (matches.size() > mark && matches.back().optional) {
 					child_start_idx = matches.back().end_idx.GetIndex();
 					matches.pop_back();
 					continue;
@@ -465,16 +514,22 @@ static vector<Match> MatchPattern(const Expression &pattern, idx_t input_size, c
 				break;
 			}
 		}
-		return {Match(token_idx == concatenation_expr.children.size(), child_start_idx)};
+		// the concatenation reports one match spanning its children
+		matches.resize(mark);
+		if (token_idx != concatenation_expr.children.size()) {
+			return false;
+		}
+		matches.emplace_back(Match(true, child_start_idx));
+		return true;
 	}
 	case ExpressionType::ALTERNATION: {
 		// ordered choice: the left alternative wins if it matches
 		auto &alternation_expr = pattern.Cast<BoundAlternationExpression>();
-		auto left = MatchPattern(*alternation_expr.child_left, input_size, offset, symbol_matches, classifiers);
-		if (left.back().success) {
-			return left;
+		if (MatchPattern(*alternation_expr.child_left, input_size, offset, symbol_matches, classifiers, matches)) {
+			return true;
 		}
-		return MatchPattern(*alternation_expr.child_right, input_size, offset, symbol_matches, classifiers);
+		matches.resize(mark);
+		return MatchPattern(*alternation_expr.child_right, input_size, offset, symbol_matches, classifiers, matches);
 	}
 	case ExpressionType::QUANTIFIER: {
 		auto &quantifier_expr = pattern.Cast<BoundQuantifierExpression>();
@@ -483,37 +538,41 @@ static vector<Match> MatchPattern(const Expression &pattern, idx_t input_size, c
 		auto max_offset = quantifier_expr.max_count.IsValid()
 		                      ? MinValue(input_size, quantifier_expr.max_count.GetIndex())
 		                      : input_size;
-		vector<Match> matches;
 		while (match_count < max_offset) {
-			auto res = MatchPattern(*quantifier_expr.child, input_size, child_start_idx, symbol_matches, classifiers);
-			if (!res.back().success) {
+			const auto repetition = matches.size();
+			if (!MatchPattern(*quantifier_expr.child, input_size, child_start_idx, symbol_matches, classifiers,
+			                  matches)) {
+				matches.resize(repetition);
 				break;
 			}
-			child_start_idx = res.back().end_idx.GetIndex();
+			child_start_idx = matches.back().end_idx.GetIndex();
 			match_count++;
 			// a repetition may only be given up if doing so still satisfies the minimum
 			auto is_optional =
 			    quantifier_expr.min_count.IsValid() ? match_count > quantifier_expr.min_count.GetIndex() : true;
+			// one entry per repetition, in place of whatever the child reported
+			matches.resize(repetition);
 			matches.emplace_back(Match(true, child_start_idx, is_optional));
 		}
-		if (!matches.empty() &&
+		if (matches.size() > mark &&
 		    (!quantifier_expr.min_count.IsValid() || match_count >= quantifier_expr.min_count.GetIndex())) {
-			return matches;
+			return true;
 		}
-		return {Match(false)};
+		matches.resize(mark);
+		return false;
 	}
 	case ExpressionType::VALUE_CONSTANT: {
-		// TODO cache those pointers in the map instead of the vector
-		auto symbol = pattern.Cast<BoundConstantExpression>().GetValue().GetValue<string>();
+		const auto symbol = NumericCast<idx_t>(pattern.Cast<BoundConstantExpression>().GetValue().GetValue<uint64_t>());
 		// the row is tentatively this symbol while its condition is evaluated, which is what lets
 		// LAST(X.c) see the row being tested
 		auto previous = classifiers[offset];
 		classifiers[offset] = symbol;
 		if (!symbol_matches(symbol, offset)) {
 			classifiers[offset] = previous;
-			return {Match(false)};
+			return false;
 		}
-		return {Match(true, offset + 1)};
+		matches.emplace_back(Match(true, offset + 1));
+		return true;
 	}
 	default:
 		throw InternalException("Unsupported pattern type");
@@ -521,8 +580,8 @@ static vector<Match> MatchPattern(const Expression &pattern, idx_t input_size, c
 }
 
 //! Where to resume scanning after a match spanning [match_start, match_end]
-static idx_t SkipTo(const MatchRecognizeFunctionData &config, idx_t match_start, idx_t match_end,
-                    const vector<string> &classifiers) {
+static idx_t SkipTo(const MatchRecognizeFunctionData &config, idx_t skip_symbol, idx_t match_start, idx_t match_end,
+                    const vector<idx_t> &classifiers) {
 	auto resume = match_end + 1;
 	switch (config.after_match) {
 	case MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_NEXT_ROW:
@@ -533,7 +592,7 @@ static idx_t SkipTo(const MatchRecognizeFunctionData &config, idx_t match_start,
 		const auto first = config.after_match == MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_FIRST_VAR;
 		optional_idx target;
 		for (idx_t row = match_start; row <= match_end; row++) {
-			if (classifiers[row] != config.after_match_variable) {
+			if (classifiers[row] != skip_symbol) {
 				continue;
 			}
 			target = row;
@@ -558,33 +617,39 @@ static idx_t SkipTo(const MatchRecognizeFunctionData &config, idx_t match_start,
 void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_ptr<WindowCollection> collection,
                                             OperatorSinkInput &sink) {
 	auto &gstate = sink.global_state.Cast<WindowMatchRecognizeGlobalState>();
-	lock_guard<mutex> lock(gstate.state_lock);
-	if (gstate.finalized) {
-		return;
-	}
-	gstate.finalized = true;
-
 	auto &config = gstate.executor.wexpr.BindInfo()->Cast<MatchRecognizeFunctionData>();
 
-	idx_t partition_start = 0;
 	// we always start with a new partition
 	D_ASSERT(gstate.partition_mask.RowIsValid(0));
 
-	// TODO this should probably be kept elsewhere
-	// The operator has already materialised the hash group. Only logical navigation needs random
-	// access to arbitrary rows of it, so a second copy is made only when a condition navigates.
-	auto navigates = !config.navigations.empty();
-	for (auto scoped : config.row_scoped) {
-		navigates = navigates || scoped;
-	}
-	DataChunk partition_chunk;
-	if (navigates) {
-		partition_chunk.Initialize(context.client, collection->inputs->Types(), gstate.payload_count);
-		FetchHashGroup(*collection->inputs, partition_chunk);
+	// One time setup: work out where the partitions are, and materialise the rows if a condition has
+	// to be settled per row. Both are shared by every thread that gets here.
+	{
+		lock_guard<mutex> lock(gstate.state_lock);
+		if (!gstate.prepared) {
+			gstate.prepared = true;
+			idx_t partition_start = 0;
+			for (idx_t payload_idx = 1; payload_idx <= gstate.payload_count; payload_idx++) {
+				const auto at_end = payload_idx == gstate.payload_count;
+				if (!at_end && !gstate.partition_mask.RowIsValid(payload_idx)) {
+					continue;
+				}
+				gstate.partitions.emplace_back(partition_start, payload_idx - 1);
+				partition_start = payload_idx;
+			}
+			auto per_row = !config.navigations.empty();
+			for (auto scoped : config.row_scoped) {
+				per_row = per_row || scoped;
+			}
+			if (per_row) {
+				gstate.rows.Initialize(context.client, collection->inputs->Types(), gstate.payload_count);
+				FetchHashGroup(*collection->inputs, gstate.rows);
+			}
+		}
 	}
 
-	// the pattern variable that classified each row, indexed by row offset within the hash group
-	vector<string> classifiers(gstate.payload_count);
+	auto &partition_chunk = gstate.rows;
+	auto &classifiers = gstate.classifiers;
 
 	// The conditions reference the window arguments; expression sharing decided where those landed in
 	// the collection, so rebind them against it before evaluating.
@@ -602,8 +667,19 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 
 	auto &condition_values = gstate.condition_values;
 	unordered_map<string, idx_t> symbol_index;
-	for (idx_t i = 0; i < conditions.size(); i++) {
+	for (idx_t i = 0; i < config.symbols.size(); i++) {
 		symbol_index[config.symbols[i]] = i;
+	}
+	// the skip target and the navigations name symbols too, resolved here so the matcher compares
+	// indices rather than strings
+	auto lookup_symbol = [&](const string &name) -> idx_t {
+		auto entry = symbol_index.find(name);
+		return entry == symbol_index.end() ? DConstants::INVALID_INDEX : entry->second;
+	};
+	const auto skip_symbol = lookup_symbol(config.after_match_variable);
+	vector<idx_t> navigation_symbols;
+	for (auto &navigation : config.navigations) {
+		navigation_symbols.push_back(lookup_symbol(navigation.symbol));
 	}
 
 	// state of the attempt in progress, needed to resolve FIRST()/LAST()
@@ -617,7 +693,7 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 
 	//	The row FIRST()/LAST() navigates to, or an invalid index when the match has no such row
 	auto navigate = [&](const MatchRecognizeFunctionData::Navigation &navigation, idx_t row,
-	                    const vector<string> &assignment) -> optional_idx {
+	                    const vector<idx_t> &assignment) -> optional_idx {
 		if (navigation.symbol.empty()) {
 			// the match as a whole, counted from whichever end
 			if (navigation.last) {
@@ -630,13 +706,15 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		idx_t seen = 0;
 		if (navigation.last) {
 			for (idx_t candidate = row + 1; candidate > current_match_start; candidate--) {
-				if (assignment[candidate - 1] == navigation.symbol && seen++ == navigation.offset) {
+				if (assignment[candidate - 1] == navigation_symbols[&navigation - config.navigations.data()] &&
+				    seen++ == navigation.offset) {
 					return candidate - 1;
 				}
 			}
 		} else {
 			for (idx_t candidate = current_match_start; candidate <= row; candidate++) {
-				if (assignment[candidate] == navigation.symbol && seen++ == navigation.offset) {
+				if (assignment[candidate] == navigation_symbols[&navigation - config.navigations.data()] &&
+				    seen++ == navigation.offset) {
 					return candidate;
 				}
 			}
@@ -644,10 +722,8 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		return optional_idx();
 	};
 
-	SymbolMatcher symbol_matches = [&](const string &symbol, idx_t row) -> bool {
-		auto entry = symbol_index.find(symbol);
-		D_ASSERT(entry != symbol_index.end());
-		const auto index = entry->second;
+	SymbolMatcher symbol_matches = [&](idx_t index, idx_t row) -> bool {
+		D_ASSERT(index < config.symbols.size());
 		if (index >= config.row_scoped.size() || !config.row_scoped[index]) {
 			return condition_values[index][row] != 0;
 		}
@@ -692,14 +768,18 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		       UnifiedVectorFormat::GetData<bool>(result_data)[result_idx];
 	};
 
-	// iterate over entire input, but there can be many partitions in the input
-	for (idx_t payload_idx = 1; payload_idx <= gstate.payload_count; payload_idx++) {
-		// a partition is closed either by the start of the next one or by the end of the input
-		const auto at_end = payload_idx == gstate.payload_count;
-		if (!at_end && !gstate.partition_mask.RowIsValid(payload_idx)) {
-			continue;
+	// reused by every match attempt rather than allocated per pattern node
+	vector<Match> matches;
+
+	// Partitions are independent, so every thread that reaches Finalize takes them from a shared
+	// cursor rather than one thread doing the whole hash group.
+	while (true) {
+		const auto partition_idx = gstate.next_partition++;
+		if (partition_idx >= gstate.partitions.size()) {
+			break;
 		}
-		const idx_t partition_end = payload_idx - 1;
+		const auto partition_start = gstate.partitions[partition_idx].first;
+		const auto partition_end = gstate.partitions[partition_idx].second;
 
 		// scan the partition left to right, applying AFTER MATCH SKIP after every match. Rows that are
 		// not part of any match keep a NULL struct, which filters them out downstream.
@@ -708,27 +788,32 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		auto row = partition_start;
 		while (row <= partition_end) {
 			current_match_start = row;
-			auto match = MatchPattern(*config.pattern, partition_end + 1, row, symbol_matches, classifiers).back();
+			matches.clear();
+			const auto matched =
+			    MatchPattern(*config.pattern, partition_end + 1, row, symbol_matches, classifiers, matches);
 			// a zero length match would never advance the scan
-			if (!match.success || !match.end_idx.IsValid() || match.end_idx.GetIndex() <= row) {
+			if (!matched || matches.empty() || !matches.back().end_idx.IsValid() ||
+			    matches.back().end_idx.GetIndex() <= row) {
 				row++;
 				continue;
 			}
 			// a match can never reach beyond its own partition
-			const auto match_end = MinValue(match.end_idx.GetIndex() - 1, partition_end);
+			const auto match_end = MinValue(matches.back().end_idx.GetIndex() - 1, partition_end);
 			match_number++;
 
 			for (idx_t match_row = row; match_row <= match_end; match_row++) {
 				gstate.spans[match_row].push_back(WindowMatchRecognizeGlobalState::Span {
-				    MatchRecognizeSymbolName(classifiers[match_row]), match_number, match_row == row, row, match_end});
+				    classifiers[match_row], match_number, match_row == row, row, match_end});
 			}
-			row = SkipTo(config, row, match_end, classifiers);
+			row = SkipTo(config, skip_symbol, row, match_end, classifiers);
 			current_match_number = match_number + 1;
 		}
-		partition_start = payload_idx;
-	}
 
-	gstate.MaterializeSpans();
+		// the thread that finishes the last partition publishes the result
+		if (++gstate.completed_partitions == gstate.partitions.size()) {
+			gstate.MaterializeSpans(config.symbols);
+		}
+	}
 }
 
 // this should actually be it yay!
