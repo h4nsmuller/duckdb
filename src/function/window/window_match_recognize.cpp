@@ -64,6 +64,9 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 
 	// TODO can we get away with putting this into the local state?
 	mutex state_lock;
+	//! Finalize runs on every thread, but the matching is over the whole hash group and only has to
+	//! happen once
+	bool finalized = false;
 
 	Vector result_vec;
 	vector<vector<Span>> spans;
@@ -288,8 +291,7 @@ unique_ptr<FunctionData> WindowMatchRecognizeExecutor::Deserialize(Deserializer 
 // WindowMatchRecognizeExecutor
 //===--------------------------------------------------------------------===//
 void WindowMatchRecognizeExecutor::GetBounds(WindowBoundsSet &required, const BoundWindowExpression &wexpr) {
-	required.insert(FRAME_BEGIN);
-	required.insert(FRAME_END);
+	// matching spans a whole partition rather than a frame, so no frame boundaries are needed
 }
 
 void WindowMatchRecognizeExecutor::GetSharing(WindowExecutor &executor, WindowSharedExpressions &shared) {
@@ -476,6 +478,10 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
                                             OperatorSinkInput &sink) {
 	auto &gstate = sink.global_state.Cast<WindowMatchRecognizeGlobalState>();
 	lock_guard<mutex> lock(gstate.state_lock);
+	if (gstate.finalized) {
+		return;
+	}
+	gstate.finalized = true;
 
 	auto &config = gstate.executor.wexpr.BindInfo()->Cast<MatchRecognizeFunctionData>();
 
