@@ -2,7 +2,10 @@ TableMatchRecognizeClause <- 'MATCH_RECOGNIZE' Parens(MatchRecognizeBody) TableA
 MatchRecognizeBody <- WindowPartition? OrderByClause? MeasuresClause RowsPerMatch? AfterMatchSkip? PatternClause DefineClause
 
 MeasuresClause <- 'MEASURES' List(MeasuresElement)
-MeasuresElement <- Expression 'AS' ColLabelOrString
+MeasuresElement <- MeasureSemantics? Expression 'AS' ColLabelOrString
+MeasureSemantics <- RunningSemantics / FinalSemantics
+RunningSemantics <- 'RUNNING'
+FinalSemantics <- 'FINAL'
 
 RowsPerMatch <- OneRowPerMatch / AllRowsPerMatch
 OneRowPerMatch <- 'ONE' 'ROW' 'PER' 'MATCH'

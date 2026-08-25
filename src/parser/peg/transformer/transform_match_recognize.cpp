@@ -1,4 +1,6 @@
+#include "duckdb/function/match_recognize.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/pattern_expression.hpp"
 #include "duckdb/parser/peg/transformer/peg_transformer.hpp"
@@ -51,9 +53,25 @@ unique_ptr<TableRef> PEGTransformerFactory::TransformTableMatchRecognizeClause(
 	return match_recognize_body;
 }
 
+bool PEGTransformerFactory::TransformRunningSemantics(PEGTransformer &transformer) {
+	return false;
+}
+
+bool PEGTransformerFactory::TransformFinalSemantics(PEGTransformer &transformer) {
+	return true;
+}
+
 unique_ptr<ParsedExpression> PEGTransformerFactory::TransformMeasuresElement(PEGTransformer &transformer,
+                                                                             optional<bool> measure_semantics,
                                                                              unique_ptr<ParsedExpression> expression,
                                                                              const Identifier &col_label_or_string) {
+	if (measure_semantics) {
+		// carry the choice to the binder, which knows the frame it turns into
+		vector<unique_ptr<ParsedExpression>> wrapped;
+		wrapped.push_back(std::move(expression));
+		expression = make_uniq<FunctionExpression>(
+		    *measure_semantics ? MATCH_RECOGNIZE_FINAL_MARKER : MATCH_RECOGNIZE_RUNNING_MARKER, std::move(wrapped));
+	}
 	expression->SetAlias(col_label_or_string);
 	return expression;
 }

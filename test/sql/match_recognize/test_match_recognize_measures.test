@@ -369,3 +369,50 @@ SELECT 1 FROM nav MATCH_RECOGNIZE(
 )
 ----
 <REGEX>:Binder Error.*offset of LAST\(\) must be a constant.*
+
+# RUNNING and FINAL
+# A measure is RUNNING under ALL ROWS PER MATCH and FINAL under ONE ROW PER MATCH by default. The
+# keywords make that explicit, and can pick the other one.
+
+query IIII
+SELECT i, dflt, run, fin FROM ev MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS dflt, RUNNING count(*) AS run, FINAL count(*) AS fin
+    ALL ROWS PER MATCH PATTERN (A B+) DEFINE A as v=1, B as v=0
+) ORDER BY i
+----
+1	1	1	3
+2	2	2	3
+3	3	3	3
+4	1	1	2
+5	2	2	2
+
+# FINAL navigation reads the whole match, RUNNING only what precedes the current row
+query III
+SELECT i, fin_b, run_b FROM ev MATCH_RECOGNIZE(
+    ORDER BY i MEASURES FINAL LAST(B.i) AS fin_b, RUNNING LAST(B.i) AS run_b
+    ALL ROWS PER MATCH PATTERN (A B+) DEFINE A as v=1, B as v=0
+) ORDER BY i
+----
+1	3	NULL
+2	3	2
+3	3	3
+4	5	NULL
+5	5	5
+
+# ONE ROW PER MATCH reports a finished match, so its current row is the last one and the two
+# keywords mean the same thing
+query II
+SELECT run, fin FROM ev MATCH_RECOGNIZE(
+    ORDER BY i MEASURES RUNNING count(*) AS run, FINAL count(*) AS fin
+    ONE ROW PER MATCH PATTERN (A B+) DEFINE A as v=1, B as v=0
+) ORDER BY fin
+----
+2	2
+3	3
+
+# neither keyword is reserved
+statement ok
+CREATE TABLE running(final INTEGER)
+
+statement ok
+SELECT final FROM running

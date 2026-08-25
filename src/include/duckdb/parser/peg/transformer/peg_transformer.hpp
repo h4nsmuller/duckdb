@@ -3666,6 +3666,18 @@ public:
 	                                                TransformStackFrame &frame);
 	static unique_ptr<TransformResultValue>
 	FinalizeMeasuresElementTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
+	static void InitializeMeasureSemanticsTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                                 TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue>
+	FinalizeMeasureSemanticsTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
+	static void InitializeRunningSemanticsTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                                 TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue>
+	FinalizeRunningSemanticsTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
+	static void InitializeFinalSemanticsTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                               TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue>
+	FinalizeFinalSemanticsTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
 	static void InitializeRowsPerMatchTrampoline(PEGTransformer &transformer, TransformStack &stack,
 	                                             TransformStackFrame &frame);
 	static unique_ptr<TransformResultValue>
@@ -7689,8 +7701,17 @@ public:
 	static unique_ptr<TransformResultValue> TransformMeasuresElementInternal(PEGTransformer &transformer,
 	                                                                         ParseResult &parse_result);
 	static unique_ptr<ParsedExpression> TransformMeasuresElement(PEGTransformer &transformer,
+	                                                             optional<bool> measure_semantics,
 	                                                             unique_ptr<ParsedExpression> expression,
 	                                                             const Identifier &col_label_or_string);
+	static unique_ptr<TransformResultValue> TransformMeasureSemanticsInternal(PEGTransformer &transformer,
+	                                                                          ParseResult &parse_result);
+	static unique_ptr<TransformResultValue> TransformRunningSemanticsInternal(PEGTransformer &transformer,
+	                                                                          ParseResult &parse_result);
+	static bool TransformRunningSemantics(PEGTransformer &transformer);
+	static unique_ptr<TransformResultValue> TransformFinalSemanticsInternal(PEGTransformer &transformer,
+	                                                                        ParseResult &parse_result);
+	static bool TransformFinalSemantics(PEGTransformer &transformer);
 	static unique_ptr<TransformResultValue> TransformRowsPerMatchInternal(PEGTransformer &transformer,
 	                                                                      ParseResult &parse_result);
 	static unique_ptr<TransformResultValue> TransformOneRowPerMatchInternal(PEGTransformer &transformer,

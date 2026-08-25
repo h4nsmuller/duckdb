@@ -187,6 +187,7 @@ void DuckDBKeywordHelper::InitializeKeywordMaps() { // Renamed for clarity
 	unreserved_keyword_map.insert("external");
 	unreserved_keyword_map.insert("family");
 	unreserved_keyword_map.insert("filter");
+	unreserved_keyword_map.insert("final");
 	unreserved_keyword_map.insert("first");
 	unreserved_keyword_map.insert("following");
 	unreserved_keyword_map.insert("force");
@@ -341,6 +342,7 @@ void DuckDBKeywordHelper::InitializeKeywordMaps() { // Renamed for clarity
 	unreserved_keyword_map.insert("rollup");
 	unreserved_keyword_map.insert("rows");
 	unreserved_keyword_map.insert("rule");
+	unreserved_keyword_map.insert("running");
 	unreserved_keyword_map.insert("sample");
 	unreserved_keyword_map.insert("savepoint");
 	unreserved_keyword_map.insert("schema");

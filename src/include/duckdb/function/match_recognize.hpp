@@ -22,6 +22,11 @@ constexpr const char *MATCH_RECOGNIZE_DEFINE_PREFIX = "__mr_define_";
 //! it attempts, which is what lets a DEFINE depend on the match being assembled.
 constexpr const char *MATCH_RECOGNIZE_MATCH_NUMBER_COLUMN = "__mr_match_number";
 
+//! RUNNING and FINAL are carried from the parser to the binder as these markers, which wrap the
+//! measure they applied to and are unwrapped once the frame has been decided.
+constexpr const char *MATCH_RECOGNIZE_RUNNING_MARKER = "__mr_running";
+constexpr const char *MATCH_RECOGNIZE_FINAL_MARKER = "__mr_final";
+
 //! The user facing pattern variable for a prefixed plan column
 inline string MatchRecognizeSymbolName(const string &column_name) {
 	const auto prefix_size = strlen(MATCH_RECOGNIZE_DEFINE_PREFIX);
