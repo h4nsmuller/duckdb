@@ -18,6 +18,10 @@ namespace duckdb {
 //! the plan to keep a DEFINE from resolving to a base table column of the same name.
 constexpr const char *MATCH_RECOGNIZE_DEFINE_PREFIX = "__mr_define_";
 
+//! The column MATCH_NUMBER() reads in a DEFINE condition. The matcher overwrites it for every match
+//! it attempts, which is what lets a DEFINE depend on the match being assembled.
+constexpr const char *MATCH_RECOGNIZE_MATCH_NUMBER_COLUMN = "__mr_match_number";
+
 //! The user facing pattern variable for a prefixed plan column
 inline string MatchRecognizeSymbolName(const string &column_name) {
 	const auto prefix_size = strlen(MATCH_RECOGNIZE_DEFINE_PREFIX);
@@ -32,7 +36,7 @@ public:
 	static constexpr const ExpressionClass TYPE = ExpressionClass::PATTERN;
 
 	BoundAlternationExpression(unique_ptr<Expression> child_left_p, unique_ptr<Expression> child_right_p)
-	    : Expression(ExpressionType::ALTERNATION, ExpressionClass::PATTERN, LogicalType::INVALID),
+	    : Expression(ExpressionType::ALTERNATION, ExpressionClass::PATTERN, LogicalType::BOOLEAN),
 	      child_left(std::move(child_left_p)), child_right(std::move(child_right_p)) {
 	}
 
@@ -55,7 +59,7 @@ public:
 	static constexpr const ExpressionClass TYPE = ExpressionClass::PATTERN;
 
 	BoundConcatenationExpression(vector<unique_ptr<Expression>> children_p)
-	    : Expression(ExpressionType::CONCATENATION, ExpressionClass::PATTERN, LogicalType::INVALID),
+	    : Expression(ExpressionType::CONCATENATION, ExpressionClass::PATTERN, LogicalType::BOOLEAN),
 	      children(std::move(children_p)) {
 	}
 
@@ -80,7 +84,7 @@ public:
 	static constexpr const ExpressionClass TYPE = ExpressionClass::PATTERN;
 
 	BoundQuantifierExpression(unique_ptr<Expression> child_p, optional_idx min_count_p, optional_idx max_count_p)
-	    : Expression(ExpressionType::QUANTIFIER, ExpressionClass::PATTERN, LogicalType::INVALID),
+	    : Expression(ExpressionType::QUANTIFIER, ExpressionClass::PATTERN, LogicalType::BOOLEAN),
 	      child(std::move(child_p)), min_count(min_count_p), max_count(max_count_p) {
 	}
 
@@ -107,6 +111,13 @@ public:
 // TODO this needs to live somewhere else!!
 struct MatchRecognizeFunctionData : FunctionData {
 	unique_ptr<Expression> pattern;
+	//! One condition per pattern symbol, evaluated by the matcher rather than precomputed. Column
+	//! references are BoundReferenceExpressions into the window's argument list.
+	vector<unique_ptr<Expression>> conditions;
+	//! The symbol each condition defines, in the same order
+	vector<string> symbols;
+	//! Whether any condition reads MATCH_NUMBER(), which is what forces re-evaluation per match
+	bool depends_on_match_number = false;
 	//! How to resume scanning after a match has been found
 	MatchRecognizeAfterMatch after_match = MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_DEFAULT;
 	//! The target pattern variable for the SKIP TO FIRST/LAST forms
@@ -116,13 +127,18 @@ struct MatchRecognizeFunctionData : FunctionData {
 		auto res = make_uniq<MatchRecognizeFunctionData>();
 
 		res->pattern = pattern->Copy();
+		for (auto &condition : conditions) {
+			res->conditions.push_back(condition->Copy());
+		}
+		res->symbols = symbols;
+		res->depends_on_match_number = depends_on_match_number;
 		res->after_match = after_match;
 		res->after_match_variable = after_match_variable;
 		return res;
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<MatchRecognizeFunctionData>();
-		return other.pattern->Equals(*pattern) && other.after_match == after_match &&
+		return other.pattern->Equals(*pattern) && other.symbols == symbols && other.after_match == after_match &&
 		       other.after_match_variable == after_match_variable;
 	}
 };
