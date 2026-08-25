@@ -15,6 +15,9 @@ namespace duckdb {
 
 struct WindowMatchRecognizeExecutor {
 	static unique_ptr<FunctionData> Bind(BindWindowFunctionInput &input);
+	static void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+	                      const BoundWindowFunction &function);
+	static unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundWindowFunction &function);
 	static void GetBounds(WindowBoundsSet &required, const BoundWindowExpression &wexpr);
 	static void GetSharing(WindowExecutor &executor, WindowSharedExpressions &shared);
 	static unique_ptr<GlobalSinkState> GetGlobal(ClientContext &client, const WindowExecutor &executor,

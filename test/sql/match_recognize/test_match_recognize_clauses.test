@@ -16,26 +16,26 @@ insert into q values (1),(2),(3),(4);
 
 # the default skips past the last row of the match, so 1-2 is dropped
 query I
-SELECT i FROM q MATCH_RECOGNIZE(
+SELECT x FROM q MATCH_RECOGNIZE(
     ORDER BY i MEASURES i AS x PATTERN (A A) DEFINE A as true
-) ORDER BY i
+) ORDER BY x
 ----
 1
 3
 
 query I
-SELECT i FROM q MATCH_RECOGNIZE(
+SELECT x FROM q MATCH_RECOGNIZE(
     ORDER BY i MEASURES i AS x AFTER MATCH SKIP PAST LAST ROW PATTERN (A A) DEFINE A as true
-) ORDER BY i
+) ORDER BY x
 ----
 1
 3
 
 # skipping to the next row keeps every match, including the overlapping ones
 query I
-SELECT i FROM q MATCH_RECOGNIZE(
+SELECT x FROM q MATCH_RECOGNIZE(
     ORDER BY i MEASURES i AS x AFTER MATCH SKIP TO NEXT ROW PATTERN (A A) DEFINE A as true
-) ORDER BY i
+) ORDER BY x
 ----
 1
 2
@@ -43,18 +43,18 @@ SELECT i FROM q MATCH_RECOGNIZE(
 
 # skipping to a pattern variable allows matches to abut
 query I
-SELECT i FROM q MATCH_RECOGNIZE(
+SELECT x FROM q MATCH_RECOGNIZE(
     ORDER BY i MEASURES i AS x AFTER MATCH SKIP TO FIRST A PATTERN (A A) DEFINE A as true
-) ORDER BY i
+) ORDER BY x
 ----
 1
 2
 3
 
 query I
-SELECT i FROM q MATCH_RECOGNIZE(
+SELECT x FROM q MATCH_RECOGNIZE(
     ORDER BY i MEASURES i AS x AFTER MATCH SKIP TO LAST A PATTERN (A A) DEFINE A as true
-) ORDER BY i
+) ORDER BY x
 ----
 1
 2
@@ -62,18 +62,18 @@ SELECT i FROM q MATCH_RECOGNIZE(
 
 # ROWS PER MATCH parses in both forms and combines with AFTER MATCH SKIP
 query I
-SELECT i FROM q MATCH_RECOGNIZE(
+SELECT x FROM q MATCH_RECOGNIZE(
     ORDER BY i MEASURES i AS x ONE ROW PER MATCH PATTERN (A A) DEFINE A as true
-) ORDER BY i
+) ORDER BY x
 ----
 1
 3
 
 # ALL ROWS PER MATCH reports every row of each match, not just the row it started on
 query I
-SELECT i FROM q MATCH_RECOGNIZE(
+SELECT x FROM q MATCH_RECOGNIZE(
     ORDER BY i MEASURES i AS x ALL ROWS PER MATCH PATTERN (A A) DEFINE A as true
-) ORDER BY i
+) ORDER BY x
 ----
 1
 2
@@ -81,9 +81,9 @@ SELECT i FROM q MATCH_RECOGNIZE(
 4
 
 query I
-SELECT i FROM q MATCH_RECOGNIZE(
+SELECT x FROM q MATCH_RECOGNIZE(
     ORDER BY i MEASURES i AS x ALL ROWS PER MATCH AFTER MATCH SKIP TO NEXT ROW PATTERN (A A) DEFINE A as true
-) ORDER BY i
+) ORDER BY x
 ----
 1
 2
@@ -92,27 +92,27 @@ SELECT i FROM q MATCH_RECOGNIZE(
 
 # ORDER BY is optional
 query I
-SELECT i FROM q MATCH_RECOGNIZE(
+SELECT x FROM q MATCH_RECOGNIZE(
     MEASURES i AS x PATTERN (A A) DEFINE A as true
-) ORDER BY i
+) ORDER BY x
 ----
 1
 3
 
 # ordering direction changes which rows start a match
 query I
-SELECT i FROM q MATCH_RECOGNIZE(
+SELECT x FROM q MATCH_RECOGNIZE(
     ORDER BY i DESC MEASURES i AS x PATTERN (A A) DEFINE A as true
-) ORDER BY i
+) ORDER BY x
 ----
 2
 4
 
 # PARTITION BY accepts arbitrary expressions
 query I
-SELECT i FROM q MATCH_RECOGNIZE(
+SELECT x FROM q MATCH_RECOGNIZE(
     PARTITION BY i%2 ORDER BY i MEASURES i AS x PATTERN (A A) DEFINE A as true
-) ORDER BY i
+) ORDER BY x
 ----
 1
 2
@@ -126,17 +126,19 @@ insert into pt values (1,1),(1,2),(1,3),(2,1),(2,2),(2,3);
 # matches never span a partition, and the reported offsets are partition relative
 query IIII
 SELECT p, i, __pattern_window.match_start, __pattern_window.match_end FROM pt MATCH_RECOGNIZE(
-    PARTITION BY p ORDER BY i MEASURES i AS x PATTERN (A A) DEFINE A as true
+    PARTITION BY p ORDER BY i MEASURES i AS x ALL ROWS PER MATCH PATTERN (A A) DEFINE A as true
 ) ORDER BY p, i
 ----
 1	1	0	1
+1	2	0	1
 2	1	0	1
+2	2	0	1
 
 # every row of every partition is considered, including the last one
 query II
-SELECT p, i FROM pt MATCH_RECOGNIZE(
+SELECT p, x FROM pt MATCH_RECOGNIZE(
     PARTITION BY p ORDER BY i MEASURES i AS x PATTERN (A) DEFINE A as true
-) ORDER BY p, i
+) ORDER BY p, x
 ----
 1	1
 1	2
@@ -153,9 +155,9 @@ insert into m values (1,1,1),(1,1,2),(1,2,1),(1,2,2);
 
 # partitioning on several columns
 query III
-SELECT a, b, i FROM m MATCH_RECOGNIZE(
+SELECT a, b, x FROM m MATCH_RECOGNIZE(
     PARTITION BY a, b ORDER BY i MEASURES i AS x PATTERN (A A) DEFINE A as true
-) ORDER BY a, b, i
+) ORDER BY a, b, x
 ----
 1	1	1
 1	2	1
@@ -168,9 +170,9 @@ insert into coll values (5,1),(5,2),(9,3),(5,4);
 
 # a DEFINE symbol may share its name with an input column, and its body may reference that column
 query I
-SELECT i FROM coll MATCH_RECOGNIZE(
+SELECT x FROM coll MATCH_RECOGNIZE(
     ORDER BY i MEASURES i AS x PATTERN (A A) DEFINE A as a=5
-) ORDER BY i
+) ORDER BY x
 ----
 1
 
@@ -182,7 +184,7 @@ insert into one values (7);
 
 # a single row partition still matches
 query I
-SELECT i FROM one MATCH_RECOGNIZE(
+SELECT x FROM one MATCH_RECOGNIZE(
     ORDER BY i MEASURES i AS x PATTERN (A) DEFINE A as true
 )
 ----
@@ -208,9 +210,9 @@ SELECT count(*) FROM q MATCH_RECOGNIZE(
 
 # table alias and result alias
 query I
-SELECT z.i FROM q AS t MATCH_RECOGNIZE(
+SELECT z.x FROM q AS t MATCH_RECOGNIZE(
     ORDER BY i MEASURES i AS x PATTERN (A A) DEFINE A as true
-) AS z ORDER BY z.i
+) AS z ORDER BY z.x
 ----
 1
 3
