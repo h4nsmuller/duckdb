@@ -529,6 +529,8 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 	DataChunk row_chunk;
 	DataChunk row_result;
 	bool row_chunk_ready = false;
+	// one executor per condition, reused across rows
+	vector<unique_ptr<ExpressionExecutor>> row_executors(config.conditions.size());
 
 	//	The row FIRST()/LAST() navigates to, or an invalid index when the match has no such row
 	auto navigate = [&](const MatchRecognizeFunctionData::Navigation &navigation, idx_t row,
@@ -596,8 +598,10 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		row_chunk.SetCardinality(1);
 
 		row_result.Reset();
-		ExpressionExecutor row_executor(context.client, *conditions[index]);
-		row_executor.Execute(row_chunk, row_result);
+		if (!row_executors[index]) {
+			row_executors[index] = make_uniq<ExpressionExecutor>(context.client, *conditions[index]);
+		}
+		row_executors[index]->Execute(row_chunk, row_result);
 		UnifiedVectorFormat result_data;
 		row_result.data[0].ToUnifiedFormat(1, result_data);
 		const auto result_idx = result_data.sel->get_index(0);
