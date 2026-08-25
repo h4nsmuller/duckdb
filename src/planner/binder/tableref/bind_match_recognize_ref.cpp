@@ -266,8 +266,9 @@ static void ScopeToMatch(WindowExpression &window, const MatchRecognizeConfig &c
 }
 
 static unique_ptr<ParsedExpression> MatchScopedValue(const MatchRecognizeConfig &config,
-                                                     unique_ptr<ParsedExpression> value, bool running) {
-	auto window = make_uniq<WindowExpression>("", "", "last_value");
+                                                     unique_ptr<ParsedExpression> value, bool running,
+                                                     bool first = false) {
+	auto window = make_uniq<WindowExpression>("", "", first ? "first_value" : "last_value");
 	window->GetArgumentsMutable().emplace_back(std::move(value));
 	window->HasIgnoreNullsMutable() = true;
 	window->IgnoreNullsMutable() = true;
@@ -287,6 +288,24 @@ static void RewriteMeasure(Binder &binder, unique_ptr<ParsedExpression> &expr, c
 		}
 		if (function_name == "MATCH_NUMBER" && function.GetArguments().empty()) {
 			expr = CreateStructExtract("__pattern_window", "match_number");
+			return;
+		}
+		// logical navigation over the rows of the match. LAST(X.c) is what an unadorned X.c already
+		// means, so both share the masking; only the end they read from differs.
+		if ((function_name == "FIRST" || function_name == "LAST") && function.GetArguments().size() == 1) {
+			auto inner = std::move(function.GetArgumentsMutable()[0].GetExpressionMutable());
+			string symbol;
+			if (inner->GetExpressionType() == ExpressionType::COLUMN_REF) {
+				auto &colref = inner->Cast<ColumnRefExpression>();
+				auto &names = colref.ColumnNames();
+				if (names.size() == 2 && symbols.find(names[0].GetIdentifierName()) != symbols.end()) {
+					symbol = names[0].GetIdentifierName();
+					inner = make_uniq<ColumnRefExpression>(colref.GetColumnName());
+				}
+			}
+			RewriteMeasure(binder, inner, config, symbols, running, inside_aggregate);
+			auto masked = symbol.empty() ? std::move(inner) : ClassifiedValue(symbol, std::move(inner));
+			expr = MatchScopedValue(config, std::move(masked), running, function_name == "FIRST");
 			return;
 		}
 		// an aggregate in MEASURES aggregates the rows of the match
@@ -527,8 +546,10 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	}
 	measures_node->select_list.push_back(std::move(star));
 
+	vector<Identifier> measure_aliases;
 	for (auto &expr : ref.config->measures_expression_list) {
 		D_ASSERT(!expr->GetAlias().empty());
+		measure_aliases.push_back(expr->GetAlias());
 		// rewriting can replace the expression wholesale, which would drop the MEASURES alias
 		auto alias = expr->GetAlias();
 		RewriteMeasure(*this, expr, *ref.config, pattern_symbols, all_rows);
@@ -538,12 +559,18 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 
 	select_node = std::move(measures_node);
 
-	// ONE ROW PER MATCH reports one row per match. This has to filter above the measures rather than
-	// beside them: the measures are computed across the match, so the other rows have to still be there.
+	// ONE ROW PER MATCH reports one row per match, and reports the match rather than any of its rows:
+	// the output is the partitioning followed by the measures. Filtering has to happen above the
+	// measures rather than beside them, because they are computed across the whole match.
 	if (!all_rows) {
 		auto measures_select = make_uniq<SelectStatement>(std::move(select_node));
 		auto filter_node = make_uniq<SelectNode>(make_uniq<SubqueryRef>(std::move(measures_select)));
-		filter_node->select_list.push_back(make_uniq<StarExpression>());
+		for (auto &expr : ref.config->partition_expressions) {
+			filter_node->select_list.push_back(expr->Copy());
+		}
+		for (auto &alias : measure_aliases) {
+			filter_node->select_list.push_back(make_uniq<ColumnRefExpression>(alias));
+		}
 		filter_node->where_clause = CreateStructExtract("__pattern_window", "is_match_start");
 		select_node = std::move(filter_node);
 	}

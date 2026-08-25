@@ -3,6 +3,8 @@
 #include "duckdb/function/match_recognize.hpp"
 #include "duckdb/function/window/match_recognize_functions.hpp"
 #include "duckdb/function/window/window_shared_expressions.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -66,8 +68,15 @@ static void RebindToArguments(unique_ptr<Expression> &expr, const expression_map
 
 unique_ptr<FunctionData> WindowMatchRecognizeExecutor::Bind(BindWindowFunctionInput &input) {
 	auto &arguments = input.GetArguments();
-	if (arguments.size() != 7) {
-		throw BinderException("MATCH_RECOGNIZE expects its columns, conditions, pattern and configuration");
+	// Deserialization rebinds the function after the configuration arguments are gone, filling the
+	// optional parameters with NULL. The bind data is restored by the deserialize callback instead.
+	const auto configured = arguments.size() == 7 &&
+	                        arguments[3]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+	                        !arguments[3]->Cast<BoundConstantExpression>().GetValue().IsNull();
+	if (!configured) {
+		input.GetBoundFunction().GetArguments().resize(MinValue<idx_t>(1, arguments.size()));
+		input.GetBoundFunction().SetReturnType(ResultType());
+		return nullptr;
 	}
 
 	auto bind_data = make_uniq<MatchRecognizeFunctionData>();
@@ -125,6 +134,120 @@ unique_ptr<FunctionData> WindowMatchRecognizeExecutor::Bind(BindWindowFunctionIn
 }
 
 //===--------------------------------------------------------------------===//
+// Serialization
+//===--------------------------------------------------------------------===//
+// The pattern is built from expression types that only exist here, so it is written out directly
+// rather than through the expression serializer.
+static void SerializePattern(Serializer &serializer, const Expression &pattern) {
+	serializer.WriteProperty(100, "type", pattern.GetExpressionType());
+	switch (pattern.GetExpressionType()) {
+	case ExpressionType::ALTERNATION: {
+		auto &alternation = pattern.Cast<BoundAlternationExpression>();
+		serializer.WriteObject(101, "left",
+		                       [&](Serializer &child) { SerializePattern(child, *alternation.child_left); });
+		serializer.WriteObject(102, "right",
+		                       [&](Serializer &child) { SerializePattern(child, *alternation.child_right); });
+		break;
+	}
+	case ExpressionType::CONCATENATION: {
+		auto &concatenation = pattern.Cast<BoundConcatenationExpression>();
+		serializer.WriteList(101, "children", concatenation.children.size(), [&](Serializer::List &list, idx_t i) {
+			list.WriteObject([&](Serializer &child) { SerializePattern(child, *concatenation.children[i]); });
+		});
+		break;
+	}
+	case ExpressionType::QUANTIFIER: {
+		auto &quantifier = pattern.Cast<BoundQuantifierExpression>();
+		serializer.WriteObject(101, "child", [&](Serializer &child) { SerializePattern(child, *quantifier.child); });
+		serializer.WriteProperty(102, "min_count", quantifier.min_count);
+		serializer.WriteProperty(103, "max_count", quantifier.max_count);
+		break;
+	}
+	case ExpressionType::VALUE_CONSTANT:
+		serializer.WriteProperty(101, "symbol", pattern.Cast<BoundConstantExpression>().GetValue());
+		break;
+	default:
+		throw SerializationException("Unsupported MATCH_RECOGNIZE pattern node");
+	}
+}
+
+static unique_ptr<Expression> DeserializePattern(Deserializer &deserializer) {
+	auto type = deserializer.ReadProperty<ExpressionType>(100, "type");
+	switch (type) {
+	case ExpressionType::ALTERNATION: {
+		unique_ptr<Expression> left;
+		unique_ptr<Expression> right;
+		deserializer.ReadObject(101, "left", [&](Deserializer &child) { left = DeserializePattern(child); });
+		deserializer.ReadObject(102, "right", [&](Deserializer &child) { right = DeserializePattern(child); });
+		return make_uniq_base<Expression, BoundAlternationExpression>(std::move(left), std::move(right));
+	}
+	case ExpressionType::CONCATENATION: {
+		vector<unique_ptr<Expression>> children;
+		deserializer.ReadList(101, "children", [&](Deserializer::List &list, idx_t i) {
+			list.ReadObject([&](Deserializer &child) { children.push_back(DeserializePattern(child)); });
+		});
+		return make_uniq_base<Expression, BoundConcatenationExpression>(std::move(children));
+	}
+	case ExpressionType::QUANTIFIER: {
+		unique_ptr<Expression> child;
+		deserializer.ReadObject(101, "child", [&](Deserializer &inner) { child = DeserializePattern(inner); });
+		auto min_count = deserializer.ReadProperty<optional_idx>(102, "min_count");
+		auto max_count = deserializer.ReadProperty<optional_idx>(103, "max_count");
+		return make_uniq_base<Expression, BoundQuantifierExpression>(std::move(child), min_count, max_count);
+	}
+	case ExpressionType::VALUE_CONSTANT:
+		return make_uniq_base<Expression, BoundConstantExpression>(deserializer.ReadProperty<Value>(101, "symbol"));
+	default:
+		throw SerializationException("Unsupported MATCH_RECOGNIZE pattern node");
+	}
+}
+
+void WindowMatchRecognizeExecutor::Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+                                             const BoundWindowFunction &function) {
+	auto &config = bind_data->Cast<MatchRecognizeFunctionData>();
+	serializer.WriteObject(100, "pattern", [&](Serializer &child) { SerializePattern(child, *config.pattern); });
+	serializer.WriteProperty(101, "conditions", config.conditions);
+	serializer.WriteProperty(102, "symbols", config.symbols);
+	serializer.WriteProperty(103, "after_match", config.after_match);
+	serializer.WriteProperty(104, "after_match_variable", config.after_match_variable);
+	serializer.WriteProperty(105, "depends_on_match_number", config.depends_on_match_number);
+	serializer.WriteProperty(106, "row_scoped", config.row_scoped);
+	serializer.WriteList(107, "navigations", config.navigations.size(), [&](Serializer::List &list, idx_t i) {
+		auto &navigation = config.navigations[i];
+		list.WriteObject([&](Serializer &child) {
+			child.WriteProperty(100, "last", navigation.last);
+			child.WriteProperty(101, "symbol", navigation.symbol);
+			child.WriteProperty(102, "field", navigation.field);
+			child.WriteProperty(103, "offset", navigation.offset);
+		});
+	});
+}
+
+unique_ptr<FunctionData> WindowMatchRecognizeExecutor::Deserialize(Deserializer &deserializer,
+                                                                   BoundWindowFunction &function) {
+	auto result = make_uniq<MatchRecognizeFunctionData>();
+	deserializer.ReadObject(100, "pattern", [&](Deserializer &child) { result->pattern = DeserializePattern(child); });
+	deserializer.ReadProperty(101, "conditions", result->conditions);
+	deserializer.ReadProperty(102, "symbols", result->symbols);
+	deserializer.ReadProperty(103, "after_match", result->after_match);
+	deserializer.ReadProperty(104, "after_match_variable", result->after_match_variable);
+	deserializer.ReadProperty(105, "depends_on_match_number", result->depends_on_match_number);
+	deserializer.ReadProperty(106, "row_scoped", result->row_scoped);
+	deserializer.ReadList(107, "navigations", [&](Deserializer::List &list, idx_t i) {
+		list.ReadObject([&](Deserializer &child) {
+			MatchRecognizeFunctionData::Navigation navigation;
+			navigation.last = child.ReadProperty<bool>(100, "last");
+			navigation.symbol = child.ReadProperty<string>(101, "symbol");
+			navigation.field = child.ReadProperty<idx_t>(102, "field");
+			navigation.offset = child.ReadProperty<idx_t>(103, "offset");
+			result->navigations.push_back(navigation);
+		});
+	});
+	function.SetReturnType(ResultType());
+	return std::move(result);
+}
+
+//===--------------------------------------------------------------------===//
 // WindowMatchRecognizeExecutor
 //===--------------------------------------------------------------------===//
 void WindowMatchRecognizeExecutor::GetBounds(WindowBoundsSet &required, const BoundWindowExpression &wexpr) {
@@ -153,41 +276,16 @@ unique_ptr<LocalSinkState> WindowMatchRecognizeExecutor::GetLocal(ExecutionConte
 	return make_uniq<WindowExecutorLocalState>(context, gstate.Cast<WindowMatchRecognizeGlobalState>());
 }
 
-static void FetchPartition(ClientContext &context, ColumnDataCollection &input, DataChunk &result_chunk,
-                           idx_t partition_start, idx_t partition_end) {
+//! Materialise the whole hash group. Row offsets are global to it, which is what the matcher and the
+//! condition evaluation both index by.
+static void FetchHashGroup(ColumnDataCollection &input, DataChunk &result_chunk) {
 	ColumnDataScanState scan_state;
 	DataChunk scan_chunk;
-
-	// TODO cache those allocations
 	input.InitializeScanChunk(scan_chunk);
-
-	auto partition_size = partition_end - partition_start + 1;
-
-	D_ASSERT(result_chunk.GetCapacity() <= partition_size);
-
 	input.InitializeScan(scan_state);
-	// we do one Scan() because Seek() does nothing if its already on the right chunk
-	input.Scan(scan_state, scan_chunk);
-	input.Seek(partition_start, scan_state, scan_chunk);
-
-	// we may have to slice the first chunk because the partition may start somewhere halfway into the chunk
-	auto chunk_offset = partition_start - scan_state.current_row_index;
-	scan_chunk.Slice(chunk_offset, scan_chunk.size() - chunk_offset);
-
-	result_chunk.Append(scan_chunk);
-
-	while (partition_end <= scan_state.next_row_index) {
-		if (!input.Scan(scan_state, scan_chunk)) {
-			// we need to get out here because otherwise the check below goes wrong
-			break;
-		}
-		// we may have too many rows, so slice again
-		if (scan_state.next_row_index > partition_end) {
-			scan_chunk.Slice(0, scan_state.next_row_index - partition_end); // TODO verify this very complex math
-		}
+	while (input.Scan(scan_state, scan_chunk)) {
 		result_chunk.Append(scan_chunk);
 	}
-	D_ASSERT(result_chunk.size() == partition_size);
 }
 
 struct Match {
@@ -351,6 +449,7 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 	// TODO this should probably be kept elsewhere
 	DataChunk partition_chunk;
 	partition_chunk.Initialize(context.client, collection->inputs->Types(), gstate.payload_count);
+	FetchHashGroup(*collection->inputs, partition_chunk);
 
 	// the pattern variable that classified each row, indexed by row offset within the hash group
 	vector<string> classifiers(gstate.payload_count);
@@ -426,7 +525,8 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 				column_types.push_back(column.GetType());
 			}
 			row_chunk.Initialize(context.client, column_types, 1);
-			row_result.Initialize(context.client, condition_types, 1);
+			// one expression is evaluated at a time here, so the result holds a single column
+			row_result.Initialize(context.client, vector<LogicalType> {LogicalType::BOOLEAN}, 1);
 			row_chunk_ready = true;
 		}
 
@@ -506,9 +606,6 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		}
 		const idx_t partition_end = payload_idx - 1;
 
-		// FIXME
-		FetchPartition(context.client, *collection->inputs, partition_chunk, partition_start, partition_end);
-
 		// scan the partition left to right, applying AFTER MATCH SKIP after every match. Rows that are
 		// not part of any match keep a NULL struct, which filters them out downstream.
 		auto &struct_entries = StructVector::GetEntries(gstate.result_vec);
@@ -558,16 +655,28 @@ void WindowMatchRecognizeExecutor::GetData(ExecutionContext &context, DataChunk 
 }
 
 WindowFunction MatchRecognizeFun::GetFunction() {
-	// the argument list is variable: match number column, condition columns, conditions, pattern and
-	// the configuration constants
-	WindowFunction fun(Name,
-	                   {LogicalType::ANY, LogicalType::ANY, LogicalType::ANY, LogicalType::LIST(LogicalType::VARCHAR),
-	                    LogicalType::VARCHAR, LogicalType::UTINYINT, LogicalType::ANY},
-	                   WindowMatchRecognizeExecutor::ResultType(), ExpressionType::WINDOW_FUNCTION,
-	                   WindowMatchRecognizeExecutor::Bind, WindowMatchRecognizeExecutor::GetBounds,
-	                   WindowMatchRecognizeExecutor::GetSharing, WindowMatchRecognizeExecutor::GetGlobal,
-	                   WindowMatchRecognizeExecutor::GetLocal, nullptr, WindowMatchRecognizeExecutor::Finalize,
-	                   WindowMatchRecognizeExecutor::GetData);
+	// Everything after the columns is configuration that Bind() moves into the function data, so a
+	// bound call carries only the first argument. Declaring the rest optional keeps the signature
+	// resolvable both before and after that.
+	WindowFunction fun(Name, {LogicalType::ANY}, WindowMatchRecognizeExecutor::ResultType(),
+	                   ExpressionType::WINDOW_FUNCTION, WindowMatchRecognizeExecutor::Bind,
+	                   WindowMatchRecognizeExecutor::GetBounds, WindowMatchRecognizeExecutor::GetSharing,
+	                   WindowMatchRecognizeExecutor::GetGlobal, WindowMatchRecognizeExecutor::GetLocal, nullptr,
+	                   WindowMatchRecognizeExecutor::Finalize, WindowMatchRecognizeExecutor::GetData);
+
+	auto &signature = fun.GetSignature();
+	signature = FunctionSignature(vector<FunctionParameter>(), WindowMatchRecognizeExecutor::ResultType());
+	signature.AddParameter(Identifier("columns"), LogicalType::ANY);
+	signature.AddParameter(Identifier("conditions"), LogicalType::ANY, Value());
+	signature.AddParameter(Identifier("pattern"), LogicalType::ANY, Value());
+	signature.AddParameter(Identifier("symbols"), LogicalType::LIST(LogicalType::VARCHAR), Value());
+	signature.AddParameter(Identifier("after_match_variable"), LogicalType::VARCHAR, Value());
+	signature.AddParameter(Identifier("after_match"), LogicalType::UTINYINT, Value());
+	signature.AddParameter(Identifier("navigations"), LogicalType::ANY, Value());
+
+	fun.SetSerializeCallback(WindowMatchRecognizeExecutor::Serialize);
+	fun.SetDeserializeCallback(WindowMatchRecognizeExecutor::Deserialize);
+
 	return fun;
 }
 
