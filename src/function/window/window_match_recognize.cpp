@@ -490,9 +490,14 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 	D_ASSERT(gstate.partition_mask.RowIsValid(0));
 
 	// TODO this should probably be kept elsewhere
+	// The operator has already materialised the hash group. Only logical navigation needs random
+	// access to arbitrary rows of it, so a second copy is made only when a condition navigates.
+	const auto navigates = !config.navigations.empty();
 	DataChunk partition_chunk;
-	partition_chunk.Initialize(context.client, collection->inputs->Types(), gstate.payload_count);
-	FetchHashGroup(*collection->inputs, partition_chunk);
+	if (navigates) {
+		partition_chunk.Initialize(context.client, collection->inputs->Types(), gstate.payload_count);
+		FetchHashGroup(*collection->inputs, partition_chunk);
+	}
 
 	// the pattern variable that classified each row, indexed by row offset within the hash group
 	vector<string> classifiers(gstate.payload_count);
@@ -508,7 +513,8 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		conditions.push_back(std::move(copied));
 	}
 	// the conditions address the fields of the packed column struct, and MATCH_NUMBER() is field 0
-	const idx_t match_number_idx = 0;
+	//	MATCH_NUMBER() is the first field of the packed column struct
+	static constexpr idx_t MATCH_NUMBER_FIELD = 0;
 
 	// one boolean per symbol per row, refreshed whenever the match number changes
 	vector<vector<uint8_t>> condition_values(conditions.size(), vector<uint8_t>(gstate.payload_count, 0));
@@ -577,7 +583,7 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		for (idx_t col = 0; col < columns.size(); col++) {
 			row_chunk.data[col].Slice(columns[col], row, row + 1);
 		}
-		row_chunk.data[0].Reference(Value::UBIGINT(current_match_number), count_t(1));
+		row_chunk.data[MATCH_NUMBER_FIELD].Reference(Value::UBIGINT(current_match_number), count_t(1));
 		for (auto &navigation : config.navigations) {
 			auto target = navigate(navigation, row, classifiers);
 			if (target.IsValid()) {
@@ -605,25 +611,41 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		condition_result.Initialize(context.client, condition_types);
 	}
 
-	//	Evaluate every condition over [begin, end] with MATCH_NUMBER() bound to match_number
+	//	Evaluate every condition over [begin, end] with MATCH_NUMBER() bound to match_number, by
+	//	streaming the collection rather than holding a copy of it
 	auto evaluate_conditions = [&](idx_t begin, idx_t end, idx_t match_number) {
 		if (conditions.empty() || begin > end) {
 			return;
 		}
-		auto &columns = StructVector::GetEntries(partition_chunk.data[columns_idx]);
-		vector<LogicalType> column_types;
-		for (auto &column : columns) {
-			column_types.push_back(column.GetType());
-		}
-		for (idx_t offset = begin; offset <= end; offset += STANDARD_VECTOR_SIZE) {
-			const auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, end - offset + 1);
+		ColumnDataScanState scan_state;
+		DataChunk scan_chunk;
+		collection->inputs->InitializeScanChunk(scan_chunk);
+		collection->inputs->InitializeScan(scan_state);
+
+		idx_t scanned = 0;
+		while (collection->inputs->Scan(scan_state, scan_chunk)) {
+			const auto chunk_begin = scanned;
+			const auto chunk_end = chunk_begin + scan_chunk.size();
+			scanned = chunk_end;
+			if (chunk_end <= begin || chunk_begin > end) {
+				continue;
+			}
+			const auto from = begin > chunk_begin ? begin - chunk_begin : 0;
+			const auto to = MinValue(chunk_end, end + 1) - chunk_begin;
+			const auto count = to - from;
+
+			auto &columns = StructVector::GetEntries(scan_chunk.data[columns_idx]);
+			vector<LogicalType> column_types;
+			for (auto &column : columns) {
+				column_types.push_back(column.GetType());
+			}
 			DataChunk slice;
 			slice.InitializeEmpty(column_types);
 			for (idx_t col = 0; col < columns.size(); col++) {
-				slice.data[col].Slice(columns[col], offset, offset + count);
+				slice.data[col].Slice(columns[col], from, to);
 			}
 			slice.SetCardinality(count);
-			slice.data[match_number_idx].Reference(Value::UBIGINT(match_number), count_t(count));
+			slice.data[MATCH_NUMBER_FIELD].Reference(Value::UBIGINT(match_number), count_t(count));
 
 			condition_result.Reset();
 			condition_executor.Execute(slice, condition_result);
@@ -633,7 +655,7 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 				auto values = UnifiedVectorFormat::GetData<bool>(condition_data);
 				for (idx_t row = 0; row < count; row++) {
 					const auto row_idx = condition_data.sel->get_index(row);
-					condition_values[i][offset + row] =
+					condition_values[i][chunk_begin + from + row] =
 					    condition_data.validity.RowIsValid(row_idx) && values[row_idx] ? 1 : 0;
 				}
 			}
@@ -652,7 +674,6 @@ void WindowMatchRecognizeExecutor::Finalize(ExecutionContext &context, optional_
 		// scan the partition left to right, applying AFTER MATCH SKIP after every match. Rows that are
 		// not part of any match keep a NULL struct, which filters them out downstream.
 		idx_t match_number = 0;
-		current_match_number = 1;
 		current_match_number = 1;
 		evaluate_conditions(partition_start, partition_end, match_number + 1);
 		auto row = partition_start;
