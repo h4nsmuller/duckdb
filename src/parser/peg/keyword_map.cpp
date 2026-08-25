@@ -382,6 +382,7 @@ void DuckDBKeywordHelper::InitializeKeywordMaps() { // Renamed for clarity
 	unreserved_keyword_map.insert("strict");
 	unreserved_keyword_map.insert("strip");
 	unreserved_keyword_map.insert("subscription");
+	unreserved_keyword_map.insert("subset");
 	unreserved_keyword_map.insert("sysid");
 	unreserved_keyword_map.insert("system");
 	unreserved_keyword_map.insert("tables");

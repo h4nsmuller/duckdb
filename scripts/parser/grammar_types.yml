@@ -1587,6 +1587,18 @@ BinaryExpressionTail:
 # category with other rules. Typically pair<>, map<>, or one-off structs.
 # ---------------------------------------------------------------------------
 
+MatchRecognizeSubset:
+  type: "MatchRecognizeSubset"
+  by_value: true
+  rules:
+    - SubsetElement
+
+MatchRecognizeSubsetList:
+  type: "vector<MatchRecognizeSubset>"
+  by_value: true
+  rules:
+    - SubsetClause
+
 MeasureSemantics:
   type: "bool"
   by_value: true

@@ -3,6 +3,7 @@
 
 #include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
+#include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/pattern_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
@@ -227,11 +228,16 @@ static unique_ptr<ParsedExpression> CreateStructExtract(const string &column_nam
 	return make_uniq<FunctionExpression>("struct_extract", std::move(children));
 }
 
-//! CASE WHEN <classifier> = 'symbol' THEN <column> END - NULL on every row the variable did not match
-static unique_ptr<ParsedExpression> ClassifiedValue(const string &symbol, unique_ptr<ParsedExpression> value) {
-	auto classifier = CreateStructExtract("__pattern_window", "classifier");
-	auto matches_symbol = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, std::move(classifier),
-	                                                      make_uniq<ConstantExpression>(Value(symbol)));
+//! CASE WHEN <classifier> IN (symbols) THEN <column> END - NULL on every row none of them matched.
+//! A plain pattern variable stands for itself; a SUBSET name stands for all of its members.
+static unique_ptr<ParsedExpression> ClassifiedValue(const vector<string> &symbols, unique_ptr<ParsedExpression> value) {
+	D_ASSERT(!symbols.empty());
+	vector<unique_ptr<ParsedExpression>> in_children;
+	in_children.push_back(CreateStructExtract("__pattern_window", "classifier"));
+	for (auto &symbol : symbols) {
+		in_children.push_back(make_uniq<ConstantExpression>(Value(symbol)));
+	}
+	auto matches_symbol = make_uniq<OperatorExpression>(ExpressionType::COMPARE_IN, std::move(in_children));
 	auto result = make_uniq<CaseExpression>();
 	CaseCheck check;
 	check.when_expr = std::move(matches_symbol);
@@ -271,7 +277,7 @@ static unique_ptr<ParsedExpression> MatchScopedValue(const MatchRecognizeConfig 
 
 //! Rewrite a MEASURES expression into something evaluable next to the pattern window
 static void RewriteMeasure(Binder &binder, unique_ptr<ParsedExpression> &expr, const MatchRecognizeConfig &config,
-                           const case_insensitive_set_t &symbols, bool running, bool one_row,
+                           const case_insensitive_map_t<vector<string>> &symbols, bool running, bool one_row,
                            bool inside_aggregate = false) {
 	if (expr->GetExpressionType() == ExpressionType::FUNCTION) {
 		auto &function = expr->Cast<FunctionExpression>();
@@ -297,12 +303,13 @@ static void RewriteMeasure(Binder &binder, unique_ptr<ParsedExpression> &expr, c
 		// means, so both share the masking; only the end they read from differs.
 		if ((function_name == "FIRST" || function_name == "LAST") && function.GetArguments().size() == 1) {
 			auto inner = std::move(function.GetArgumentsMutable()[0].GetExpressionMutable());
-			string symbol;
+			vector<string> symbol;
 			if (inner->GetExpressionType() == ExpressionType::COLUMN_REF) {
 				auto &colref = inner->Cast<ColumnRefExpression>();
 				auto &names = colref.ColumnNames();
-				if (names.size() == 2 && symbols.find(names[0].GetIdentifierName()) != symbols.end()) {
-					symbol = names[0].GetIdentifierName();
+				auto entry = names.size() == 2 ? symbols.find(names[0].GetIdentifierName()) : symbols.end();
+				if (entry != symbols.end()) {
+					symbol = entry->second;
 					inner = make_uniq<ColumnRefExpression>(colref.GetColumnName());
 				}
 			}
@@ -334,11 +341,11 @@ static void RewriteMeasure(Binder &binder, unique_ptr<ParsedExpression> &expr, c
 	if (expr->GetExpressionType() == ExpressionType::COLUMN_REF) {
 		auto &colref = expr->Cast<ColumnRefExpression>();
 		auto &names = colref.ColumnNames();
-		if (names.size() == 2 && symbols.find(names[0].GetIdentifierName()) != symbols.end()) {
+		auto entry = names.size() == 2 ? symbols.find(names[0].GetIdentifierName()) : symbols.end();
+		if (entry != symbols.end()) {
 			// a known pattern variable scopes the column to the rows it matched
-			auto symbol = names[0].GetIdentifierName();
 			auto column = make_uniq<ColumnRefExpression>(colref.GetColumnName());
-			auto masked = ClassifiedValue(symbol, std::move(column));
+			auto masked = ClassifiedValue(entry->second, std::move(column));
 			expr = inside_aggregate ? std::move(masked) : MatchScopedValue(config, std::move(masked), running);
 			return;
 		}
@@ -377,6 +384,27 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 	}
 	pattern_window->PartitionsMutable() = std::move(partitions);
 	pattern_window->OrderByMutable() = std::move(ref.config->order_by_expressions);
+
+	// a union variable only stands for a set of rows after the match is assembled, so it is confined
+	// to MEASURES: the matcher works one symbol at a time and cannot yet navigate or skip to a union
+	case_insensitive_set_t subset_names;
+	for (auto &subset : ref.config->subsets) {
+		subset_names.insert(subset.name);
+	}
+	if (!subset_names.empty()) {
+		if (ref.config->after_match_variable &&
+		    subset_names.count(ref.config->after_match_variable->GetValue().ToString())) {
+			throw NotImplementedException("AFTER MATCH SKIP TO a SUBSET variable is not supported yet");
+		}
+		for (auto &expr : ref.config->defines_expression_list) {
+			ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(
+			    *expr, [&](const ColumnRefExpression &colref) {
+				    if (colref.IsQualified() && subset_names.count(colref.ColumnNames()[0].GetIdentifierName())) {
+					    throw NotImplementedException("A SUBSET variable cannot be referenced in DEFINE yet");
+				    }
+			    });
+		}
+	}
 
 	// another select node
 	// all the inputs for the defines go in their own select node
@@ -447,6 +475,26 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 		    define_conditions.push_back(make_uniq<ConstantExpression>(Value::BOOLEAN(true)));
 		    pattern_symbols.insert(MatchRecognizeSymbolName(column_name));
 	    });
+
+	// a measure may name a pattern variable or a SUBSET of them; both resolve to a set of symbols
+	case_insensitive_map_t<vector<string>> measure_symbols;
+	for (auto &symbol : pattern_symbols) {
+		measure_symbols[symbol] = {symbol};
+	}
+	for (auto &subset : ref.config->subsets) {
+		if (measure_symbols.find(subset.name) != measure_symbols.end()) {
+			throw BinderException("SUBSET name \"%s\" is already a pattern variable", subset.name);
+		}
+		vector<string> members;
+		for (auto &member : subset.members) {
+			auto entry = measure_symbols.find(member);
+			if (entry == measure_symbols.end() || entry->second.size() != 1) {
+				throw BinderException("SUBSET \"%s\" refers to unknown pattern variable \"%s\"", subset.name, member);
+			}
+			members.push_back(entry->second[0]);
+		}
+		measure_symbols[subset.name] = std::move(members);
+	}
 
 	// the matcher only needs the symbol a leaf names, and there is no longer a column to bind it to
 	PatternSymbolsToConstants(ref.config->pattern);
@@ -566,7 +614,7 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 		measure_aliases.push_back(expr->GetAlias());
 		// rewriting can replace the expression wholesale, which would drop the MEASURES alias
 		auto alias = expr->GetAlias();
-		RewriteMeasure(*this, expr, *ref.config, pattern_symbols, all_rows, !all_rows);
+		RewriteMeasure(*this, expr, *ref.config, measure_symbols, all_rows, !all_rows);
 		expr->SetAlias(std::move(alias));
 		measures_node->select_list.push_back(std::move(expr));
 	}

@@ -7837,10 +7837,17 @@ unique_ptr<TransformResultValue> PEGTransformerFactory::TransformMatchRecognizeB
 		after_match_skip = std::move(after_match_skip_value);
 	}
 	auto pattern_clause = transformer.Transform<unique_ptr<ParsedExpression>>(list_pr.GetChild(5));
-	auto define_clause = transformer.Transform<vector<unique_ptr<ParsedExpression>>>(list_pr.GetChild(6));
-	auto result = TransformMatchRecognizeBody(
-	    transformer, std::move(window_partition), std::move(order_by_clause), std::move(measures_clause),
-	    std::move(rows_per_match), std::move(after_match_skip), std::move(pattern_clause), std::move(define_clause));
+	optional<vector<MatchRecognizeSubset>> subset_clause {};
+	auto &subset_clause_opt = list_pr.GetChild(6).Cast<OptionalParseResult>();
+	if (subset_clause_opt.HasResult()) {
+		auto subset_clause_value = transformer.Transform<vector<MatchRecognizeSubset>>(subset_clause_opt.GetResult());
+		subset_clause = std::move(subset_clause_value);
+	}
+	auto define_clause = transformer.Transform<vector<unique_ptr<ParsedExpression>>>(list_pr.GetChild(7));
+	auto result =
+	    TransformMatchRecognizeBody(transformer, std::move(window_partition), std::move(order_by_clause),
+	                                std::move(measures_clause), std::move(rows_per_match), std::move(after_match_skip),
+	                                std::move(pattern_clause), std::move(subset_clause), std::move(define_clause));
 	return make_uniq<TypedTransformResult<unique_ptr<TableRef>>>(std::move(result));
 }
 
@@ -8117,6 +8124,33 @@ unique_ptr<TransformResultValue> PEGTransformerFactory::TransformQuantifierExact
 	auto number_literal = transformer.Transform<unique_ptr<ParsedExpression>>(list_pr.GetChild(0));
 	auto result = TransformQuantifierExact(transformer, std::move(number_literal));
 	return make_uniq<TypedTransformResult<MatchRecognizeQuantifier>>(std::move(result));
+}
+
+unique_ptr<TransformResultValue> PEGTransformerFactory::TransformSubsetClauseInternal(PEGTransformer &transformer,
+                                                                                      ParseResult &parse_result) {
+	auto &list_pr = parse_result.Cast<ListParseResult>();
+	vector<MatchRecognizeSubset> subset_element;
+	auto subset_element_items = ExtractParseResultsFromList(list_pr.GetChild(1));
+	for (auto &subset_element_item : subset_element_items) {
+		auto subset_element_value = transformer.Transform<MatchRecognizeSubset>(subset_element_item.get());
+		subset_element.push_back(std::move(subset_element_value));
+	}
+	auto result = TransformSubsetClause(transformer, std::move(subset_element));
+	return make_uniq<TypedTransformResult<vector<MatchRecognizeSubset>>>(std::move(result));
+}
+
+unique_ptr<TransformResultValue> PEGTransformerFactory::TransformSubsetElementInternal(PEGTransformer &transformer,
+                                                                                       ParseResult &parse_result) {
+	auto &list_pr = parse_result.Cast<ListParseResult>();
+	auto col_label_or_string = transformer.Transform<Identifier>(list_pr.GetChild(0));
+	vector<Identifier> col_label_or_string_1;
+	auto col_label_or_string_1_items = ExtractParseResultsFromList(ExtractResultFromParens(list_pr.GetChild(2)));
+	for (auto &col_label_or_string_1_item : col_label_or_string_1_items) {
+		auto col_label_or_string_1_value = transformer.Transform<Identifier>(col_label_or_string_1_item.get());
+		col_label_or_string_1.push_back(col_label_or_string_1_value);
+	}
+	auto result = TransformSubsetElement(transformer, col_label_or_string, col_label_or_string_1);
+	return make_uniq<TypedTransformResult<MatchRecognizeSubset>>(std::move(result));
 }
 
 unique_ptr<TransformResultValue> PEGTransformerFactory::TransformDefineClauseInternal(PEGTransformer &transformer,
@@ -11906,6 +11940,8 @@ void PEGTransformerFactory::RegisterGenerated() {
 	    {"QuantifierMin", &PEGTransformerFactory::TransformQuantifierMinInternal},
 	    {"QuantifierMax", &PEGTransformerFactory::TransformQuantifierMaxInternal},
 	    {"QuantifierExact", &PEGTransformerFactory::TransformQuantifierExactInternal},
+	    {"SubsetClause", &PEGTransformerFactory::TransformSubsetClauseInternal},
+	    {"SubsetElement", &PEGTransformerFactory::TransformSubsetElementInternal},
 	    {"DefineClause", &PEGTransformerFactory::TransformDefineClauseInternal},
 	    {"DefineElement", &PEGTransformerFactory::TransformDefineElementInternal},
 	    {"MergeIntoStatement", &PEGTransformerFactory::TransformMergeIntoStatementInternal},

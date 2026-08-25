@@ -682,6 +682,7 @@ UnreservedKeyword <- 'ABORT' /
 'STRICT' /
 'STRIP' /
 'SUBSCRIPTION' /
+'SUBSET' /
 'SYSID' /
 'SYSTEM' /
 'TABLES' /
@@ -1623,7 +1624,7 @@ FromSourceIdentifier <- 'FROM' Identifier
 FromSourceString <- 'FROM' StringLiteral
 VersionNumber <- 'VERSION' IdentifierOrStringLiteral
 TableMatchRecognizeClause <- 'MATCH_RECOGNIZE' Parens(MatchRecognizeBody) TableAlias?
-MatchRecognizeBody <- WindowPartition? OrderByClause? MeasuresClause RowsPerMatch? AfterMatchSkip? PatternClause DefineClause
+MatchRecognizeBody <- WindowPartition? OrderByClause? MeasuresClause RowsPerMatch? AfterMatchSkip? PatternClause SubsetClause? DefineClause
 
 MeasuresClause <- 'MEASURES' List(MeasuresElement)
 MeasuresElement <- MeasureSemantics? Expression 'AS' ColLabelOrString
@@ -1662,6 +1663,9 @@ QuantifierMinMax <- NumberLiteral ',' NumberLiteral
 QuantifierMin <- NumberLiteral ','
 QuantifierMax <- ',' NumberLiteral
 QuantifierExact <- NumberLiteral
+
+SubsetClause <- 'SUBSET' List(SubsetElement)
+SubsetElement <- ColLabelOrString '=' Parens(List(ColLabelOrString))
 
 DefineClause <- 'DEFINE' List(DefineElement)
 DefineElement <- ColLabelOrString 'AS' Expression

@@ -3785,6 +3785,14 @@ public:
 	                                                TransformStackFrame &frame);
 	static unique_ptr<TransformResultValue>
 	FinalizeQuantifierExactTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
+	static void InitializeSubsetClauseTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                             TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue>
+	FinalizeSubsetClauseTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
+	static void InitializeSubsetElementTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                              TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue>
+	FinalizeSubsetElementTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
 	static void InitializeDefineClauseTrampoline(PEGTransformer &transformer, TransformStack &stack,
 	                                             TransformStackFrame &frame);
 	static unique_ptr<TransformResultValue>
@@ -7693,7 +7701,8 @@ public:
 	    PEGTransformer &transformer, optional<vector<unique_ptr<ParsedExpression>>> window_partition,
 	    optional<vector<OrderByNode>> order_by_clause, vector<unique_ptr<ParsedExpression>> measures_clause,
 	    optional<MatchRecognizeRows> rows_per_match, optional<MatchRecognizeAfterMatchClause> after_match_skip,
-	    unique_ptr<ParsedExpression> pattern_clause, vector<unique_ptr<ParsedExpression>> define_clause);
+	    unique_ptr<ParsedExpression> pattern_clause, optional<vector<MatchRecognizeSubset>> subset_clause,
+	    vector<unique_ptr<ParsedExpression>> define_clause);
 	static unique_ptr<TransformResultValue> TransformMeasuresClauseInternal(PEGTransformer &transformer,
 	                                                                        ParseResult &parse_result);
 	static vector<unique_ptr<ParsedExpression>>
@@ -7793,6 +7802,15 @@ public:
 	                                                                         ParseResult &parse_result);
 	static MatchRecognizeQuantifier TransformQuantifierExact(PEGTransformer &transformer,
 	                                                         unique_ptr<ParsedExpression> number_literal);
+	static unique_ptr<TransformResultValue> TransformSubsetClauseInternal(PEGTransformer &transformer,
+	                                                                      ParseResult &parse_result);
+	static vector<MatchRecognizeSubset> TransformSubsetClause(PEGTransformer &transformer,
+	                                                          vector<MatchRecognizeSubset> subset_element);
+	static unique_ptr<TransformResultValue> TransformSubsetElementInternal(PEGTransformer &transformer,
+	                                                                       ParseResult &parse_result);
+	static MatchRecognizeSubset TransformSubsetElement(PEGTransformer &transformer,
+	                                                   const Identifier &col_label_or_string,
+	                                                   const vector<Identifier> &col_label_or_string_1);
 	static unique_ptr<TransformResultValue> TransformDefineClauseInternal(PEGTransformer &transformer,
 	                                                                      ParseResult &parse_result);
 	static vector<unique_ptr<ParsedExpression>>

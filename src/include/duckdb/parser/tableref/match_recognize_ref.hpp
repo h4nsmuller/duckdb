@@ -43,6 +43,12 @@ struct MatchRecognizeAfterMatchClause {
 	string variable;
 };
 
+//! A SUBSET names a union of pattern variables
+struct MatchRecognizeSubset {
+	string name;
+	vector<string> members;
+};
+
 struct MatchRecognizeConfig {
 	vector<unique_ptr<ParsedExpression>> partition_expressions;
 	vector<OrderByNode> order_by_expressions;
@@ -52,6 +58,7 @@ struct MatchRecognizeConfig {
 	MatchRecognizeAfterMatch after_match;
 	unique_ptr<ConstantExpression> after_match_variable;
 	unique_ptr<ParsedExpression> pattern;
+	vector<MatchRecognizeSubset> subsets;
 };
 
 //! Represents a SHOW/DESCRIBE/SUMMARIZE statement
