@@ -15,7 +15,7 @@ subgroup match_recognize
 
 load
 LOAD httpfs;
-CREATE TABLE crimes AS SELECT * FROM read_parquet('https://blobs.duckdb.org/data/crimes.parquet');
+CREATE TABLE crimes AS SELECT * FROM read_parquet('http://blobs.duckdb.org/data/crimes.parquet');
 
 run
 SELECT count(*) FROM crimes MATCH_RECOGNIZE(
