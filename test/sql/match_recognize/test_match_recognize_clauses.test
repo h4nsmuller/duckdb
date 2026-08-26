@@ -276,3 +276,41 @@ SELECT count(*) FROM wave MATCH_RECOGNIZE(
 )
 ----
 11
+
+# A DEFINE may name another pattern variable. That means the variable's value on the last row matched
+# to it so far, which is what LAST() means, so the two spellings have to agree.
+
+statement ok
+create table ticks(i integer, v integer);
+
+statement ok
+insert into ticks values (1,5),(2,7),(3,2),(4,9),(5,4);
+
+query II
+SELECT match_no, n FROM ticks MATCH_RECOGNIZE(
+    ORDER BY i MEASURES MATCH_NUMBER() AS match_no, count(*) AS n
+    ONE ROW PER MATCH AFTER MATCH SKIP TO NEXT ROW
+    PATTERN (R Z* B)
+    DEFINE R AS R.v = 5, B AS B.v > R.v
+) ORDER BY match_no
+----
+1	4
+
+query II
+SELECT match_no, n FROM ticks MATCH_RECOGNIZE(
+    ORDER BY i MEASURES MATCH_NUMBER() AS match_no, count(*) AS n
+    ONE ROW PER MATCH AFTER MATCH SKIP TO NEXT ROW
+    PATTERN (R Z* B)
+    DEFINE R AS R.v = 5, B AS B.v > LAST(R.v)
+) ORDER BY match_no
+----
+1	4
+
+# a qualifier that names neither the variable being defined nor another pattern variable is an error
+statement error
+SELECT 1 FROM ticks MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS n ONE ROW PER MATCH
+    PATTERN (R B) DEFINE R AS R.v = 5, B AS B.v > nosuch.v
+)
+----
+<REGEX>:Binder Error:.*"nosuch" in the definition of B is not a pattern variable.*

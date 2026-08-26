@@ -1,0 +1,48 @@
+# name: benchmark/micro/match_recognize/match_recognize_crime_sequence.benchmark
+# description: Three related crime reports separated by unconstrained ones, within a time and area box
+# group: [match_recognize]
+
+# The query and the shape of the data follow the row pattern recognition benchmark in Zhu, Huang and
+# Chaudhuri, "High-Performance Row Pattern Recognition Using Joins", PVLDB 16(5), 2023. Two
+# deliberate differences: the reports are generated rather than the real 6.5M row city crime table
+# the paper uses, so the benchmark stays self contained, and there are far fewer of them. The paper's
+# point is that this query shape is infeasible on a plain automaton at their scale, and it is here
+# too - the cost grows faster than the square of the row count, because every report can start a
+# match and Z is unconstrained, so the search runs forward until the time box closes it.
+#
+# The conditions of B and M are relative to R, and a condition that reads another variable depends on
+# the rows matched so far, so the matcher cannot reuse the states it has already walked. That is what
+# makes this shape expensive where the other benchmarks here are linear.
+
+name MatchRecognize Crime Sequence
+group micro
+subgroup match_recognize
+
+load
+CREATE TABLE crimes AS
+    SELECT i AS id,
+           TIMESTAMP '2001-01-01 00:00:00' + INTERVAL (i * 94) SECOND AS datetime,
+           (['THEFT', 'BATTERY', 'CRIMINAL DAMAGE', 'NARCOTICS', 'ASSAULT', 'OTHER OFFENSE',
+             'BURGLARY', 'MOTOR VEHICLE THEFT', 'ROBBERY', 'DECEPTIVE PRACTICE'])[(i * 7919 % 10) + 1] AS primary_type,
+           (i * 6151 % 25) + 1 AS district,
+           ((i * 6151 % 25) + 1) * 100 + (i * 13 % 9) AS beat,
+           41.64 + (i * 7717 % 380) / 1000.0 AS lat,
+           -87.94 + (i * 5279 % 420) / 1000.0 AS lon
+    FROM range(0, 1500) t(i);
+
+run
+SELECT count(*) FROM crimes MATCH_RECOGNIZE(
+    ORDER BY datetime
+    MEASURES R.id AS rid, B.id AS bid, M.id AS mid, count(Z.id) AS gap
+    ONE ROW PER MATCH
+    AFTER MATCH SKIP TO NEXT ROW
+    PATTERN (R Z* B Z* M)
+    DEFINE R AS R.primary_type = 'ROBBERY',
+           B AS B.primary_type = 'BATTERY'
+               AND B.lon BETWEEN R.lon - 0.05 AND R.lon + 0.05
+               AND B.lat BETWEEN R.lat - 0.02 AND R.lat + 0.02,
+           M AS M.primary_type = 'MOTOR VEHICLE THEFT'
+               AND M.lon BETWEEN R.lon - 0.05 AND R.lon + 0.05
+               AND M.lat BETWEEN R.lat - 0.02 AND R.lat + 0.02
+               AND M.datetime - R.datetime <= INTERVAL '30' MINUTE
+);

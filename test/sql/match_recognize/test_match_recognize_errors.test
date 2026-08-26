@@ -68,11 +68,12 @@ SELECT 1 FROM q MATCH_RECOGNIZE(MEASURES i AS x PATTERN (A) DEFINE A as nosuchco
 ----
 <REGEX>:Binder Error.*nosuchcol.*
 
-# not implemented yet: navigating between pattern variables
-statement error
-SELECT 1 FROM q MATCH_RECOGNIZE(MEASURES i AS x PATTERN (A B) DEFINE A as B.i > 0, B as true)
+# naming a variable that the match has not reached yet reads nothing, so the condition is never
+# true and the pattern cannot match
+query I
+SELECT count(*) FROM q MATCH_RECOGNIZE(MEASURES i AS x PATTERN (A B) DEFINE A as B.i > 0, B as true)
 ----
-<REGEX>:Not implemented Error.*Define references cannot refer to other defines.*
+0
 
 # CLASSIFIER() and MATCH_NUMBER() both resolve inside DEFINE
 statement ok
