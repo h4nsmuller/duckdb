@@ -299,7 +299,8 @@ SELECT count(*), min(len), max(len) FROM rows_abab MATCH_RECOGNIZE(
 ----
 1	4	4
 
-# a quantifier that can only match nothing never produces a match
+# a quantifier that can only match nothing still matches - as an empty match at every row, covering
+# no rows at all, so the aggregate over the match sees nothing
 query III
 SELECT count(*), min(len), max(len) FROM rows_aaa MATCH_RECOGNIZE(
     ORDER BY i MEASURES count(*) AS len
@@ -308,7 +309,7 @@ SELECT count(*), min(len), max(len) FROM rows_aaa MATCH_RECOGNIZE(
     DEFINE A AS A.c = 'a', B AS B.c = 'b', C AS C.c = 'c', D AS D.c = 'd'
 )
 ----
-0	NULL	NULL
+3	0	0
 
 query III
 SELECT count(*), min(len), max(len) FROM rows_a MATCH_RECOGNIZE(
@@ -360,3 +361,42 @@ SELECT count(*), min(len), max(len) FROM rows_ab MATCH_RECOGNIZE(
 )
 ----
 1	2	2
+
+# An empty match covers no rows. It is still a match: it is numbered, it is reported once per row it
+# happens at, and every measure over it sees nothing - count is zero and CLASSIFIER() is NULL,
+# because no row was ever assigned to a variable.
+query III
+SELECT match_no, len, var_name FROM rows_aaa MATCH_RECOGNIZE(
+    ORDER BY i MEASURES MATCH_NUMBER() AS match_no, count(*) AS len, CLASSIFIER() AS var_name
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (B*)
+    DEFINE B AS B.c = 'b'
+) ORDER BY match_no
+----
+1	0	NULL
+2	0	NULL
+3	0	NULL
+
+# where the pattern can match rows it does, and only the rows it cannot reach are empty matches
+query III
+SELECT match_no, len, var_name FROM rows_aab MATCH_RECOGNIZE(
+    ORDER BY i MEASURES MATCH_NUMBER() AS match_no, count(*) AS len, CLASSIFIER() AS var_name
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (B*)
+    DEFINE B AS B.c = 'b'
+) ORDER BY match_no
+----
+1	0	NULL
+2	0	NULL
+3	1	B
+
+# an empty match does not stop the scan: it steps to the next row rather than skipping
+query I
+SELECT count(*) FROM rows_aaaaa MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS len
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (B{0,3})
+    DEFINE B AS B.c = 'b'
+)
+----
+5

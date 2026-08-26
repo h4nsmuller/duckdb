@@ -2,6 +2,7 @@
 #include "duckdb/function/match_recognize.hpp"
 
 #include "duckdb/parser/expression/case_expression.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -344,6 +345,15 @@ static void RewriteMeasure(Binder &binder, unique_ptr<ParsedExpression> &expr, c
 			                                          qualified.Name().GetIdentifierName());
 			window->GetArgumentsMutable() = std::move(function.GetArgumentsMutable());
 			window->DistinctMutable() = function.Distinct();
+			// an empty match covers no rows, so the row carrying it must not reach the aggregate
+			auto in_match = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT,
+			                                              CreateStructExtract("__pattern_window", "is_empty"));
+			if (function.FilterMutable()) {
+				window->FilterMutable() = make_uniq<ConjunctionExpression>(
+				    ExpressionType::CONJUNCTION_AND, std::move(function.FilterMutable()), std::move(in_match));
+			} else {
+				window->FilterMutable() = std::move(in_match);
+			}
 			ScopeToMatch(*window, config, running);
 			expr = std::move(window);
 			return;

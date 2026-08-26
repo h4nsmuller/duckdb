@@ -17,7 +17,15 @@
 namespace duckdb {
 
 //	Column indexes into the result struct
-enum MatchRecognizeResult : idx_t { CLASSIFIER = 0, MATCH_NUMBER, IS_MATCH_START, MATCH_START, MATCH_END, IS_EXCLUDED };
+enum MatchRecognizeResult : idx_t {
+	CLASSIFIER = 0,
+	MATCH_NUMBER,
+	IS_MATCH_START,
+	MATCH_START,
+	MATCH_END,
+	IS_EXCLUDED,
+	IS_EMPTY
+};
 
 //	MATCH_NUMBER() is the first field of the packed column struct
 static constexpr idx_t MATCH_NUMBER_FIELD = 0;
@@ -45,6 +53,8 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 		idx_t match_start;
 		idx_t match_end;
 		bool excluded;
+		//! An empty match covers no rows at all; this span only marks where it happened
+		bool empty;
 	};
 
 	//! Build the list vector the operator reads from the spans collected during matching
@@ -64,12 +74,14 @@ struct WindowMatchRecognizeGlobalState : WindowExecutorGlobalState {
 			list_data[row].offset = offset;
 			list_data[row].length = spans[row].size();
 			for (auto &span : spans[row]) {
-				fields[CLASSIFIER].SetValue(offset, Value(MatchRecognizeSymbolName(symbols[span.symbol])));
+				fields[CLASSIFIER].SetValue(offset, span.empty ? Value(LogicalType::VARCHAR)
+				                                               : Value(MatchRecognizeSymbolName(symbols[span.symbol])));
 				fields[MATCH_NUMBER].SetValue(offset, Value::UBIGINT(span.match_number));
 				fields[IS_MATCH_START].SetValue(offset, Value::BOOLEAN(span.is_match_start));
 				fields[MATCH_START].SetValue(offset, Value::UBIGINT(span.match_start));
 				fields[MATCH_END].SetValue(offset, Value::UBIGINT(span.match_end));
 				fields[IS_EXCLUDED].SetValue(offset, Value::BOOLEAN(span.excluded));
+				fields[IS_EMPTY].SetValue(offset, Value::BOOLEAN(span.empty));
 				offset++;
 			}
 		}
@@ -104,7 +116,8 @@ LogicalType WindowMatchRecognizeExecutor::ResultType() {
 	                                              {"is_match_start", LogicalType::BOOLEAN},
 	                                              {"match_start", LogicalType::UBIGINT},
 	                                              {"match_end", LogicalType::UBIGINT},
-	                                              {"is_excluded", LogicalType::BOOLEAN}}));
+	                                              {"is_excluded", LogicalType::BOOLEAN},
+	                                              {"is_empty", LogicalType::BOOLEAN}}));
 }
 
 //===--------------------------------------------------------------------===//
@@ -873,8 +886,17 @@ static void ScanPartitions(ExecutionContext &context, WindowMatchRecognizeGlobal
 		auto row = partition_start;
 		while (row <= partition_end) {
 			row_conditions.BeginMatch(row, match_number + 1);
-			// a zero length match would never advance the scan
-			if (!matcher.Match(row, partition_end + 1) || matcher.match_end <= row) {
+			if (!matcher.Match(row, partition_end + 1)) {
+				row++;
+				continue;
+			}
+			// a pattern that can match nothing produces an empty match, which covers no rows. It is
+			// still a match and still reported, but the span only marks where it happened, and the
+			// scan has to step past it rather than skip, or it would never move.
+			if (matcher.match_end <= row) {
+				match_number++;
+				gstate.spans[row].push_back(
+				    WindowMatchRecognizeGlobalState::Span {0, match_number, true, row, row, false, true});
 				row++;
 				continue;
 			}
@@ -885,7 +907,7 @@ static void ScanPartitions(ExecutionContext &context, WindowMatchRecognizeGlobal
 			for (idx_t match_row = row; match_row <= match_end; match_row++) {
 				gstate.spans[match_row].push_back(
 				    WindowMatchRecognizeGlobalState::Span {classifiers[match_row], match_number, match_row == row, row,
-				                                           match_end, gstate.excluded_rows[match_row] != 0});
+				                                           match_end, gstate.excluded_rows[match_row] != 0, false});
 			}
 			row = SkipTo(config, row_conditions.SkipSymbol(), row, match_end, classifiers);
 		}
