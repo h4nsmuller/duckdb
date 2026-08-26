@@ -6,12 +6,13 @@
 # Huang and Chaudhuri, "High-Performance Row Pattern Recognition Using Joins", PVLDB 16(5), 2023,
 # cut at that paper's June 2020 boundary and projected to the columns its queries read.
 
+require httpfs
+
 name MatchRecognize Crime Repeats
 group micro
 subgroup match_recognize
 
 load
-LOAD httpfs;
 CREATE TABLE crimes AS SELECT * FROM read_parquet('http://blobs.duckdb.org/data/crimes.parquet');
 
 run

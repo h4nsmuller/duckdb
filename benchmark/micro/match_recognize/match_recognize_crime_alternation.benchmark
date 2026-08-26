@@ -9,12 +9,13 @@
 # Every condition here reads only the report it is testing, so the matcher can reuse the states it
 # has walked and the whole table is within reach, unlike the query in crime_sequence.
 
+require httpfs
+
 name MatchRecognize Crime Alternation
 group micro
 subgroup match_recognize
 
 load
-LOAD httpfs;
 CREATE TABLE crimes AS SELECT * FROM read_parquet('http://blobs.duckdb.org/data/crimes.parquet');
 
 run
