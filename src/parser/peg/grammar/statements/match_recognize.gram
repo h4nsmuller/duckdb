@@ -1,5 +1,14 @@
 TableMatchRecognizeClause <- 'MATCH_RECOGNIZE' Parens(MatchRecognizeBody) TableAlias?
-MatchRecognizeBody <- WindowPartition? OrderByClause? MeasuresClause RowsPerMatch? AfterMatchSkip? PatternClause SubsetClause? DefineClause
+MatchRecognizeBody <- MatchRecognizeClause+
+MatchRecognizeClause <- MRPartition / MROrderBy / MRMeasures / MRRows / MRSkip / MRPattern / MRSubset / MRDefine
+MRPartition <- WindowPartition
+MROrderBy <- OrderByClause
+MRMeasures <- MeasuresClause
+MRRows <- RowsPerMatch
+MRSkip <- AfterMatchSkip
+MRPattern <- PatternClause
+MRSubset <- SubsetClause
+MRDefine <- DefineClause
 
 MeasuresClause <- 'MEASURES' List(MeasuresElement)
 MeasuresElement <- MeasureSemantics? Expression 'AS' ColLabelOrString

@@ -2,6 +2,7 @@
 #include "duckdb/function/match_recognize.hpp"
 
 #include "duckdb/parser/expression/case_expression.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -63,11 +64,37 @@ BindResult ExpressionBinder::BindPatternExpression(unique_ptr<ParsedExpression> 
 	}
 }
 
+//! Inside a DEFINE, naming another pattern variable means its value on the last row matched to it
+//! so far. That is what LAST() means, so the reference becomes one and is resolved by the same
+//! machinery. A reference already inside a navigation function is left alone.
+static void NavigateOtherSymbols(unique_ptr<ParsedExpression> &expr, const string &define_name,
+                                 const case_insensitive_set_t &symbols) {
+	if (expr->GetExpressionType() == ExpressionType::FUNCTION) {
+		auto name = StringUtil::Upper(expr->Cast<FunctionExpression>().FunctionName().GetIdentifierName());
+		if (name == "FIRST" || name == "LAST") {
+			return;
+		}
+	}
+	if (expr->GetExpressionType() == ExpressionType::COLUMN_REF) {
+		auto &colref = expr->Cast<ColumnRefExpression>();
+		auto &names = colref.ColumnNames();
+		if (names.size() == 2 && !StringUtil::CIEquals(names[0].GetIdentifierName(), define_name) &&
+		    symbols.find(names[0].GetIdentifierName()) != symbols.end()) {
+			vector<unique_ptr<ParsedExpression>> children;
+			children.push_back(std::move(expr));
+			expr = make_uniq<FunctionExpression>("LAST", std::move(children));
+		}
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expr, [&](unique_ptr<ParsedExpression> &child) { NavigateOtherSymbols(child, define_name, symbols); });
+}
+
 static void CheckAndZapQualifiers(ParsedExpression &root_expr, const string &define_name) {
 	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(root_expr, [&](ColumnRefExpression &colref) {
 		if (colref.IsQualified() && colref.ColumnNames()[0] != define_name) {
-			throw NotImplementedException("Define references cannot refer to other defines just yet %s <> %s",
-			                              colref.ColumnNames()[0].GetIdentifierName(), define_name);
+			throw BinderException("\"%s\" in the definition of %s is not a pattern variable or a column of the input",
+			                      colref.ColumnNames()[0].GetIdentifierName(), define_name);
 		}
 		colref.ColumnNamesMutable() = {colref.GetColumnName()};
 	});
@@ -344,6 +371,15 @@ static void RewriteMeasure(Binder &binder, unique_ptr<ParsedExpression> &expr, c
 			                                          qualified.Name().GetIdentifierName());
 			window->GetArgumentsMutable() = std::move(function.GetArgumentsMutable());
 			window->DistinctMutable() = function.Distinct();
+			// an empty match covers no rows, so the row carrying it must not reach the aggregate
+			auto in_match = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT,
+			                                              CreateStructExtract("__pattern_window", "is_empty"));
+			if (function.FilterMutable()) {
+				window->FilterMutable() = make_uniq<ConjunctionExpression>(
+				    ExpressionType::CONJUNCTION_AND, std::move(function.FilterMutable()), std::move(in_match));
+			} else {
+				window->FilterMutable() = std::move(in_match);
+			}
 			ScopeToMatch(*window, config, running);
 			expr = std::move(window);
 			return;
@@ -461,6 +497,9 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 		D_ASSERT(!define_name.empty());
 		D_ASSERT(pattern_symbols.find(define_name) == pattern_symbols.end());
 
+		// a reference to another variable is navigation over that variable's rows, so it has to
+		// become one before the navigation is pulled out
+		NavigateOtherSymbols(expr, define_name, declared_symbols);
 		// logical navigation is resolved by the matcher, so it leaves before qualifiers are checked
 		ExtractNavigation(expr, *define_select_node, declared_symbols, navigations);
 		CheckAndZapQualifiers(*expr, define_name);

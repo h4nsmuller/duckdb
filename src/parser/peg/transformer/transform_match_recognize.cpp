@@ -11,37 +11,148 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 // MATCH_RECOGNIZE clause
 //===--------------------------------------------------------------------===//
-unique_ptr<TableRef> PEGTransformerFactory::TransformMatchRecognizeBody(
-    PEGTransformer &transformer, optional<vector<unique_ptr<ParsedExpression>>> window_partition,
-    optional<vector<OrderByNode>> order_by_clause, vector<unique_ptr<ParsedExpression>> measures_clause,
-    optional<MatchRecognizeRows> rows_per_match, optional<MatchRecognizeAfterMatchClause> after_match_skip,
-    unique_ptr<ParsedExpression> pattern_clause, optional<vector<MatchRecognizeSubset>> subset_clause,
-    vector<unique_ptr<ParsedExpression>> define_clause) {
+namespace {
+
+MatchRecognizeClause MakeClause(MatchRecognizeClause::Kind kind) {
+	MatchRecognizeClause result;
+	result.kind = kind;
+	return result;
+}
+
+const char *ClauseName(MatchRecognizeClause::Kind kind) {
+	switch (kind) {
+	case MatchRecognizeClause::Kind::PARTITION:
+		return "PARTITION BY";
+	case MatchRecognizeClause::Kind::ORDER_BY:
+		return "ORDER BY";
+	case MatchRecognizeClause::Kind::MEASURES:
+		return "MEASURES";
+	case MatchRecognizeClause::Kind::ROWS:
+		return "ROWS PER MATCH";
+	case MatchRecognizeClause::Kind::SKIP:
+		return "AFTER MATCH SKIP";
+	case MatchRecognizeClause::Kind::PATTERN:
+		return "PATTERN";
+	case MatchRecognizeClause::Kind::SUBSET:
+		return "SUBSET";
+	default:
+		return "DEFINE";
+	}
+}
+
+} // namespace
+
+MatchRecognizeClause
+PEGTransformerFactory::TransformMRPartition(PEGTransformer &transformer,
+                                            vector<unique_ptr<ParsedExpression>> window_partition) {
+	auto result = MakeClause(MatchRecognizeClause::Kind::PARTITION);
+	result.expressions = std::move(window_partition);
+	return result;
+}
+
+MatchRecognizeClause PEGTransformerFactory::TransformMROrderBy(PEGTransformer &transformer,
+                                                               vector<OrderByNode> order_by_clause) {
+	auto result = MakeClause(MatchRecognizeClause::Kind::ORDER_BY);
+	result.order_by = std::move(order_by_clause);
+	return result;
+}
+
+MatchRecognizeClause PEGTransformerFactory::TransformMRMeasures(PEGTransformer &transformer,
+                                                                vector<unique_ptr<ParsedExpression>> measures_clause) {
+	auto result = MakeClause(MatchRecognizeClause::Kind::MEASURES);
+	result.expressions = std::move(measures_clause);
+	return result;
+}
+
+MatchRecognizeClause PEGTransformerFactory::TransformMRRows(PEGTransformer &transformer,
+                                                            const MatchRecognizeRows &rows_per_match) {
+	auto result = MakeClause(MatchRecognizeClause::Kind::ROWS);
+	result.rows = rows_per_match;
+	return result;
+}
+
+MatchRecognizeClause PEGTransformerFactory::TransformMRSkip(PEGTransformer &transformer,
+                                                            MatchRecognizeAfterMatchClause after_match_skip) {
+	auto result = MakeClause(MatchRecognizeClause::Kind::SKIP);
+	result.skip = std::move(after_match_skip);
+	return result;
+}
+
+MatchRecognizeClause PEGTransformerFactory::TransformMRPattern(PEGTransformer &transformer,
+                                                               unique_ptr<ParsedExpression> pattern_clause) {
+	auto result = MakeClause(MatchRecognizeClause::Kind::PATTERN);
+	result.pattern = std::move(pattern_clause);
+	return result;
+}
+
+MatchRecognizeClause PEGTransformerFactory::TransformMRSubset(PEGTransformer &transformer,
+                                                              vector<MatchRecognizeSubset> subset_clause) {
+	auto result = MakeClause(MatchRecognizeClause::Kind::SUBSET);
+	result.subsets = std::move(subset_clause);
+	return result;
+}
+
+MatchRecognizeClause PEGTransformerFactory::TransformMRDefine(PEGTransformer &transformer,
+                                                              vector<unique_ptr<ParsedExpression>> define_clause) {
+	auto result = MakeClause(MatchRecognizeClause::Kind::DEFINE);
+	result.expressions = std::move(define_clause);
+	return result;
+}
+
+//! The clauses may arrive in any order, so which one is which is settled here rather than by the
+//! shape of the grammar. That also lets a repeated or missing clause be named in the error.
+unique_ptr<TableRef>
+PEGTransformerFactory::TransformMatchRecognizeBody(PEGTransformer &transformer,
+                                                   vector<MatchRecognizeClause> match_recognize_clause) {
 	auto config = make_uniq<MatchRecognizeConfig>();
+	config->rows_per_match = MatchRecognizeRows::MATCH_RECOGNIZE_ROWS_DEFAULT;
+	config->after_match = MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_DEFAULT;
 
-	if (window_partition) {
-		config->partition_expressions = std::move(*window_partition);
-	}
-	if (order_by_clause) {
-		config->order_by_expressions = std::move(*order_by_clause);
-	}
-	config->measures_expression_list = std::move(measures_clause);
-	config->defines_expression_list = std::move(define_clause);
-
-	config->rows_per_match = rows_per_match ? *rows_per_match : MatchRecognizeRows::MATCH_RECOGNIZE_ROWS_DEFAULT;
-
-	if (after_match_skip) {
-		config->after_match = after_match_skip->after_match;
-		if (!after_match_skip->variable.empty()) {
-			config->after_match_variable = make_uniq<ConstantExpression>(Value(after_match_skip->variable));
+	bool seen[8] = {false, false, false, false, false, false, false, false};
+	for (auto &clause : match_recognize_clause) {
+		auto index = static_cast<idx_t>(clause.kind);
+		if (seen[index]) {
+			throw ParserException("MATCH_RECOGNIZE has more than one %s clause", ClauseName(clause.kind));
 		}
-	} else {
-		config->after_match = MatchRecognizeAfterMatch::MATCH_RECOGNIZE_AFTER_MATCH_DEFAULT;
+		seen[index] = true;
+		switch (clause.kind) {
+		case MatchRecognizeClause::Kind::PARTITION:
+			config->partition_expressions = std::move(clause.expressions);
+			break;
+		case MatchRecognizeClause::Kind::ORDER_BY:
+			config->order_by_expressions = std::move(clause.order_by);
+			break;
+		case MatchRecognizeClause::Kind::MEASURES:
+			config->measures_expression_list = std::move(clause.expressions);
+			break;
+		case MatchRecognizeClause::Kind::ROWS:
+			config->rows_per_match = clause.rows;
+			break;
+		case MatchRecognizeClause::Kind::SKIP:
+			config->after_match = clause.skip.after_match;
+			if (!clause.skip.variable.empty()) {
+				config->after_match_variable = make_uniq<ConstantExpression>(Value(clause.skip.variable));
+			}
+			break;
+		case MatchRecognizeClause::Kind::PATTERN:
+			config->pattern = std::move(clause.pattern);
+			break;
+		case MatchRecognizeClause::Kind::SUBSET:
+			config->subsets = std::move(clause.subsets);
+			break;
+		default:
+			config->defines_expression_list = std::move(clause.expressions);
+			break;
+		}
 	}
-
-	config->pattern = std::move(pattern_clause);
-	if (subset_clause) {
-		config->subsets = std::move(*subset_clause);
+	if (!seen[static_cast<idx_t>(MatchRecognizeClause::Kind::MEASURES)]) {
+		throw ParserException("MATCH_RECOGNIZE requires a MEASURES clause");
+	}
+	if (!seen[static_cast<idx_t>(MatchRecognizeClause::Kind::PATTERN)]) {
+		throw ParserException("MATCH_RECOGNIZE requires a PATTERN clause");
+	}
+	if (!seen[static_cast<idx_t>(MatchRecognizeClause::Kind::DEFINE)]) {
+		throw ParserException("MATCH_RECOGNIZE requires a DEFINE clause");
 	}
 
 	// the input table is attached by TransformTableRef
@@ -66,7 +177,7 @@ bool PEGTransformerFactory::TransformFinalSemantics(PEGTransformer &transformer)
 }
 
 unique_ptr<ParsedExpression> PEGTransformerFactory::TransformMeasuresElement(PEGTransformer &transformer,
-                                                                             optional<bool> measure_semantics,
+                                                                             const optional<bool> &measure_semantics,
                                                                              unique_ptr<ParsedExpression> expression,
                                                                              const Identifier &col_label_or_string) {
 	if (measure_semantics) {

@@ -1588,6 +1588,20 @@ BinaryExpressionTail:
 # category with other rules. Typically pair<>, map<>, or one-off structs.
 # ---------------------------------------------------------------------------
 
+MatchRecognizeClauseEntry:
+  type: "MatchRecognizeClause"
+  by_value: true
+  rules:
+    - MatchRecognizeClause
+    - MRPartition
+    - MROrderBy
+    - MRMeasures
+    - MRRows
+    - MRSkip
+    - MRPattern
+    - MRSubset
+    - MRDefine
+
 MatchRecognizeSubset:
   type: "MatchRecognizeSubset"
   by_value: true
@@ -1602,7 +1616,6 @@ MatchRecognizeSubsetList:
 
 MeasureSemantics:
   type: "bool"
-  by_value: true
   rules:
     - MeasureSemantics
     - RunningSemantics
@@ -1610,7 +1623,6 @@ MeasureSemantics:
 
 MatchRecognizeRows:
   type: "MatchRecognizeRows"
-  by_value: true
   rules:
     - RowsPerMatch
     - OneRowPerMatch

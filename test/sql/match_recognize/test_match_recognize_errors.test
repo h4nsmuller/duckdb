@@ -26,17 +26,17 @@ SELECT 1 FROM q MATCH_RECOGNIZE(MEASURES i AS x PATTERN (A+ B* A{2,1}) DEFINE A 
 statement error
 SELECT 1 FROM q MATCH_RECOGNIZE(PATTERN (A) DEFINE A as true)
 ----
-<REGEX>:Parser Error.*syntax error.*
+<REGEX>:Parser Error.*requires a MEASURES clause.*
 
 statement error
 SELECT 1 FROM q MATCH_RECOGNIZE(MEASURES i AS x DEFINE A as true)
 ----
-<REGEX>:Parser Error.*syntax error.*
+<REGEX>:Parser Error.*requires a PATTERN clause.*
 
 statement error
 SELECT 1 FROM q MATCH_RECOGNIZE(MEASURES i AS x PATTERN (A))
 ----
-<REGEX>:Parser Error.*syntax error.*
+<REGEX>:Parser Error.*requires a DEFINE clause.*
 
 # the pattern may not be empty
 statement error
@@ -68,11 +68,12 @@ SELECT 1 FROM q MATCH_RECOGNIZE(MEASURES i AS x PATTERN (A) DEFINE A as nosuchco
 ----
 <REGEX>:Binder Error.*nosuchcol.*
 
-# not implemented yet: navigating between pattern variables
-statement error
-SELECT 1 FROM q MATCH_RECOGNIZE(MEASURES i AS x PATTERN (A B) DEFINE A as B.i > 0, B as true)
+# naming a variable that the match has not reached yet reads nothing, so the condition is never
+# true and the pattern cannot match
+query I
+SELECT count(*) FROM q MATCH_RECOGNIZE(MEASURES i AS x PATTERN (A B) DEFINE A as B.i > 0, B as true)
 ----
-<REGEX>:Not implemented Error.*Define references cannot refer to other defines.*
+0
 
 # CLASSIFIER() and MATCH_NUMBER() both resolve inside DEFINE
 statement ok
@@ -152,3 +153,21 @@ SELECT 1 FROM q MATCH_RECOGNIZE(
 )
 ----
 <REGEX>:Binder Error:.*exclusion syntax \{- -\} requires ALL ROWS PER MATCH.*
+
+# the clauses may be written in any order, and each may appear only once
+query I
+SELECT count(*) FROM q MATCH_RECOGNIZE(
+    DEFINE A as true PATTERN (A) ONE ROW PER MATCH MEASURES count(*) AS n ORDER BY i
+)
+----
+2
+
+statement error
+SELECT 1 FROM q MATCH_RECOGNIZE(MEASURES i AS x PATTERN (A) MEASURES j AS y DEFINE A as true)
+----
+<REGEX>:Parser Error.*more than one MEASURES clause.*
+
+statement error
+SELECT 1 FROM q MATCH_RECOGNIZE(MEASURES i AS x PATTERN (A) PATTERN (A) DEFINE A as true)
+----
+<REGEX>:Parser Error.*more than one PATTERN clause.*
