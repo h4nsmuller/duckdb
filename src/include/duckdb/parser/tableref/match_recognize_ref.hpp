@@ -49,6 +49,21 @@ struct MatchRecognizeSubset {
 	vector<string> members;
 };
 
+//! One clause of a MATCH_RECOGNIZE body. The clauses may be written in any order, so the parser
+//! collects them and the transformer sorts out which is which.
+struct MatchRecognizeClause {
+	enum class Kind : uint8_t { PARTITION, ORDER_BY, MEASURES, ROWS, SKIP, PATTERN, SUBSET, DEFINE };
+
+	Kind kind = Kind::PATTERN;
+	//! PARTITION, MEASURES and DEFINE
+	vector<unique_ptr<ParsedExpression>> expressions;
+	vector<OrderByNode> order_by;
+	vector<MatchRecognizeSubset> subsets;
+	MatchRecognizeRows rows = MatchRecognizeRows::MATCH_RECOGNIZE_ROWS_DEFAULT;
+	MatchRecognizeAfterMatchClause skip;
+	unique_ptr<ParsedExpression> pattern;
+};
+
 struct MatchRecognizeConfig {
 	vector<unique_ptr<ParsedExpression>> partition_expressions;
 	vector<OrderByNode> order_by_expressions;

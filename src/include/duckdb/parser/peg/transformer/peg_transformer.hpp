@@ -3658,6 +3658,43 @@ public:
 	static unique_ptr<TransformResultValue> FinalizeMatchRecognizeBodyTrampoline(PEGTransformer &transformer,
 	                                                                             TransformStack &stack,
 	                                                                             TransformStackFrame &frame);
+	static void InitializeMatchRecognizeClauseTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                                     TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue> FinalizeMatchRecognizeClauseTrampoline(PEGTransformer &transformer,
+	                                                                               TransformStack &stack,
+	                                                                               TransformStackFrame &frame);
+	static void InitializeMRPartitionTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                            TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue>
+	FinalizeMRPartitionTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
+	static void InitializeMROrderByTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                          TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue>
+	FinalizeMROrderByTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
+	static void InitializeMRMeasuresTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                           TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue>
+	FinalizeMRMeasuresTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
+	static void InitializeMRRowsTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                       TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue> FinalizeMRRowsTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                                                 TransformStackFrame &frame);
+	static void InitializeMRSkipTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                       TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue> FinalizeMRSkipTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                                                 TransformStackFrame &frame);
+	static void InitializeMRPatternTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                          TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue>
+	FinalizeMRPatternTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
+	static void InitializeMRSubsetTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                         TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue>
+	FinalizeMRSubsetTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
+	static void InitializeMRDefineTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                         TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue>
+	FinalizeMRDefineTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
 	static void InitializeMeasuresClauseTrampoline(PEGTransformer &transformer, TransformStack &stack,
 	                                               TransformStackFrame &frame);
 	static unique_ptr<TransformResultValue>
@@ -7702,12 +7739,40 @@ public:
 	                                                               const optional<TableAlias> &table_alias);
 	static unique_ptr<TransformResultValue> TransformMatchRecognizeBodyInternal(PEGTransformer &transformer,
 	                                                                            ParseResult &parse_result);
-	static unique_ptr<TableRef> TransformMatchRecognizeBody(
-	    PEGTransformer &transformer, optional<vector<unique_ptr<ParsedExpression>>> window_partition,
-	    optional<vector<OrderByNode>> order_by_clause, vector<unique_ptr<ParsedExpression>> measures_clause,
-	    const optional<MatchRecognizeRows> &rows_per_match, optional<MatchRecognizeAfterMatchClause> after_match_skip,
-	    unique_ptr<ParsedExpression> pattern_clause, optional<vector<MatchRecognizeSubset>> subset_clause,
-	    vector<unique_ptr<ParsedExpression>> define_clause);
+	static unique_ptr<TableRef> TransformMatchRecognizeBody(PEGTransformer &transformer,
+	                                                        vector<MatchRecognizeClause> match_recognize_clause);
+	static unique_ptr<TransformResultValue> TransformMatchRecognizeClauseInternal(PEGTransformer &transformer,
+	                                                                              ParseResult &parse_result);
+	static unique_ptr<TransformResultValue> TransformMRPartitionInternal(PEGTransformer &transformer,
+	                                                                     ParseResult &parse_result);
+	static MatchRecognizeClause TransformMRPartition(PEGTransformer &transformer,
+	                                                 vector<unique_ptr<ParsedExpression>> window_partition);
+	static unique_ptr<TransformResultValue> TransformMROrderByInternal(PEGTransformer &transformer,
+	                                                                   ParseResult &parse_result);
+	static MatchRecognizeClause TransformMROrderBy(PEGTransformer &transformer, vector<OrderByNode> order_by_clause);
+	static unique_ptr<TransformResultValue> TransformMRMeasuresInternal(PEGTransformer &transformer,
+	                                                                    ParseResult &parse_result);
+	static MatchRecognizeClause TransformMRMeasures(PEGTransformer &transformer,
+	                                                vector<unique_ptr<ParsedExpression>> measures_clause);
+	static unique_ptr<TransformResultValue> TransformMRRowsInternal(PEGTransformer &transformer,
+	                                                                ParseResult &parse_result);
+	static MatchRecognizeClause TransformMRRows(PEGTransformer &transformer, const MatchRecognizeRows &rows_per_match);
+	static unique_ptr<TransformResultValue> TransformMRSkipInternal(PEGTransformer &transformer,
+	                                                                ParseResult &parse_result);
+	static MatchRecognizeClause TransformMRSkip(PEGTransformer &transformer,
+	                                            MatchRecognizeAfterMatchClause after_match_skip);
+	static unique_ptr<TransformResultValue> TransformMRPatternInternal(PEGTransformer &transformer,
+	                                                                   ParseResult &parse_result);
+	static MatchRecognizeClause TransformMRPattern(PEGTransformer &transformer,
+	                                               unique_ptr<ParsedExpression> pattern_clause);
+	static unique_ptr<TransformResultValue> TransformMRSubsetInternal(PEGTransformer &transformer,
+	                                                                  ParseResult &parse_result);
+	static MatchRecognizeClause TransformMRSubset(PEGTransformer &transformer,
+	                                              vector<MatchRecognizeSubset> subset_clause);
+	static unique_ptr<TransformResultValue> TransformMRDefineInternal(PEGTransformer &transformer,
+	                                                                  ParseResult &parse_result);
+	static MatchRecognizeClause TransformMRDefine(PEGTransformer &transformer,
+	                                              vector<unique_ptr<ParsedExpression>> define_clause);
 	static unique_ptr<TransformResultValue> TransformMeasuresClauseInternal(PEGTransformer &transformer,
 	                                                                        ParseResult &parse_result);
 	static vector<unique_ptr<ParsedExpression>>
