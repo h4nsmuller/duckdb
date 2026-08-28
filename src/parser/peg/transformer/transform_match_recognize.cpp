@@ -145,14 +145,10 @@ PEGTransformerFactory::TransformMatchRecognizeBody(PEGTransformer &transformer,
 			break;
 		}
 	}
-	if (!seen[static_cast<idx_t>(MatchRecognizeClause::Kind::MEASURES)]) {
-		throw ParserException("MATCH_RECOGNIZE requires a MEASURES clause");
-	}
+	// only the pattern is required. A variable with no condition matches any row, so leaving out
+	// DEFINE asks for the pattern's shape alone, and leaving out MEASURES reports the rows themselves.
 	if (!seen[static_cast<idx_t>(MatchRecognizeClause::Kind::PATTERN)]) {
 		throw ParserException("MATCH_RECOGNIZE requires a PATTERN clause");
-	}
-	if (!seen[static_cast<idx_t>(MatchRecognizeClause::Kind::DEFINE)]) {
-		throw ParserException("MATCH_RECOGNIZE requires a DEFINE clause");
 	}
 
 	// the input table is attached by TransformTableRef
