@@ -1600,6 +1600,7 @@ MatchRecognizeClauseEntry:
     - MRSkip
     - MRPattern
     - MRSubset
+    - MRDefineAuto
     - MRDefine
 
 MatchRecognizeSubset:

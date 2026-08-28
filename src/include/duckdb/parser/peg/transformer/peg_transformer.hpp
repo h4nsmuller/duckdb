@@ -3691,6 +3691,10 @@ public:
 	                                         TransformStackFrame &frame);
 	static unique_ptr<TransformResultValue>
 	FinalizeMRSubsetTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
+	static void InitializeMRDefineAutoTrampoline(PEGTransformer &transformer, TransformStack &stack,
+	                                             TransformStackFrame &frame);
+	static unique_ptr<TransformResultValue>
+	FinalizeMRDefineAutoTrampoline(PEGTransformer &transformer, TransformStack &stack, TransformStackFrame &frame);
 	static void InitializeMRDefineTrampoline(PEGTransformer &transformer, TransformStack &stack,
 	                                         TransformStackFrame &frame);
 	static unique_ptr<TransformResultValue>
@@ -7769,6 +7773,9 @@ public:
 	                                                                  ParseResult &parse_result);
 	static MatchRecognizeClause TransformMRSubset(PEGTransformer &transformer,
 	                                              vector<MatchRecognizeSubset> subset_clause);
+	static unique_ptr<TransformResultValue> TransformMRDefineAutoInternal(PEGTransformer &transformer,
+	                                                                      ParseResult &parse_result);
+	static MatchRecognizeClause TransformMRDefineAuto(PEGTransformer &transformer);
 	static unique_ptr<TransformResultValue> TransformMRDefineInternal(PEGTransformer &transformer,
 	                                                                  ParseResult &parse_result);
 	static MatchRecognizeClause TransformMRDefine(PEGTransformer &transformer,

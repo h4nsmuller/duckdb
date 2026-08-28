@@ -103,6 +103,7 @@ void DuckDBKeywordHelper::InitializeKeywordMaps() { // Renamed for clarity
 	unreserved_keyword_map.insert("assignment");
 	unreserved_keyword_map.insert("attach");
 	unreserved_keyword_map.insert("attribute");
+	unreserved_keyword_map.insert("auto");
 	unreserved_keyword_map.insert("backward");
 	unreserved_keyword_map.insert("before");
 	unreserved_keyword_map.insert("begin");

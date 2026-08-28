@@ -2146,6 +2146,9 @@ static const TransformFrameOps MRPATTERN_OPS = {"MRPattern", &PEGTransformerFact
                                                 &PEGTransformerFactory::FinalizeMRPatternTrampoline};
 static const TransformFrameOps MRSUBSET_OPS = {"MRSubset", &PEGTransformerFactory::InitializeMRSubsetTrampoline,
                                                &PEGTransformerFactory::FinalizeMRSubsetTrampoline};
+static const TransformFrameOps MRDEFINE_AUTO_OPS = {"MRDefineAuto",
+                                                    &PEGTransformerFactory::InitializeMRDefineAutoTrampoline,
+                                                    &PEGTransformerFactory::FinalizeMRDefineAutoTrampoline};
 static const TransformFrameOps MRDEFINE_OPS = {"MRDefine", &PEGTransformerFactory::InitializeMRDefineTrampoline,
                                                &PEGTransformerFactory::FinalizeMRDefineTrampoline};
 static const TransformFrameOps MEASURES_CLAUSE_OPS = {"MeasuresClause",
@@ -3794,6 +3797,7 @@ const case_insensitive_map_t<const TransformFrameOps *> &PEGTransformerFactory::
 	    {"MRSkip", &MRSKIP_OPS},
 	    {"MRPattern", &MRPATTERN_OPS},
 	    {"MRSubset", &MRSUBSET_OPS},
+	    {"MRDefineAuto", &MRDEFINE_AUTO_OPS},
 	    {"MRDefine", &MRDEFINE_OPS},
 	    {"MeasuresClause", &MEASURES_CLAUSE_OPS},
 	    {"MeasuresElement", &MEASURES_ELEMENT_OPS},
@@ -19577,6 +19581,18 @@ unique_ptr<TransformResultValue> PEGTransformerFactory::FinalizeMRSubsetTrampoli
                                                                                    TransformStackFrame &frame) {
 	auto subset_clause = frame.TakeResult<vector<MatchRecognizeSubset>>(0);
 	auto result = TransformMRSubset(transformer, std::move(subset_clause));
+	return make_uniq<TypedTransformResult<MatchRecognizeClause>>(std::move(result));
+}
+
+void PEGTransformerFactory::InitializeMRDefineAutoTrampoline(PEGTransformer &transformer, TransformStack &stack,
+                                                             TransformStackFrame &frame) {
+	frame.ReserveChildSlots(0);
+}
+
+unique_ptr<TransformResultValue> PEGTransformerFactory::FinalizeMRDefineAutoTrampoline(PEGTransformer &transformer,
+                                                                                       TransformStack &stack,
+                                                                                       TransformStackFrame &frame) {
+	auto result = TransformMRDefineAuto(transformer);
 	return make_uniq<TypedTransformResult<MatchRecognizeClause>>(std::move(result));
 }
 

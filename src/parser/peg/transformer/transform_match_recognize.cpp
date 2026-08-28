@@ -92,6 +92,12 @@ MatchRecognizeClause PEGTransformerFactory::TransformMRSubset(PEGTransformer &tr
 	return result;
 }
 
+MatchRecognizeClause PEGTransformerFactory::TransformMRDefineAuto(PEGTransformer &transformer) {
+	auto result = MakeClause(MatchRecognizeClause::Kind::DEFINE);
+	result.define_auto = true;
+	return result;
+}
+
 MatchRecognizeClause PEGTransformerFactory::TransformMRDefine(PEGTransformer &transformer,
                                                               vector<unique_ptr<ParsedExpression>> define_clause) {
 	auto result = MakeClause(MatchRecognizeClause::Kind::DEFINE);
@@ -142,6 +148,7 @@ PEGTransformerFactory::TransformMatchRecognizeBody(PEGTransformer &transformer,
 			break;
 		default:
 			config->defines_expression_list = std::move(clause.expressions);
+			config->define_auto = clause.define_auto;
 			break;
 		}
 	}

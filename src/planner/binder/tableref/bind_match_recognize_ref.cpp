@@ -2,6 +2,7 @@
 #include "duckdb/function/match_recognize.hpp"
 
 #include "duckdb/parser/expression/case_expression.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
@@ -529,7 +530,16 @@ BoundStatement Binder::Bind(MatchRecognizeRef &ref) {
 			    }
 		    }
 		    define_symbols.push_back(column_name);
-		    define_conditions.push_back(make_uniq<ConstantExpression>(Value::BOOLEAN(true)));
+		    if (ref.config->define_auto) {
+			    // the variable stands for the column of the same name being true, or non zero, or
+			    // whatever else that column's type calls true. The symbol carries the internal
+			    // prefix by now, so the column it names is what is left after it.
+			    auto source = column_name.substr(strlen(MATCH_RECOGNIZE_DEFINE_PREFIX));
+			    define_conditions.push_back(make_uniq<CastExpression>(
+			        LogicalType::BOOLEAN, make_uniq<ColumnRefExpression>(Identifier(source))));
+		    } else {
+			    define_conditions.push_back(make_uniq<ConstantExpression>(Value::BOOLEAN(true)));
+		    }
 		    pattern_symbols.insert(MatchRecognizeSymbolName(column_name));
 	    });
 
