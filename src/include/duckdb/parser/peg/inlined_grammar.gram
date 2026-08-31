@@ -403,6 +403,7 @@ UnreservedKeyword <- 'ABORT' /
 'ASSIGNMENT' /
 'ATTACH' /
 'ATTRIBUTE' /
+'AUTO' /
 'BACKWARD' /
 'BEFORE' /
 'BEGIN' /
@@ -1625,7 +1626,7 @@ FromSourceString <- 'FROM' StringLiteral
 VersionNumber <- 'VERSION' IdentifierOrStringLiteral
 TableMatchRecognizeClause <- 'MATCH_RECOGNIZE' Parens(MatchRecognizeBody) TableAlias?
 MatchRecognizeBody <- MatchRecognizeClause+
-MatchRecognizeClause <- MRPartition / MROrderBy / MRMeasures / MRRows / MRSkip / MRPattern / MRSubset / MRDefine
+MatchRecognizeClause <- MRPartition / MROrderBy / MRMeasures / MRRows / MRSkip / MRPattern / MRSubset / MRDefineAuto / MRDefine
 MRPartition <- WindowPartition
 MROrderBy <- OrderByClause
 MRMeasures <- MeasuresClause
@@ -1633,6 +1634,7 @@ MRRows <- RowsPerMatch
 MRSkip <- AfterMatchSkip
 MRPattern <- PatternClause
 MRSubset <- SubsetClause
+MRDefineAuto <- 'DEFINE' 'AUTO'
 MRDefine <- DefineClause
 
 MeasuresClause <- 'MEASURES' List(MeasuresElement)

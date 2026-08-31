@@ -7884,6 +7884,12 @@ unique_ptr<TransformResultValue> PEGTransformerFactory::TransformMRSubsetInterna
 	return make_uniq<TypedTransformResult<MatchRecognizeClause>>(std::move(result));
 }
 
+unique_ptr<TransformResultValue> PEGTransformerFactory::TransformMRDefineAutoInternal(PEGTransformer &transformer,
+                                                                                      ParseResult &parse_result) {
+	auto result = TransformMRDefineAuto(transformer);
+	return make_uniq<TypedTransformResult<MatchRecognizeClause>>(std::move(result));
+}
+
 unique_ptr<TransformResultValue> PEGTransformerFactory::TransformMRDefineInternal(PEGTransformer &transformer,
                                                                                   ParseResult &parse_result) {
 	auto &list_pr = parse_result.Cast<ListParseResult>();
@@ -11978,6 +11984,7 @@ void PEGTransformerFactory::RegisterGenerated() {
 	    {"MRSkip", &PEGTransformerFactory::TransformMRSkipInternal},
 	    {"MRPattern", &PEGTransformerFactory::TransformMRPatternInternal},
 	    {"MRSubset", &PEGTransformerFactory::TransformMRSubsetInternal},
+	    {"MRDefineAuto", &PEGTransformerFactory::TransformMRDefineAutoInternal},
 	    {"MRDefine", &PEGTransformerFactory::TransformMRDefineInternal},
 	    {"MeasuresClause", &PEGTransformerFactory::TransformMeasuresClauseInternal},
 	    {"MeasuresElement", &PEGTransformerFactory::TransformMeasuresElementInternal},

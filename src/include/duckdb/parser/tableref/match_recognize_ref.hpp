@@ -62,6 +62,8 @@ struct MatchRecognizeClause {
 	MatchRecognizeRows rows = MatchRecognizeRows::MATCH_RECOGNIZE_ROWS_DEFAULT;
 	MatchRecognizeAfterMatchClause skip;
 	unique_ptr<ParsedExpression> pattern;
+	//! DEFINE AUTO: take each variable's condition from the column of the same name
+	bool define_auto = false;
 };
 
 struct MatchRecognizeConfig {
@@ -74,6 +76,8 @@ struct MatchRecognizeConfig {
 	unique_ptr<ConstantExpression> after_match_variable;
 	unique_ptr<ParsedExpression> pattern;
 	vector<MatchRecognizeSubset> subsets;
+	//! DEFINE AUTO: take each variable's condition from the column of the same name
+	bool define_auto = false;
 };
 
 //! Represents a SHOW/DESCRIBE/SUMMARIZE statement

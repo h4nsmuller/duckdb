@@ -92,6 +92,12 @@ MatchRecognizeClause PEGTransformerFactory::TransformMRSubset(PEGTransformer &tr
 	return result;
 }
 
+MatchRecognizeClause PEGTransformerFactory::TransformMRDefineAuto(PEGTransformer &transformer) {
+	auto result = MakeClause(MatchRecognizeClause::Kind::DEFINE);
+	result.define_auto = true;
+	return result;
+}
+
 MatchRecognizeClause PEGTransformerFactory::TransformMRDefine(PEGTransformer &transformer,
                                                               vector<unique_ptr<ParsedExpression>> define_clause) {
 	auto result = MakeClause(MatchRecognizeClause::Kind::DEFINE);
@@ -142,17 +148,14 @@ PEGTransformerFactory::TransformMatchRecognizeBody(PEGTransformer &transformer,
 			break;
 		default:
 			config->defines_expression_list = std::move(clause.expressions);
+			config->define_auto = clause.define_auto;
 			break;
 		}
 	}
-	if (!seen[static_cast<idx_t>(MatchRecognizeClause::Kind::MEASURES)]) {
-		throw ParserException("MATCH_RECOGNIZE requires a MEASURES clause");
-	}
+	// only the pattern is required. A variable with no condition matches any row, so leaving out
+	// DEFINE asks for the pattern's shape alone, and leaving out MEASURES reports the rows themselves.
 	if (!seen[static_cast<idx_t>(MatchRecognizeClause::Kind::PATTERN)]) {
 		throw ParserException("MATCH_RECOGNIZE requires a PATTERN clause");
-	}
-	if (!seen[static_cast<idx_t>(MatchRecognizeClause::Kind::DEFINE)]) {
-		throw ParserException("MATCH_RECOGNIZE requires a DEFINE clause");
 	}
 
 	// the input table is attached by TransformTableRef

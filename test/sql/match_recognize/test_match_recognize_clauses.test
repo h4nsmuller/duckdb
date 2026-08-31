@@ -314,3 +314,57 @@ SELECT 1 FROM ticks MATCH_RECOGNIZE(
 )
 ----
 <REGEX>:Binder Error:.*"nosuch" in the definition of B is not a pattern variable.*
+
+# DEFINE AUTO takes each variable's condition from the column of the same name, cast to boolean, so
+# a variable stands for that column being true, or non zero, or whatever else its type calls true.
+
+statement ok
+create table flags(t integer, rising boolean, falling boolean, vol integer, tag varchar);
+
+statement ok
+insert into flags values (1,true,false,3,'true'),(2,true,false,0,'false'),
+                         (3,false,true,7,'true'),(4,false,true,1,'t');
+
+query II
+SELECT match_no, n FROM flags MATCH_RECOGNIZE(
+    ORDER BY t MEASURES MATCH_NUMBER() AS match_no, count(*) AS n
+    ONE ROW PER MATCH PATTERN (rising+ falling+) DEFINE AUTO
+) ORDER BY match_no
+----
+1	4
+
+# a non zero integer is true
+query I
+SELECT t FROM flags MATCH_RECOGNIZE(
+    ORDER BY t ALL ROWS PER MATCH PATTERN (vol+) DEFINE AUTO
+) ORDER BY t
+----
+1
+3
+4
+
+# and a string is whatever casting it to boolean says
+query I
+SELECT t FROM flags MATCH_RECOGNIZE(
+    ORDER BY t ALL ROWS PER MATCH PATTERN (tag+) DEFINE AUTO
+) ORDER BY t
+----
+1
+3
+4
+
+# the clause is order free like the others
+query I
+SELECT count(*) FROM flags MATCH_RECOGNIZE(
+    DEFINE AUTO PATTERN (rising+) ORDER BY t ALL ROWS PER MATCH
+)
+----
+2
+
+# a variable with no column of that name has nothing to stand for
+statement error
+SELECT 1 FROM flags MATCH_RECOGNIZE(
+    ORDER BY t ALL ROWS PER MATCH PATTERN (nosuchcol+) DEFINE AUTO
+)
+----
+<REGEX>:Binder Error:.*nosuchcol.*
