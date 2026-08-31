@@ -560,6 +560,12 @@ else()
   set(DUCKDB_VERSION "v${DUCKDB_MAJOR_VERSION}.${DUCKDB_MINOR_VERSION}.${DUCKDB_PATCH_VERSION}-dev${DUCKDB_DEV_ITERATION}")
 endif()
 
+# the version has to be defined before anything that configures an extension: an extension added
+# earlier than this would compile with these undefined, which the preprocessor reads as zero
+add_definitions(-DDUCKDB_MAJOR_VERSION=${DUCKDB_MAJOR_VERSION})
+add_definitions(-DDUCKDB_MINOR_VERSION=${DUCKDB_MINOR_VERSION})
+add_definitions(-DDUCKDB_PATCH_VERSION=${DUCKDB_PATCH_VERSION})
+
 string(REGEX MATCH ".*dev.*" DUCKDB_EXTENSION_FOLDER_IS_VERSION "${DUCKDB_VERSION}")
 
 if(DUCKDB_EXPLICIT_VERSION)
@@ -1072,9 +1078,6 @@ include(${PROJECT_SOURCE_DIR}/extension/extension_build_tools.cmake)
 include_directories("${PROJECT_BINARY_DIR}/codegen/include/")
 add_extension_definitions()
 add_definitions(-DGENERATED_EXTENSION_HEADERS=1)
-add_definitions(-DDUCKDB_MAJOR_VERSION=${DUCKDB_MAJOR_VERSION})
-add_definitions(-DDUCKDB_MINOR_VERSION=${DUCKDB_MINOR_VERSION})
-add_definitions(-DDUCKDB_PATCH_VERSION=${DUCKDB_PATCH_VERSION})
 
 if(ENABLE_JEMALLOC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT FORCE_32_BIT AND OS_NAME STREQUAL "linux" AND NOT EMSCRIPTEN AND NOT CLANG_TIDY AND NOT ANDROID AND NOT ZOS AND NOT BSD AND NOT ${WASM_ENABLED} AND NOT ${MUSL_ENABLED})
   set(JEMALLOC_ENABLED TRUE)
