@@ -13,27 +13,27 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 namespace {
 
-MatchRecognizeClause MakeClause(MatchRecognizeClause::Kind kind) {
+MatchRecognizeClause MakeClause(MatchRecognizeClauseKind kind) {
 	MatchRecognizeClause result;
 	result.kind = kind;
 	return result;
 }
 
-const char *ClauseName(MatchRecognizeClause::Kind kind) {
+const char *ClauseName(MatchRecognizeClauseKind kind) {
 	switch (kind) {
-	case MatchRecognizeClause::Kind::PARTITION:
+	case MatchRecognizeClauseKind::PARTITION:
 		return "PARTITION BY";
-	case MatchRecognizeClause::Kind::ORDER_BY:
+	case MatchRecognizeClauseKind::ORDER_BY:
 		return "ORDER BY";
-	case MatchRecognizeClause::Kind::MEASURES:
+	case MatchRecognizeClauseKind::MEASURES:
 		return "MEASURES";
-	case MatchRecognizeClause::Kind::ROWS:
+	case MatchRecognizeClauseKind::ROWS:
 		return "ROWS PER MATCH";
-	case MatchRecognizeClause::Kind::SKIP:
+	case MatchRecognizeClauseKind::SKIP:
 		return "AFTER MATCH SKIP";
-	case MatchRecognizeClause::Kind::PATTERN:
+	case MatchRecognizeClauseKind::PATTERN:
 		return "PATTERN";
-	case MatchRecognizeClause::Kind::SUBSET:
+	case MatchRecognizeClauseKind::SUBSET:
 		return "SUBSET";
 	default:
 		return "DEFINE";
@@ -45,62 +45,62 @@ const char *ClauseName(MatchRecognizeClause::Kind kind) {
 MatchRecognizeClause
 PEGTransformerFactory::TransformMRPartition(PEGTransformer &transformer,
                                             vector<unique_ptr<ParsedExpression>> window_partition) {
-	auto result = MakeClause(MatchRecognizeClause::Kind::PARTITION);
+	auto result = MakeClause(MatchRecognizeClauseKind::PARTITION);
 	result.expressions = std::move(window_partition);
 	return result;
 }
 
 MatchRecognizeClause PEGTransformerFactory::TransformMROrderBy(PEGTransformer &transformer,
                                                                vector<OrderByNode> order_by_clause) {
-	auto result = MakeClause(MatchRecognizeClause::Kind::ORDER_BY);
+	auto result = MakeClause(MatchRecognizeClauseKind::ORDER_BY);
 	result.order_by = std::move(order_by_clause);
 	return result;
 }
 
 MatchRecognizeClause PEGTransformerFactory::TransformMRMeasures(PEGTransformer &transformer,
                                                                 vector<unique_ptr<ParsedExpression>> measures_clause) {
-	auto result = MakeClause(MatchRecognizeClause::Kind::MEASURES);
+	auto result = MakeClause(MatchRecognizeClauseKind::MEASURES);
 	result.expressions = std::move(measures_clause);
 	return result;
 }
 
 MatchRecognizeClause PEGTransformerFactory::TransformMRRows(PEGTransformer &transformer,
                                                             const MatchRecognizeRows &rows_per_match) {
-	auto result = MakeClause(MatchRecognizeClause::Kind::ROWS);
+	auto result = MakeClause(MatchRecognizeClauseKind::ROWS);
 	result.rows = rows_per_match;
 	return result;
 }
 
 MatchRecognizeClause PEGTransformerFactory::TransformMRSkip(PEGTransformer &transformer,
                                                             MatchRecognizeAfterMatchClause after_match_skip) {
-	auto result = MakeClause(MatchRecognizeClause::Kind::SKIP);
+	auto result = MakeClause(MatchRecognizeClauseKind::SKIP);
 	result.skip = std::move(after_match_skip);
 	return result;
 }
 
 MatchRecognizeClause PEGTransformerFactory::TransformMRPattern(PEGTransformer &transformer,
                                                                unique_ptr<ParsedExpression> pattern_clause) {
-	auto result = MakeClause(MatchRecognizeClause::Kind::PATTERN);
+	auto result = MakeClause(MatchRecognizeClauseKind::PATTERN);
 	result.pattern = std::move(pattern_clause);
 	return result;
 }
 
 MatchRecognizeClause PEGTransformerFactory::TransformMRSubset(PEGTransformer &transformer,
                                                               vector<MatchRecognizeSubset> subset_clause) {
-	auto result = MakeClause(MatchRecognizeClause::Kind::SUBSET);
+	auto result = MakeClause(MatchRecognizeClauseKind::SUBSET);
 	result.subsets = std::move(subset_clause);
 	return result;
 }
 
 MatchRecognizeClause PEGTransformerFactory::TransformMRDefineAuto(PEGTransformer &transformer) {
-	auto result = MakeClause(MatchRecognizeClause::Kind::DEFINE);
+	auto result = MakeClause(MatchRecognizeClauseKind::DEFINE);
 	result.define_auto = true;
 	return result;
 }
 
 MatchRecognizeClause PEGTransformerFactory::TransformMRDefine(PEGTransformer &transformer,
                                                               vector<unique_ptr<ParsedExpression>> define_clause) {
-	auto result = MakeClause(MatchRecognizeClause::Kind::DEFINE);
+	auto result = MakeClause(MatchRecognizeClauseKind::DEFINE);
 	result.expressions = std::move(define_clause);
 	return result;
 }
@@ -122,28 +122,28 @@ PEGTransformerFactory::TransformMatchRecognizeBody(PEGTransformer &transformer,
 		}
 		seen[index] = true;
 		switch (clause.kind) {
-		case MatchRecognizeClause::Kind::PARTITION:
+		case MatchRecognizeClauseKind::PARTITION:
 			config->partition_expressions = std::move(clause.expressions);
 			break;
-		case MatchRecognizeClause::Kind::ORDER_BY:
+		case MatchRecognizeClauseKind::ORDER_BY:
 			config->order_by_expressions = std::move(clause.order_by);
 			break;
-		case MatchRecognizeClause::Kind::MEASURES:
+		case MatchRecognizeClauseKind::MEASURES:
 			config->measures_expression_list = std::move(clause.expressions);
 			break;
-		case MatchRecognizeClause::Kind::ROWS:
+		case MatchRecognizeClauseKind::ROWS:
 			config->rows_per_match = clause.rows;
 			break;
-		case MatchRecognizeClause::Kind::SKIP:
+		case MatchRecognizeClauseKind::SKIP:
 			config->after_match = clause.skip.after_match;
 			if (!clause.skip.variable.empty()) {
 				config->after_match_variable = make_uniq<ConstantExpression>(Value(clause.skip.variable));
 			}
 			break;
-		case MatchRecognizeClause::Kind::PATTERN:
+		case MatchRecognizeClauseKind::PATTERN:
 			config->pattern = std::move(clause.pattern);
 			break;
-		case MatchRecognizeClause::Kind::SUBSET:
+		case MatchRecognizeClauseKind::SUBSET:
 			config->subsets = std::move(clause.subsets);
 			break;
 		default:
@@ -154,7 +154,7 @@ PEGTransformerFactory::TransformMatchRecognizeBody(PEGTransformer &transformer,
 	}
 	// only the pattern is required. A variable with no condition matches any row, so leaving out
 	// DEFINE asks for the pattern's shape alone, and leaving out MEASURES reports the rows themselves.
-	if (!seen[static_cast<idx_t>(MatchRecognizeClause::Kind::PATTERN)]) {
+	if (!seen[static_cast<idx_t>(MatchRecognizeClauseKind::PATTERN)]) {
 		throw ParserException("MATCH_RECOGNIZE requires a PATTERN clause");
 	}
 

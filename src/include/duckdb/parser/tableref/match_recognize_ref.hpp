@@ -51,10 +51,12 @@ struct MatchRecognizeSubset {
 
 //! One clause of a MATCH_RECOGNIZE body. The clauses may be written in any order, so the parser
 //! collects them and the transformer sorts out which is which.
-struct MatchRecognizeClause {
-	enum class Kind : uint8_t { PARTITION, ORDER_BY, MEASURES, ROWS, SKIP, PATTERN, SUBSET, DEFINE };
+//! Which clause of a MATCH_RECOGNIZE body this is. Named rather than nested, because the enum
+//! utilities generate from the name alone and a nested one reads as a type of its own.
+enum class MatchRecognizeClauseKind : uint8_t { PARTITION, ORDER_BY, MEASURES, ROWS, SKIP, PATTERN, SUBSET, DEFINE };
 
-	Kind kind = Kind::PATTERN;
+struct MatchRecognizeClause {
+	MatchRecognizeClauseKind kind = MatchRecognizeClauseKind::PATTERN;
 	//! PARTITION, MEASURES and DEFINE
 	vector<unique_ptr<ParsedExpression>> expressions;
 	vector<OrderByNode> order_by;
