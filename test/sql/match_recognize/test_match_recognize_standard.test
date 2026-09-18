@@ -107,6 +107,25 @@ SELECT RUNNING sum(price) FROM events
 ----
 RUNNING and FINAL are only meaningful in the MEASURES of a MATCH_RECOGNIZE
 
+# A condition is decided while the match is still being assembled, so running is the only semantics
+# it has: RUNNING may be written there for clarity, FINAL may not (ISO/IEC 19075-5 5.4). Trino and
+# Oracle draw the same line.
+query I
+SELECT n FROM events MATCH_RECOGNIZE (
+    ORDER BY seq MEASURES count(*) AS n ONE ROW PER MATCH
+    PATTERN (A+) DEFINE A AS A.price >= RUNNING LAST(A.price)
+)
+----
+4
+
+statement error
+SELECT n FROM events MATCH_RECOGNIZE (
+    ORDER BY seq MEASURES count(*) AS n ONE ROW PER MATCH
+    PATTERN (A+) DEFINE A AS A.price >= FINAL LAST(A.price)
+)
+----
+<REGEX>:Binder Error:.*only RUNNING is available there.*
+
 statement error
 SELECT * FROM events WHERE FINAL count(*) > 0
 ----

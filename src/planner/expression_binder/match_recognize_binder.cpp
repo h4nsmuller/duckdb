@@ -353,6 +353,17 @@ BindResult MatchRecognizeDefineBinder::BindExpression(unique_ptr<ParsedExpressio
 	if (expr.GetExpressionType() == ExpressionType::FUNCTION) {
 		auto &function = expr.Cast<FunctionExpression>();
 		auto function_name = StringUtil::Upper(function.FunctionName().GetIdentifierName());
+		// A condition is decided while the match is still being assembled, so running is the only
+		// semantics it has: RUNNING may be written for clarity, FINAL asks for a match that is not
+		// there yet
+		if (function.FunctionName() == MATCH_RECOGNIZE_RUNNING_MARKER) {
+			expr_ptr = std::move(function.GetArgumentsMutable()[0].GetExpressionMutable());
+			return BindExpression(expr_ptr, depth, root_expression);
+		}
+		if (function.FunctionName() == MATCH_RECOGNIZE_FINAL_MARKER) {
+			throw BinderException("FINAL reads the whole match, which a DEFINE condition is still assembling, so "
+			                      "only RUNNING is available there");
+		}
 		if (function_name == "CLASSIFIER") {
 			if (!function.GetArguments().empty()) {
 				// a condition is settled on the row being tested, and the classifier of a row another
