@@ -224,3 +224,12 @@ SELECT n FROM cls_arg MATCH_RECOGNIZE(
 )
 ----
 <REGEX>:.*only supported in MEASURES, not in DEFINE.*
+
+# collecting the classifiers of a match reports the shape it took without reporting its rows
+query I
+SELECT ca FROM (VALUES (1,120),(2,90),(3,150),(4,80),(5,200)) t(rn, price) MATCH_RECOGNIZE(
+    ORDER BY rn MEASURES array_agg(CLASSIFIER() ORDER BY rn) AS ca
+    ONE ROW PER MATCH PATTERN ((A | B)+) DEFINE A AS price > 100, B AS price <= 100
+)
+----
+[A, B, A, B, A]

@@ -203,6 +203,39 @@ static bool HasNeighbourNavigation(const ParsedExpression &expr) {
 	return found;
 }
 
+//! Whether a value only the matcher supplies sits anywhere inside this expression
+static bool HasMatcherState(const ParsedExpression &expr) {
+	if (expr.GetExpressionType() == ExpressionType::FUNCTION) {
+		auto name = StringUtil::Upper(expr.Cast<FunctionExpression>().FunctionName().GetIdentifierName());
+		if (name == "CLASSIFIER" || name == "MATCH_NUMBER") {
+			return true;
+		}
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || HasMatcherState(child); });
+	return found;
+}
+
+//! Drops the pattern variable qualifiers from the operand of a navigation and reports which
+//! variables they named. The operand designates a row rather than being evaluated where it stands,
+//! so what is left reads off the row finally arrived at.
+static void StripNavigationQualifiers(unique_ptr<ParsedExpression> &expr,
+                                      const case_insensitive_map_t<vector<string>> &symbols,
+                                      case_insensitive_set_t &scope) {
+	if (expr->GetExpressionType() == ExpressionType::COLUMN_REF) {
+		auto &colref = expr->Cast<ColumnRefExpression>();
+		auto &names = colref.ColumnNames();
+		if (names.size() >= 2 && symbols.find(names[0].GetIdentifierName()) != symbols.end()) {
+			scope.insert(names[0].GetIdentifierName());
+			expr = MatchRecognizeWithoutQualifier(colref);
+		}
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expr, [&](unique_ptr<ParsedExpression> &child) { StripNavigationQualifiers(child, symbols, scope); });
+}
+
 //! Whether a FIRST() or LAST() sits anywhere inside this expression
 static bool HasMatchNavigation(const ParsedExpression &expr) {
 	if (expr.GetExpressionType() == ExpressionType::FUNCTION) {
@@ -239,6 +272,13 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 			if (arguments.empty() || arguments.size() > 2) {
 				throw BinderException("%s() takes an expression and an optional offset", function_name);
 			}
+			// what the step reads is computed for every row of the input, below the matcher, and the
+			// matcher has said nothing about any row at that point
+			if (HasMatcherState(arguments[0].GetExpression())) {
+				throw NotImplementedException("%s() reads a row of the input, so CLASSIFIER() and MATCH_NUMBER(), "
+				                              "which only the matcher supplies, cannot be part of what it reads",
+				                              function_name);
+			}
 			// A step from a step is not a step this walks: only FIRST and LAST may sit inside one,
 			// and they are turned inside out below rather than hoisted here.
 			if (HasNeighbourNavigation(arguments[0].GetExpression())) {
@@ -260,17 +300,17 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 				// the step reads the column over the partition, so it leaves the qualifier behind:
 				// which row of the match it is read from is the enclosing FIRST/LAST's to decide
 				auto stepped = std::move(inner_arguments[0].GetExpressionMutable());
-				Identifier variable;
-				bool qualified = false;
-				if (stepped->GetExpressionType() == ExpressionType::COLUMN_REF) {
-					auto &colref = stepped->Cast<ColumnRefExpression>();
-					if (colref.ColumnNames().size() >= 2 &&
-					    symbols.find(colref.ColumnNames()[0].GetIdentifierName()) != symbols.end()) {
-						variable = colref.ColumnNames()[0];
-						qualified = true;
-						stepped = MatchRecognizeWithoutQualifier(colref);
-					}
+				// the operand names the variable whose rows the inner navigation walks, so every
+				// qualifier in it has to name the same one
+				case_insensitive_set_t scope;
+				StripNavigationQualifiers(stepped, symbols, scope);
+				if (scope.size() > 1) {
+					throw NotImplementedException(
+					    "%s() steps from a row of one pattern variable, so \"%s\" cannot also name \"%s\"",
+					    function_name, *scope.begin(), *std::next(scope.begin()));
 				}
+				const bool qualified = !scope.empty();
+				Identifier variable = qualified ? Identifier(*scope.begin()) : Identifier();
 				vector<unique_ptr<ParsedExpression>> step_arguments;
 				step_arguments.push_back(std::move(stepped));
 				if (arguments.size() == 2) {
