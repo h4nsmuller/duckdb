@@ -413,3 +413,93 @@ FROM (VALUES (1), (2), (3), (4)) t(x) MATCH_RECOGNIZE (
 )
 ----
 4
+
+# FIRST and LAST navigate the match, PREV and NEXT navigate the ordered partition, and the standard
+# lets the two combine one way round: FIRST or LAST names the row, and the step is taken from there.
+# The same rows are read either way the composition is written, so both spellings are supported.
+
+statement ok
+create table nav_nest(i integer, v integer);
+
+statement ok
+insert into nav_nest values (1,5),(2,7),(3,4),(4,11),(5,2),(6,9),(7,6),(8,13);
+
+# A's first row is row 1, so stepping back from it leaves the partition
+query IIIII
+SELECT mn, a, b, c, d FROM nav_nest MATCH_RECOGNIZE(
+    ORDER BY i MEASURES MATCH_NUMBER() AS mn, PREV(FIRST(A.v), 1) AS a, PREV(LAST(A.v), 1) AS b,
+                        NEXT(FIRST(B.v), 1) AS c, NEXT(LAST(B.v), 1) AS d
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A+ B+) DEFINE A AS v >= 5, B AS v < 5
+) ORDER BY mn
+----
+1	NULL	5	11	11
+2	4	4	9	9
+
+# a step of more than one, and a step from the match rather than from one variable
+query IIIII
+SELECT mn, a, b, c, d FROM nav_nest MATCH_RECOGNIZE(
+    ORDER BY i MEASURES MATCH_NUMBER() AS mn, PREV(FIRST(A.v), 2) AS a, PREV(LAST(B.v), 2) AS b,
+                        PREV(FIRST(v), 1) AS c, NEXT(LAST(v), 1) AS d
+    ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A+ B+) DEFINE A AS v >= 5, B AS v < 5
+) ORDER BY mn
+----
+1	NULL	5	NULL	11
+2	7	4	4	9
+
+# the other way round reads the same rows: the step is the same for every row of the partition, so
+# taking it first and picking the row afterwards arrives at the same value
+query II
+SELECT (SELECT list(p ORDER BY mn) FROM (FROM nav_nest MATCH_RECOGNIZE(
+            ORDER BY i MEASURES MATCH_NUMBER() AS mn, PREV(FIRST(A.v), 1) AS p
+            ONE ROW PER MATCH PATTERN (A+) DEFINE A AS v >= 5))) IS NOT DISTINCT FROM
+       (SELECT list(p ORDER BY mn) FROM (FROM nav_nest MATCH_RECOGNIZE(
+            ORDER BY i MEASURES MATCH_NUMBER() AS mn, FIRST(PREV(v, 1)) AS p
+            ONE ROW PER MATCH PATTERN (A+) DEFINE A AS v >= 5))) AS first_agrees,
+       (SELECT list(p ORDER BY mn) FROM (FROM nav_nest MATCH_RECOGNIZE(
+            ORDER BY i MEASURES MATCH_NUMBER() AS mn, PREV(LAST(A.v), 1) AS p
+            ONE ROW PER MATCH PATTERN (A+) DEFINE A AS v >= 5))) IS NOT DISTINCT FROM
+       (SELECT list(p ORDER BY mn) FROM (FROM nav_nest MATCH_RECOGNIZE(
+            ORDER BY i MEASURES MATCH_NUMBER() AS mn, LAST(PREV(v, 1)) AS p
+            ONE ROW PER MATCH PATTERN (A+) DEFINE A AS v >= 5))) AS last_agrees
+----
+true	true
+
+# a step from a step is not a row the standard lets one start from
+statement error
+SELECT p FROM nav_nest MATCH_RECOGNIZE(
+    ORDER BY i MEASURES PREV(PREV(v), 1) AS p ONE ROW PER MATCH PATTERN (A+) DEFINE A AS true
+)
+----
+<REGEX>:.*PREV\(\) walks the ordered partition from one row.*
+
+statement error
+SELECT p FROM nav_nest MATCH_RECOGNIZE(
+    ORDER BY i MEASURES NEXT(PREV(v), 1) AS p ONE ROW PER MATCH PATTERN (A+) DEFINE A AS true
+)
+----
+<REGEX>:.*NEXT\(\) walks the ordered partition from one row.*
+
+# and a value computed from a navigation is not a row either, so the nesting has to be immediate
+statement error
+SELECT p FROM nav_nest MATCH_RECOGNIZE(
+    ORDER BY i MEASURES PREV(FIRST(A.v) + 1, 1) AS p ONE ROW PER MATCH PATTERN (A+) DEFINE A AS true
+)
+----
+<REGEX>:.*only sit directly inside it.*
+
+statement error
+SELECT p FROM nav_nest MATCH_RECOGNIZE(
+    ORDER BY i MEASURES PREV(abs(LAST(A.v)), 1) AS p ONE ROW PER MATCH PATTERN (A+) DEFINE A AS true
+)
+----
+<REGEX>:.*only sit directly inside it.*
+
+# an expression that navigates nothing is read whole off the row stepped to, as it always was
+query I
+SELECT p FROM nav_nest MATCH_RECOGNIZE(
+    ORDER BY i MEASURES PREV(v + 1, 1) AS p ONE ROW PER MATCH PATTERN (A+) DEFINE A AS i = 8
+)
+----
+7

@@ -155,3 +155,72 @@ SELECT count(*) FROM rb MATCH_RECOGNIZE(
 )
 ----
 4
+
+# CLASSIFIER(V) reads the classifier the way V.c reads a column: off the last row V matched, which
+# for a SUBSET is the last row any of its members matched. Rows the variable never matched keep
+# reading the last one it did, and read NULL until it has matched at all.
+
+statement ok
+create table cls_arg(i integer, c varchar);
+
+statement ok
+insert into cls_arg values (1,'a'),(2,'b'),(3,'x'),(4,'a');
+
+query III
+SELECT i, plain, scoped FROM cls_arg MATCH_RECOGNIZE(
+    ORDER BY i MEASURES CLASSIFIER() AS plain, CLASSIFIER(U) AS scoped
+    ALL ROWS PER MATCH PATTERN (A B C A) SUBSET U = (A, B)
+    DEFINE A AS c = 'a', B AS c = 'b', C AS c = 'x'
+) ORDER BY i
+----
+1	A	A
+2	B	B
+3	C	B
+4	A	A
+
+# naming one variable rather than a SUBSET reads only that variable's rows
+query II
+SELECT i, scoped FROM cls_arg MATCH_RECOGNIZE(
+    ORDER BY i MEASURES CLASSIFIER(B) AS scoped
+    ALL ROWS PER MATCH PATTERN (A B C A) SUBSET U = (A, B)
+    DEFINE A AS c = 'a', B AS c = 'b', C AS c = 'x'
+) ORDER BY i
+----
+1	NULL
+2	B
+3	B
+4	B
+
+# ONE ROW PER MATCH reports the finished match, so it reads the last row of the variable
+query II
+SELECT u, b FROM cls_arg MATCH_RECOGNIZE(
+    ORDER BY i MEASURES CLASSIFIER(U) AS u, CLASSIFIER(B) AS b
+    ONE ROW PER MATCH PATTERN (A B C A) SUBSET U = (A, B)
+    DEFINE A AS c = 'a', B AS c = 'b', C AS c = 'x'
+)
+----
+A	B
+
+# the argument is a pattern variable of this clause, and nothing else stands there
+statement error
+SELECT x FROM cls_arg MATCH_RECOGNIZE(
+    ORDER BY i MEASURES CLASSIFIER(c) AS x ONE ROW PER MATCH PATTERN (A) DEFINE A AS c = 'a'
+)
+----
+<REGEX>:.*CLASSIFIER\(\) takes no arguments, or one pattern variable.*
+
+statement error
+SELECT x FROM cls_arg MATCH_RECOGNIZE(
+    ORDER BY i MEASURES CLASSIFIER(A, A) AS x ONE ROW PER MATCH PATTERN (A) DEFINE A AS c = 'a'
+)
+----
+<REGEX>:.*CLASSIFIER\(\) takes no arguments, or one pattern variable.*
+
+# a condition is settled on the row being tested, so there is no other variable's row to read yet
+statement error
+SELECT n FROM cls_arg MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS n ONE ROW PER MATCH PATTERN (A+)
+    DEFINE A AS CLASSIFIER(A) = 'A'
+)
+----
+<REGEX>:.*only supported in MEASURES, not in DEFINE.*

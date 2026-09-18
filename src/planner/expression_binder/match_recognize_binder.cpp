@@ -250,6 +250,23 @@ static bool BoundByLambda(optional_ptr<vector<DummyBinding>> lambda_bindings, co
 	return false;
 }
 
+//! The pattern variable a call names as its only argument, as CLASSIFIER(V) does. It is this
+//! clause's name rather than the input's, so nothing but a bare variable can stand there.
+static vector<string> MatchRecognizeVariableArgument(const FunctionExpression &function, const string &function_name,
+                                                     const case_insensitive_map_t<vector<string>> &symbols) {
+	auto &arguments = function.GetArguments();
+	if (arguments.size() == 1 && arguments[0].GetExpression().GetExpressionType() == ExpressionType::COLUMN_REF) {
+		auto &names = arguments[0].GetExpression().Cast<ColumnRefExpression>().ColumnNames();
+		if (names.size() == 1) {
+			auto entry = symbols.find(names[0].GetIdentifierName());
+			if (entry != symbols.end()) {
+				return entry->second;
+			}
+		}
+	}
+	throw BinderException("%s() takes no arguments, or one pattern variable of this MATCH_RECOGNIZE", function_name);
+}
+
 //===--------------------------------------------------------------------===//
 // DEFINE
 //===--------------------------------------------------------------------===//
@@ -297,7 +314,13 @@ BindResult MatchRecognizeDefineBinder::BindExpression(unique_ptr<ParsedExpressio
 	if (expr.GetExpressionType() == ExpressionType::FUNCTION) {
 		auto &function = expr.Cast<FunctionExpression>();
 		auto function_name = StringUtil::Upper(function.FunctionName().GetIdentifierName());
-		if (function_name == "CLASSIFIER" && function.GetArguments().empty()) {
+		if (function_name == "CLASSIFIER") {
+			if (!function.GetArguments().empty()) {
+				// a condition is settled on the row being tested, and the classifier of a row another
+				// variable matched is not something the matcher can hand back while it decides
+				throw NotImplementedException(
+				    "CLASSIFIER() naming a pattern variable is only supported in MEASURES, not in DEFINE");
+			}
 			OutsideMatch("CLASSIFIER()");
 			// the row being tested is the one this DEFINE decides on, so it classifies as this symbol
 			expr_ptr = ConstantExpression::String(define_name);
@@ -480,8 +503,17 @@ BindResult MatchRecognizeMeasureBinder::BindExpression(unique_ptr<ParsedExpressi
 			running = saved;
 			return result;
 		}
-		if (function_name == "CLASSIFIER" && function.GetArguments().empty()) {
-			expr_ptr = StateField("classifier");
+		if (function_name == "CLASSIFIER") {
+			if (function.GetArguments().empty()) {
+				expr_ptr = StateField("classifier");
+				return BindGenerated(expr_ptr, depth, root_expression);
+			}
+			// CLASSIFIER(V) reads the classifier the way V.c reads a column: off the last row V
+			// matched, which for a SUBSET is the last row any of its members matched
+			auto symbol = MatchRecognizeVariableArgument(function, function_name, symbols);
+			expr_ptr =
+			    MatchScopedValue(context, state, config,
+			                     ClassifiedValue(state, symbol, PackValue(state, StateField("classifier"))), running);
 			return BindGenerated(expr_ptr, depth, root_expression);
 		}
 		if (function_name == "MATCH_NUMBER" && function.GetArguments().empty()) {

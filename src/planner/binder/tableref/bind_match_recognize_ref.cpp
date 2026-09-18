@@ -189,6 +189,43 @@ static bool HasExclusion(const ParsedExpression &expr) {
 	return found;
 }
 
+//! Whether a PREV() or NEXT() sits anywhere inside this expression
+static bool HasNeighbourNavigation(const ParsedExpression &expr) {
+	if (expr.GetExpressionType() == ExpressionType::FUNCTION) {
+		auto name = StringUtil::Upper(expr.Cast<FunctionExpression>().FunctionName().GetIdentifierName());
+		if (name == "PREV" || name == "NEXT") {
+			return true;
+		}
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || HasNeighbourNavigation(child); });
+	return found;
+}
+
+//! Whether a FIRST() or LAST() sits anywhere inside this expression
+static bool HasMatchNavigation(const ParsedExpression &expr) {
+	if (expr.GetExpressionType() == ExpressionType::FUNCTION) {
+		auto name = StringUtil::Upper(expr.Cast<FunctionExpression>().FunctionName().GetIdentifierName());
+		if (name == "FIRST" || name == "LAST") {
+			return true;
+		}
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || HasMatchNavigation(child); });
+	return found;
+}
+
+//! Whether this is a FIRST() or LAST(), which navigate the match rather than the partition
+static bool IsMatchNavigation(const ParsedExpression &expr) {
+	if (expr.GetExpressionType() != ExpressionType::FUNCTION) {
+		return false;
+	}
+	auto name = StringUtil::Upper(expr.Cast<FunctionExpression>().FunctionName().GetIdentifierName());
+	return name == "FIRST" || name == "LAST";
+}
+
 //! PREV and NEXT walk the ordered partition rather than the match, so a measure's are computed per
 //! input row below the pattern window and read back from above it
 static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const WindowExpression &pattern_window,
@@ -201,6 +238,65 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 			auto &arguments = function.GetArgumentsMutable();
 			if (arguments.empty() || arguments.size() > 2) {
 				throw BinderException("%s() takes an expression and an optional offset", function_name);
+			}
+			// A step from a step is not a step this walks: only FIRST and LAST may sit inside one,
+			// and they are turned inside out below rather than hoisted here.
+			if (HasNeighbourNavigation(arguments[0].GetExpression())) {
+				throw NotImplementedException("%s() walks the ordered partition from one row, so another PREV() or "
+				                              "NEXT() cannot be what it starts from",
+				                              function_name);
+			}
+			// PREV(FIRST(X.c), n) is the row n before the one FIRST(X.c) reads, which is the row
+			// FIRST(X.<c stepped back n>) reads: the step is the same for every row, so taking it below
+			// the matcher and letting FIRST pick the row afterwards arrives at the same value.
+			if (IsMatchNavigation(arguments[0].GetExpression())) {
+				auto outer = std::move(arguments[0].GetExpressionMutable());
+				auto &navigation = outer->Cast<FunctionExpression>();
+				auto &inner_arguments = navigation.GetArgumentsMutable();
+				if (inner_arguments.empty()) {
+					throw BinderException("%s() takes an expression and an optional offset",
+					                      StringUtil::Upper(navigation.FunctionName().GetIdentifierName()));
+				}
+				// the step reads the column over the partition, so it leaves the qualifier behind:
+				// which row of the match it is read from is the enclosing FIRST/LAST's to decide
+				auto stepped = std::move(inner_arguments[0].GetExpressionMutable());
+				Identifier variable;
+				bool qualified = false;
+				if (stepped->GetExpressionType() == ExpressionType::COLUMN_REF) {
+					auto &colref = stepped->Cast<ColumnRefExpression>();
+					if (colref.ColumnNames().size() >= 2 &&
+					    symbols.find(colref.ColumnNames()[0].GetIdentifierName()) != symbols.end()) {
+						variable = colref.ColumnNames()[0];
+						qualified = true;
+						stepped = MatchRecognizeWithoutQualifier(colref);
+					}
+				}
+				vector<unique_ptr<ParsedExpression>> step_arguments;
+				step_arguments.push_back(std::move(stepped));
+				if (arguments.size() == 2) {
+					step_arguments.push_back(std::move(arguments[1].GetExpressionMutable()));
+				}
+				unique_ptr<ParsedExpression> step =
+				    make_uniq<FunctionExpression>(Identifier(function_name), std::move(step_arguments));
+				// hoisting it leaves behind a reference to the column it is computed in
+				HoistMeasureNavigation(step, pattern_window, symbols, hoisted, names);
+				if (qualified) {
+					auto column_names = step->Cast<ColumnRefExpression>().ColumnNames();
+					column_names.insert(column_names.begin(), variable);
+					step = make_uniq<ColumnRefExpression>(std::move(column_names));
+				}
+				inner_arguments[0].GetExpressionMutable() = std::move(step);
+				auto alias = expr->GetAlias();
+				expr = std::move(outer);
+				expr->SetAlias(std::move(alias));
+				return;
+			}
+			// FIRST/LAST inside a PREV/NEXT says which row to step from, so it has to be what the
+			// step is taken from and nothing else: a value computed from it is not a row.
+			if (HasMatchNavigation(arguments[0].GetExpression())) {
+				throw NotImplementedException("%s() steps from the row FIRST() or LAST() names, so one may only sit "
+				                              "directly inside it, not within an expression it is part of",
+				                              function_name);
 			}
 			for (auto &argument : arguments) {
 				HoistMeasureNavigation(argument.GetExpressionMutable(), pattern_window, symbols, hoisted, names);
