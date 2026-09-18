@@ -235,13 +235,15 @@ SELECT i, d FROM pnav MATCH_RECOGNIZE(
 4	10
 5	10
 
-# naming a pattern variable inside one asks about the match, which is not what it navigates
-statement error
-SELECT prev_v FROM pnav MATCH_RECOGNIZE(
-    ORDER BY i MEASURES PREV(A.v) AS prev_v PATTERN (A+) DEFINE A as true
+# naming a pattern variable inside one says which row to step from: an ordinary reference is the
+# last row the variable matched, so PREV(A.v) steps back from there, and an offset of 0 stays on it
+query III
+SELECT prev_v, prev0, next_v FROM pnav MATCH_RECOGNIZE(
+    ORDER BY i MEASURES PREV(A.v) AS prev_v, PREV(A.v, 0) AS prev0, NEXT(A.v) AS next_v
+    ONE ROW PER MATCH PATTERN (A+) DEFINE A as true
 )
 ----
-<REGEX>:Not implemented Error:.*navigates the ordered partition rather than the match.*
+40	50	NULL
 
 # FIRST and LAST count the match's own rows instead, so an offset on them steps in from the end it
 # names rather than over the partition

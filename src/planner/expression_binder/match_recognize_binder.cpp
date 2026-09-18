@@ -390,6 +390,10 @@ BindResult MatchRecognizeDefineBinder::BindNeighbour(FunctionExpression &functio
 	if (arguments.empty() || arguments.size() > 2) {
 		throw BinderException("%s() takes an expression and an optional offset", function_name);
 	}
+	if (arguments.size() == 2) {
+		// how many rows back to step, which is the same constant FIRST() and LAST() count by
+		MatchRecognizeNavigationOffset(function_name, arguments[1].GetExpression());
+	}
 	auto neighbour = window_template.Copy();
 	auto &window = neighbour->Cast<WindowExpression>();
 	window.SetFunctionName(function_name == "PREV" ? "lag" : "lead");

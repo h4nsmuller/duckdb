@@ -203,6 +203,18 @@ static bool HasNeighbourNavigation(const ParsedExpression &expr) {
 	return found;
 }
 
+//! Whether a pattern variable qualifies any reference inside this expression
+static bool HasPatternQualifier(const ParsedExpression &expr, const case_insensitive_map_t<vector<string>> &symbols) {
+	if (expr.GetExpressionType() == ExpressionType::COLUMN_REF) {
+		auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+		return names.size() >= 2 && symbols.find(names[0].GetIdentifierName()) != symbols.end();
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || HasPatternQualifier(child, symbols); });
+	return found;
+}
+
 //! Whether a value only the matcher supplies sits anywhere inside this expression
 static bool HasMatcherState(const ParsedExpression &expr) {
 	if (expr.GetExpressionType() == ExpressionType::FUNCTION) {
@@ -272,6 +284,10 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 			if (arguments.empty() || arguments.size() > 2) {
 				throw BinderException("%s() takes an expression and an optional offset", function_name);
 			}
+			if (arguments.size() == 2) {
+				// how many rows back to step, which is the same constant FIRST() and LAST() count by
+				MatchRecognizeNavigationOffset(function_name, arguments[1].GetExpression());
+			}
 			// what the step reads is computed for every row of the input, below the matcher, and the
 			// matcher has said nothing about any row at that point
 			if (HasMatcherState(arguments[0].GetExpression())) {
@@ -285,6 +301,15 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 				throw NotImplementedException("%s() walks the ordered partition from one row, so another PREV() or "
 				                              "NEXT() cannot be what it starts from",
 				                              function_name);
+			}
+			// An ordinary qualified reference is the last row the variable matched, so a step from one
+			// steps from that row: PREV(A.c, n) is PREV(LAST(A.c), n), which is the nesting below.
+			if (!IsMatchNavigation(arguments[0].GetExpression()) &&
+			    HasPatternQualifier(arguments[0].GetExpression(), symbols)) {
+				vector<unique_ptr<ParsedExpression>> wrapped;
+				wrapped.push_back(std::move(arguments[0].GetExpressionMutable()));
+				arguments[0].GetExpressionMutable() =
+				    make_uniq<FunctionExpression>(Identifier("LAST"), std::move(wrapped));
 			}
 			// PREV(FIRST(X.c), n) is the row n before the one FIRST(X.c) reads, which is the row
 			// FIRST(X.<c stepped back n>) reads: the step is the same for every row, so taking it below
@@ -340,15 +365,6 @@ static void HoistMeasureNavigation(unique_ptr<ParsedExpression> &expr, const Win
 			}
 			for (auto &argument : arguments) {
 				HoistMeasureNavigation(argument.GetExpressionMutable(), pattern_window, symbols, hoisted, names);
-			}
-			auto &inner = *arguments[0].GetExpressionMutable();
-			if (inner.GetExpressionType() == ExpressionType::COLUMN_REF) {
-				auto &names = inner.Cast<ColumnRefExpression>().ColumnNames();
-				if (names.size() >= 2 && symbols.find(names[0].GetIdentifierName()) != symbols.end()) {
-					throw NotImplementedException("%s() navigates the ordered partition rather than the match, so "
-					                              "naming a pattern variable inside it is not supported",
-					                              function_name);
-				}
 			}
 			auto navigation = pattern_window.Copy();
 			auto &window = navigation->Cast<WindowExpression>();
