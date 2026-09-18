@@ -554,3 +554,59 @@ SELECT p FROM nav_operand MATCH_RECOGNIZE(
 )
 ----
 <REGEX>:.*CLASSIFIER\(\) and MATCH_NUMBER\(\).*
+
+# A step may also be taken from a row of the match inside DEFINE, not only inside MEASURES. An
+# ordinary qualified reference is the last row the variable matched, so PREV(A.v) steps back from
+# there, and FIRST/LAST nested inside the step say which row of the match it starts from
+# (ISO/IEC 19075-5 5.6.4). Trino and Oracle answer the same on all of these.
+
+statement ok
+CREATE TABLE nav_define(i INTEGER, p INTEGER)
+
+statement ok
+INSERT INTO nav_define VALUES (1,10),(2,20),(3,15),(4,30),(5,25),(6,40)
+
+query III
+SELECT i, n, c FROM nav_define MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS n, CLASSIFIER() AS c
+    ALL ROWS PER MATCH PATTERN (A B+) DEFINE A AS p > 5, B AS p > PREV(A.p)
+) ORDER BY i
+----
+2	1	A
+3	2	B
+4	3	B
+5	4	B
+6	5	B
+
+query III
+SELECT i, n, c FROM nav_define MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS n, CLASSIFIER() AS c
+    ALL ROWS PER MATCH PATTERN (A B+) DEFINE A AS p > 5, B AS p > PREV(LAST(A.p), 1)
+) ORDER BY i
+----
+2	1	A
+3	2	B
+4	3	B
+5	4	B
+6	5	B
+
+query III
+SELECT i, n, c FROM nav_define MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS n, CLASSIFIER() AS c
+    ALL ROWS PER MATCH PATTERN (A B+) DEFINE A AS p > 5, B AS p > PREV(FIRST(A.p), 1)
+) ORDER BY i
+----
+2	1	A
+3	2	B
+4	3	B
+5	4	B
+6	5	B
+
+# the operand of a step names one variable's rows, so two of them have nowhere single to start from
+statement error
+SELECT i FROM nav_define MATCH_RECOGNIZE(
+    ORDER BY i MEASURES count(*) AS n
+    ALL ROWS PER MATCH PATTERN (A B+) DEFINE A AS p > 5, B AS p > PREV(LAST(A.p + B.p), 1)
+) ORDER BY i
+----
+<REGEX>:.*steps from a row of one pattern variable.*

@@ -267,6 +267,45 @@ static vector<string> MatchRecognizeVariableArgument(const FunctionExpression &f
 	throw BinderException("%s() takes no arguments, or one pattern variable of this MATCH_RECOGNIZE", function_name);
 }
 
+//! Whether this is a FIRST() or LAST(), which navigate the match rather than the partition
+static bool IsMatchNavigation(const ParsedExpression &expr) {
+	if (expr.GetExpressionType() != ExpressionType::FUNCTION) {
+		return false;
+	}
+	auto name = StringUtil::Upper(expr.Cast<FunctionExpression>().FunctionName().GetIdentifierName());
+	return name == "FIRST" || name == "LAST";
+}
+
+//! Whether a pattern variable qualifies any reference inside this expression
+static bool HasPatternQualifier(const ParsedExpression &expr, const case_insensitive_set_t &symbols) {
+	if (expr.GetExpressionType() == ExpressionType::COLUMN_REF) {
+		auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+		return names.size() >= 2 && symbols.count(names[0].GetIdentifierName()) > 0;
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { found = found || HasPatternQualifier(child, symbols); });
+	return found;
+}
+
+//! Drops the pattern variable qualifiers from the operand of a navigation and reports which variables
+//! they named. The operand designates a row rather than being evaluated where it stands, so what is
+//! left reads off the row finally arrived at.
+static void StripNavigationQualifiers(unique_ptr<ParsedExpression> &expr, const case_insensitive_set_t &symbols,
+                                      case_insensitive_set_t &scope) {
+	if (expr->GetExpressionType() == ExpressionType::COLUMN_REF) {
+		auto &colref = expr->Cast<ColumnRefExpression>();
+		auto &names = colref.ColumnNames();
+		if (names.size() >= 2 && symbols.count(names[0].GetIdentifierName())) {
+			scope.insert(names[0].GetIdentifierName());
+			expr = MatchRecognizeWithoutQualifier(colref);
+		}
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expr, [&](unique_ptr<ParsedExpression> &child) { StripNavigationQualifiers(child, symbols, scope); });
+}
+
 //===--------------------------------------------------------------------===//
 // DEFINE
 //===--------------------------------------------------------------------===//
@@ -393,6 +432,49 @@ BindResult MatchRecognizeDefineBinder::BindNeighbour(FunctionExpression &functio
 	if (arguments.size() == 2) {
 		// how many rows back to step, which is the same constant FIRST() and LAST() count by
 		MatchRecognizeNavigationOffset(function_name, arguments[1].GetExpression());
+	}
+	// An ordinary qualified reference is the last row the variable matched, so a step from one steps
+	// from that row: PREV(A.c, n) is PREV(LAST(A.c), n), which is the nesting below.
+	if (!IsMatchNavigation(arguments[0].GetExpression()) &&
+	    HasPatternQualifier(arguments[0].GetExpression(), symbols)) {
+		vector<unique_ptr<ParsedExpression>> wrapped;
+		wrapped.push_back(std::move(arguments[0].GetExpressionMutable()));
+		arguments[0].GetExpressionMutable() = make_uniq<FunctionExpression>(Identifier("LAST"), std::move(wrapped));
+	}
+	// PREV(FIRST(X.c), n) is the row n before the one FIRST(X.c) reads, which is the row
+	// FIRST(X.<c stepped back n>) reads: the step is the same for every row, so taking it below the
+	// matcher and letting FIRST pick the row afterwards arrives at the same value.
+	if (IsMatchNavigation(arguments[0].GetExpression())) {
+		auto outer = std::move(arguments[0].GetExpressionMutable());
+		auto &navigation = outer->Cast<FunctionExpression>();
+		const auto navigation_name = StringUtil::Upper(navigation.FunctionName().GetIdentifierName());
+		auto &inner_arguments = navigation.GetArgumentsMutable();
+		if (inner_arguments.empty() || inner_arguments.size() > 2) {
+			throw BinderException("%s() takes an expression and an optional offset", navigation_name);
+		}
+		idx_t offset = 0;
+		if (inner_arguments.size() == 2) {
+			offset = MatchRecognizeNavigationOffset(navigation_name, inner_arguments[1].GetExpression());
+		}
+		// the step reads the column over the partition, so it leaves the qualifier behind: which row
+		// of the match it is read from is the enclosing FIRST/LAST's to decide
+		auto stepped = std::move(inner_arguments[0].GetExpressionMutable());
+		case_insensitive_set_t scope;
+		StripNavigationQualifiers(stepped, symbols, scope);
+		if (scope.size() > 1) {
+			throw NotImplementedException(
+			    "%s() steps from a row of one pattern variable, so \"%s\" cannot also name \"%s\"", function_name,
+			    *scope.begin(), *std::next(scope.begin()));
+		}
+		vector<unique_ptr<ParsedExpression>> step_arguments;
+		step_arguments.push_back(std::move(stepped));
+		if (arguments.size() == 2) {
+			step_arguments.push_back(std::move(arguments[1].GetExpressionMutable()));
+		}
+		unique_ptr<ParsedExpression> step =
+		    make_uniq<FunctionExpression>(Identifier(function_name), std::move(step_arguments));
+		auto symbol = scope.empty() ? string() : MatchRecognizeDefineColumn(*scope.begin());
+		return BindNavigated(std::move(step), std::move(symbol), navigation_name == "LAST", offset, depth);
 	}
 	auto neighbour = window_template.Copy();
 	auto &window = neighbour->Cast<WindowExpression>();

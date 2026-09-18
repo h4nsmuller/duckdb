@@ -180,14 +180,16 @@ SELECT 1 FROM q MATCH_RECOGNIZE(
 ----
 <REGEX>:Not implemented Error:.*AFTER MATCH SKIP TO a SUBSET variable.*
 
-# an exclusion decides which of a match's rows reach the output, so it needs rows in the output
-statement error
-SELECT 1 FROM q MATCH_RECOGNIZE(
+# An exclusion decides which of a match's rows reach the output. ONE ROW PER MATCH reports the
+# match rather than its rows, so it is accepted there and simply has no effect - Trino and Oracle
+# both take it too.
+query I
+SELECT n FROM q MATCH_RECOGNIZE(
     ORDER BY i MEASURES count(*) AS n ONE ROW PER MATCH
     PATTERN ({- A -} B+) DEFINE B AS B.j > 0
 )
 ----
-<REGEX>:Binder Error:.*exclusion syntax \{- -\} requires ALL ROWS PER MATCH.*
+2
 
 # the clauses may be written in any order, and each may appear only once
 query I
@@ -377,3 +379,21 @@ FROM (VALUES (1), (2)) t(x) MATCH_RECOGNIZE (
 ----
 1
 1
+
+# A union row pattern variable is a union of pattern variables, so a SUBSET may not be built out of
+# another SUBSET however few members that one has - Trino and Oracle refuse both spellings too.
+statement error
+SELECT 1 FROM q MATCH_RECOGNIZE(
+    MEASURES i AS x PATTERN (A B C) SUBSET U = (A, B), V = (U, C)
+    DEFINE A as true
+)
+----
+<REGEX>:Binder Error:.*which is itself a SUBSET.*
+
+statement error
+SELECT 1 FROM q MATCH_RECOGNIZE(
+    MEASURES i AS x PATTERN (A B C) SUBSET U = (A), V = (U, C)
+    DEFINE A as true
+)
+----
+<REGEX>:Binder Error:.*which is itself a SUBSET.*
