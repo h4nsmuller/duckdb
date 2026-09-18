@@ -90,8 +90,35 @@ variable matched, so `PREV(A.c, n)` is `PREV(LAST(A.c), n)`, and `PREV(FIRST(X.c
 and letting FIRST pick the row afterwards reaches the same value. Trino and Oracle agree with the
 new answers on all ten spellings tested.
 
+| 6 | `RUNNING` was refused in DEFINE alongside `FINAL`; 5.4 permits it there "for added clarity" and permits only it | §5.4 |
+
 Fix 3 changes user-visible output for `SELECT *`, which is why three existing tests had to be
 re-baselined (`standard`, `names`, `shapes`). Worth a second look.
+
+### The differential harness
+
+`diff3.py` in the scratch directory runs one MATCH_RECOGNIZE query against DuckDB, Trino and Oracle
+and diffs the answers: it builds the dialect's own `WITH` clause, wraps every output column in an
+explicit NULL marker so the three command line clients cannot disagree about formatting, and
+normalises numbers and classifier case. `fuzz.py` generates random patterns, DEFINEs, measures,
+ROWS PER MATCH and SKIP clauses on top of it. Both containers were already running
+(`trino-mr`, `mr-oracle`, password in the container's env).
+
+Batteries run so far, all agreeing across the three engines unless noted: skip and quantifier
+behaviour (20), navigation and running/final (22, one noted below), DEFINE-side conditions (12),
+partitioning and ordering (12), MEASURES expression forms (15, three noted below), the 4.10 variable
+mapping, and the 5.6.3 offset equalities.
+
+### Where the engines disagree with each other
+
+- **`RUNNING FIRST(x, n)`** — on the first row of a match, DuckDB and Oracle return null (only one
+  row is mapped so far, so there is no row at offset 1) and **Trino returns the second row's value**.
+  DuckDB follows 5.4 here; the Trino answer looks like final semantics leaking into a running call.
+- **`count(DISTINCT x)`** and **`count(*) FILTER (WHERE ...)`** in MEASURES — DuckDB evaluates both
+  and gives sensible running answers; Trino refuses them outright ("Cannot use DISTINCT with count
+  aggregate function in pattern recognition context") and so does Oracle. 19075-5 5.5 says nothing
+  either way, so whether this is a violation depends on ISO/IEC 9075-2, which is not in the repo.
+  Reported rather than changed.
 
 ### Deviations still open
 
@@ -151,6 +178,60 @@ re-baselined (`standard`, `names`, `shapes`). Worth a second look.
    `ARRAY_AGG (CLASSIFIER () || A.Name)` as a syntax error, since CLASSIFIER() references the
    universal variable and `A.Name` references A; DuckDB evaluates it. Same family as the
    already-known `sum(Price + A.Tax)` permissiveness (§5.2), so one fix would cover both.
+
+### Correction to "deliberately more permissive"
+
+The first pass listed `sum(Price + A.Tax)` - an aggregate mixing an unqualified reference with a
+qualified one - among the things DuckDB accepts where the standard does not, with the note that they
+"all return correct answers". That is not true of this one.
+
+5.2 and 5.5 call it a syntax error because there is no single set of rows to evaluate over: the
+unqualified reference is implicitly the universal row pattern variable and the qualified one is not.
+DuckDB does not reject it and does not treat the unqualified reference as universal either - it
+scopes the whole aggregate to the named variable. On rows (1,10,100), (2,20,200), (3,30,300) with
+`PATTERN (A B+)` and A matching only the first row:
+
+| expression | DuckDB | meaning |
+|---|---|---|
+| `sum(A.p)` | 10 | A's rows |
+| `sum(p)` | 60 | the whole match, correct for the universal variable |
+| `sum(p + A.q)` | **110** | same as `sum(A.p + A.q)` - the unqualified `p` silently became `A.p` |
+
+Trino refuses it ("All labels and classifiers inside the call to 'sum' must match") and so does
+Oracle (ORA-62508). So a query written with an unqualified reference quietly gets an answer computed
+over a different set of rows than the one the reference names.
+
+Worth fixing, but the check needs care: rejecting on "contains a variable-qualified reference and an
+unqualified one" would also reject an outer reference inside the aggregate, which is constant across
+the match and harmless. Detecting it properly means telling a reference to a column of the row
+pattern input apart from a correlated one, before `ScopeToVariable` strips the qualifiers.
+
+### Aggregates in DEFINE: what implementing it would take
+
+This is the one substantial gap left (finding 1 above) and it is deliberately not started here,
+because a half-built path that silently answers differently is worse than the clear error today.
+The shape it would take, from reading the existing machinery:
+
+1. **Binder.** `MatchRecognizeDefineBinder::BindAggregate` currently refuses everything. It would
+   instead do what `MatchRecognizeMeasureBinder::BindOverMatch` does to find the variable an
+   aggregate is scoped to - `ScopeToVariable` over the arguments, at most one variable - then project
+   the aggregate's operand below the matcher the way `BindNavigated` projects a navigation's operand,
+   and return a `BoundReferenceExpression` to a new matcher-supplied field.
+2. **Bind data.** A `vector<MatchRecognizeAggregate>` alongside `navigations`, each holding the bound
+   aggregate, the symbol it is scoped to (empty for the universal variable) and the field its operand
+   lands in. It serializes like `conditions` already does.
+3. **Executor.** A third `FieldSource` in `RowConditions` next to `CURRENT_ROW` and `NAVIGATION`. The
+   rows mapped to each variable so far are already tracked - `navigation_positions` is exactly that
+   list, maintained across backtracking - so the value is: initialise the aggregate state, update it
+   with the operand read at each recorded position, finalise. That is O(match length) per candidate
+   row; it can be made incremental later, since the position list only grows except when a tested row
+   rewinds it.
+4. **Memoisation.** An aggregate over a variable's rows depends on which rows were matched before the
+   current one, so a condition carrying one has to force `PatternMemo::HISTORY`, the same as a
+   navigation that names a symbol does today.
+
+The tests write themselves: 5.3's worked example with its Table 12, the `COUNT(A.*)` empty-set
+example, and the forward-reference example that is legal but never matches.
 
 ### Verified conforming
 
