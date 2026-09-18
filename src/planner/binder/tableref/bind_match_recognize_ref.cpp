@@ -480,6 +480,12 @@ static void ValidateClauses(const MatchRecognizeConfig &config, const MatchRecog
 	if (has_exclusion && !MatchRecognizeReportsRows(config.rows_per_match)) {
 		throw BinderException("Pattern exclusion syntax {- -} requires ALL ROWS PER MATCH");
 	}
+	// WITH UNMATCHED ROWS is there to report every row, and {- -} is there to drop some: a row it
+	// dropped is one a match did cover, so reporting it as unmatched would say the opposite
+	if (has_exclusion && config.rows_per_match == MatchRecognizeRows::MATCH_RECOGNIZE_ROWS_ALL_UNMATCHED) {
+		throw BinderException("Pattern exclusion syntax {- -} is not allowed with ALL ROWS PER MATCH WITH "
+		                      "UNMATCHED ROWS");
+	}
 	case_insensitive_set_t subset_names;
 	for (auto &subset : config.subsets) {
 		subset_names.insert(subset.name);

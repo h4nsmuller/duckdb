@@ -632,3 +632,80 @@ SELECT (SELECT sum(n) FROM (FROM range(6) t(x) MATCH_RECOGNIZE (
 ----
 3	5
 
+
+# A quantifier's greed decides which variable a row goes to, not only how many rows match. Where two
+# variables both accept a row - here a run of equal values, which <= and >= both hold on - a greedy
+# quantifier keeps the row and a reluctant one hands it to what follows. The match covers the same
+# rows either way, so only the classification tells the two apart.
+
+statement ok
+create table plateau(i integer, v integer);
+
+statement ok
+insert into plateau values (1,10),(2,8),(3,6),(4,6),(5,6),(6,9),(7,12);
+
+# rows 4 and 5 repeat the value before them, so B and C both accept them
+query II
+SELECT i, cl FROM plateau MATCH_RECOGNIZE(
+    ORDER BY i MEASURES classifier() AS cl
+    ALL ROWS PER MATCH PATTERN (A B+ C+)
+    DEFINE B AS v <= PREV(v), C AS v >= PREV(v)
+) ORDER BY i
+----
+1	A
+2	B
+3	B
+4	B
+5	B
+6	C
+7	C
+
+# reluctant: B takes as few as it can, so the repeated rows go to C instead
+query II
+SELECT i, cl FROM plateau MATCH_RECOGNIZE(
+    ORDER BY i MEASURES classifier() AS cl
+    ALL ROWS PER MATCH PATTERN (A B+? C+)
+    DEFINE B AS v <= PREV(v), C AS v >= PREV(v)
+) ORDER BY i
+----
+1	A
+2	B
+3	B
+4	C
+5	C
+6	C
+7	C
+
+# star reads the same as plus here, because B matches at least once either way
+query II
+SELECT i, cl FROM plateau MATCH_RECOGNIZE(
+    ORDER BY i MEASURES classifier() AS cl
+    ALL ROWS PER MATCH PATTERN (A B*? C+)
+    DEFINE B AS v <= PREV(v), C AS v >= PREV(v)
+) ORDER BY i
+----
+1	A
+2	B
+3	B
+4	C
+5	C
+6	C
+7	C
+
+# both read the same rows into one match of the same length, so counting rows cannot tell them
+# apart; counting the rows of one variable can
+query IIII
+SELECT (SELECT count(*) FROM (FROM plateau MATCH_RECOGNIZE(
+            ORDER BY i MEASURES count(*) AS n ONE ROW PER MATCH PATTERN (A B+ C+)
+            DEFINE B AS v <= PREV(v), C AS v >= PREV(v)))) AS greedy_matches,
+       (SELECT count(*) FROM (FROM plateau MATCH_RECOGNIZE(
+            ORDER BY i MEASURES count(*) AS n ONE ROW PER MATCH PATTERN (A B+? C+)
+            DEFINE B AS v <= PREV(v), C AS v >= PREV(v)))) AS reluctant_matches,
+       (SELECT max(b) FROM (FROM plateau MATCH_RECOGNIZE(
+            ORDER BY i MEASURES count(B.i) AS b ONE ROW PER MATCH PATTERN (A B+ C+)
+            DEFINE B AS v <= PREV(v), C AS v >= PREV(v)))) AS greedy_b_rows,
+       (SELECT max(b) FROM (FROM plateau MATCH_RECOGNIZE(
+            ORDER BY i MEASURES count(B.i) AS b ONE ROW PER MATCH PATTERN (A B+? C+)
+            DEFINE B AS v <= PREV(v), C AS v >= PREV(v)))) AS reluctant_b_rows
+----
+1	1	4	2

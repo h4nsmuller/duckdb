@@ -164,16 +164,24 @@ SELECT * FROM events MATCH_RECOGNIZE (
 3	-5	NULL	NULL	NULL
 4	15	1	A	2
 
-# an excluded row is left out of a match it is part of; an unmatched row is part of none
-query III
+# WITH UNMATCHED ROWS reports every row, and {- -} drops some: a row it drops is one a match did
+# cover, so reporting it as unmatched would say the opposite. The standard forbids the combination.
+statement error
 SELECT * FROM events MATCH_RECOGNIZE (
     ORDER BY seq MEASURES count(*) AS n
     ALL ROWS PER MATCH WITH UNMATCHED ROWS PATTERN ({- A -} A) DEFINE A AS price > 0
 ) ORDER BY seq
 ----
+<REGEX>:.*not allowed with ALL ROWS PER MATCH WITH UNMATCHED ROWS.*
+
+# an excluded row is left out of a match it is part of, where the output reports rows at all
+query III
+SELECT * FROM events MATCH_RECOGNIZE (
+    ORDER BY seq MEASURES count(*) AS n
+    ALL ROWS PER MATCH PATTERN ({- A -} A) DEFINE A AS price > 0
+) ORDER BY seq
+----
 2	20	2
-3	-5	NULL
-4	15	NULL
 
 # ONE ROW PER MATCH takes none of them
 statement error
