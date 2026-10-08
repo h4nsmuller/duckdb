@@ -31,7 +31,11 @@ CompiledGrammar &Parser::GetGrammar() {
 		if (options.compiled_grammar) {
 			compiled_grammar = options.compiled_grammar;
 		} else {
-			compiled_grammar = CompiledGrammar::Create();
+			// No compiled grammar was supplied (a Parser constructed with default options, e.g. by the static
+			// Parser::Parse* helpers). Share one process-wide compilation of the base grammar rather than compiling
+			// it anew for every Parser instance: compiling the grammar costs far more than parsing a typical query.
+			static const shared_ptr<CompiledGrammar> default_grammar = CompiledGrammar::Create();
+			compiled_grammar = default_grammar;
 		}
 	}
 	return *compiled_grammar;
