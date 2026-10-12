@@ -257,7 +257,8 @@ enum class LogicalTypeId : uint8_t {
 	UNION = 107,
 	ARRAY = 108,
 	VARIANT = 109,
-	TUPLE = 110 /* unnamed struct - shares the physical representation of STRUCT */
+	TUPLE = 110, /* unnamed struct - shares the physical representation of STRUCT */
+	NUMERIC = 111 /* exact numeric type with an inferred representation - only exists as a column/storage type */
 };
 
 struct ExtensionTypeInfo;
@@ -548,6 +549,7 @@ public:
 	static constexpr const LogicalTypeId BIGNUM = LogicalTypeId::BIGNUM;
 
 	static constexpr const LogicalTypeId INTERVAL = LogicalTypeId::INTERVAL;
+	static constexpr const LogicalTypeId NUMERIC = LogicalTypeId::NUMERIC;
 	static constexpr const LogicalTypeId HUGEINT = LogicalTypeId::HUGEINT;
 	static constexpr const LogicalTypeId UHUGEINT = LogicalTypeId::UHUGEINT;
 	static constexpr const LogicalTypeId UUID = LogicalTypeId::UUID;
