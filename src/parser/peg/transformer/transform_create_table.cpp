@@ -245,11 +245,15 @@ ConstraintColumnDefinition PEGTransformerFactory::TransformColumnDefinition(
 	auto qualified_name = QualifiedName(identifier);
 	bool has_type = type.has_value();
 	bool has_generated = generated_column && generated_column->expr != nullptr;
-	if (!has_type && !has_generated) {
-		throw ParserException("Column %s must have a type or be defined as a GENERATED column.",
-		                      qualified_name.ToString(QualifiedNameToStringMode::HIDE_DEFAULT_SCHEMA));
+	// a column without a type and without a generated expression is a VARIANT column
+	LogicalType column_type;
+	if (has_type) {
+		column_type = *type;
+	} else if (has_generated) {
+		column_type = LogicalType::ANY;
+	} else {
+		column_type = LogicalType::VARIANT();
 	}
-	auto column_type = has_type ? *type : LogicalType::ANY;
 	CompressionType compression_type = CompressionType::COMPRESSION_AUTO;
 	bool has_collation = false;
 	ColumnConstraint accumulated_constraints;
@@ -286,6 +290,10 @@ ConstraintColumnDefinition PEGTransformerFactory::TransformColumnDefinition(
 				has_collation = true;
 				if (has_generated) {
 					throw ParserException("Collations are not supported on generated columns");
+				}
+				if (!has_type) {
+					throw ParserException("Column %s must have an explicit VARCHAR type to specify a collation",
+					                      qualified_name.ToString(QualifiedNameToStringMode::HIDE_DEFAULT_SCHEMA));
 				}
 				column_type = ApplyColumnCollation(column_type, std::move(cc_entry.expression));
 			} else {

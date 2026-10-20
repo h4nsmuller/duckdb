@@ -305,15 +305,11 @@ AddColumnEntry PEGTransformerFactory::TransformAddColumnEntry(
 	bool has_type = type.has_value();
 	bool has_generated = generated_column && generated_column->expr != nullptr;
 	// TODO(Dtenwolde) this checking logic should be moved to the binder
-	if (!has_type && !has_generated) {
-		throw ParserException("Column definition requires a type or generated expression");
-	}
 	if (has_generated) {
 		throw ParserException("Adding generated columns after table creation is not supported yet");
 	}
-	if (type) {
-		new_column.type = *type;
-	}
+	// a column without a type is a VARIANT column
+	new_column.type = has_type ? *type : LogicalType::VARIANT();
 	if (column_constraint) {
 		for (auto &constraint : *column_constraint) {
 			auto constraint_type =

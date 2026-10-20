@@ -16,13 +16,18 @@ CREATE TABLE unit (
     bar AS (foo+1),
 )
 
-# Attempting to use implicit type on a standard column
-statement error
+# A standard column without a type is a VARIANT column; the generated column's type is still inferred
+statement ok
 CREATE TABLE tbl (
     foo,
     bar GENERATED ALWAYS AS (foo+1)
 );
+
+query II
+SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'tbl' ORDER BY ordinal_position
 ----
+foo	VARIANT
+bar	INTEGER
 
 statement ok
 INSERT INTO test(foo) VALUES (1);

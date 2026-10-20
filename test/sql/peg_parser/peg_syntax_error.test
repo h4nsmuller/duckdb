@@ -120,10 +120,15 @@ create table tbl (a bigint, b bigint, c bigint);
 statement ok
 SELECT a, b, SUM(c) FROM tbl GROUP BY GROUPING SETS (a, (b, ));
 
-statement error
+# a column without a type is a VARIANT column
+statement ok
 CREATE TABLE t1 (id INTEGER, name );
+
+query II
+SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 't1' ORDER BY ordinal_position
 ----
-Parser Error: Column "name" must have a type or be defined as a GENERATED column.
+id	INTEGER
+name	VARIANT
 
 # Cast followed by subscript/slice is not allowed without parentheses
 statement error

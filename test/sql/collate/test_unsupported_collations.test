@@ -18,7 +18,7 @@ Parser Error: Only VARCHAR columns can have collations!
 statement error
 CREATE TABLE collate_test(s COLLATE nocase)
 ----
-Parser Error: Column s must have a type or be defined as a GENERATED column.
+Parser Error: Column s must have an explicit VARCHAR type to specify a collation
 
 # we can combine multiple of the same collation
 statement ok

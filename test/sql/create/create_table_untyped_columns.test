@@ -1,0 +1,106 @@
+# name: test/sql/create/create_table_untyped_columns.test
+# description: A column definition without a type creates a VARIANT column
+# group: [create]
+
+statement ok
+CREATE TABLE t (a, b);
+
+query II
+SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 't' ORDER BY ordinal_position
+----
+a	VARIANT
+b	VARIANT
+
+query I
+SELECT sql FROM duckdb_tables() WHERE table_name = 't'
+----
+CREATE TABLE t(a VARIANT, b VARIANT);
+
+statement ok
+INSERT INTO t VALUES (1, 'x'), (2.5, [1, 2]), (NULL, {'k': 1}), (DATE '2024-01-01', 'y');
+
+query IIII
+SELECT a, variant_typeof(a), b, variant_typeof(b) FROM t
+----
+1	INT32	x	VARCHAR
+2.5	DECIMAL(2, 1)	[1, 2]	ARRAY(2)
+NULL	VARIANT_NULL	{'k': 1}	OBJECT(k)
+2024-01-01	DATE	y	VARCHAR
+
+# typed and untyped columns mix; constraints and defaults apply to the VARIANT column
+statement ok
+CREATE TABLE mixed (id INTEGER, payload NOT NULL, extra DEFAULT 42, gen AS (id + 1));
+
+statement ok
+INSERT INTO mixed (id, payload) VALUES (1, 'p');
+
+query IIII
+SELECT id, payload, extra, gen FROM mixed
+----
+1	p	42	2
+
+statement error
+INSERT INTO mixed (id) VALUES (2);
+----
+NOT NULL constraint failed
+
+query II
+SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'mixed' ORDER BY ordinal_position
+----
+id	INTEGER
+payload	VARIANT
+extra	VARIANT
+gen	INTEGER
+
+# ALTER TABLE ADD COLUMN without a type also adds a VARIANT column
+statement ok
+ALTER TABLE t ADD COLUMN c;
+
+statement ok
+ALTER TABLE t ADD COLUMN d DEFAULT 'dflt';
+
+query II
+SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 't' ORDER BY ordinal_position
+----
+a	VARIANT
+b	VARIANT
+c	VARIANT
+d	VARIANT
+
+query II
+SELECT c, d FROM t LIMIT 1
+----
+NULL	dflt
+
+# generated columns without a type keep inferring their type from the expression
+statement ok
+CREATE TABLE gen_only (i INTEGER, j AS (i * 2));
+
+query II
+SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'gen_only' ORDER BY ordinal_position
+----
+i	INTEGER
+j	INTEGER
+
+# an index key cannot be a VARIANT, so untyped PRIMARY KEY / UNIQUE columns are rejected
+statement error
+CREATE TABLE pk (id PRIMARY KEY);
+----
+Invalid type for index key
+
+statement error
+CREATE TABLE uq (id UNIQUE);
+----
+Invalid type for index key
+
+# collations need an explicit VARCHAR type
+statement error
+CREATE TABLE coll (s COLLATE NOCASE);
+----
+Column s must have an explicit VARCHAR type to specify a collation
+
+# unknown type names are still errors, not untyped columns
+statement error
+CREATE TABLE typo (a INTGER);
+----
+Type with name INTGER does not exist

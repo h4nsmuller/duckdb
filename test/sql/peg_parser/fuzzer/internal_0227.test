@@ -1,5 +1,5 @@
 # name: test/sql/peg_parser/fuzzer/internal_0227.test
-# description: ADD COLUMN with no type (PEG) should give clean error; nested ADD FIELD on missing parent should give clean binder error
+# description: ADD COLUMN with no type (PEG) is a VARIANT column; nested ADD FIELD on missing parent should give clean binder error
 # group: [fuzzer]
 
 statement ok
@@ -18,12 +18,12 @@ Binder Error: Table "mytbl" does not have a column with name "result"
 statement error
 ALTER TABLE mytbl ADD result . v;
 ----
-Parser Error: Column definition requires a type or generated expression
+Binder Error: Table "mytbl" does not have a column with name "result"
 
 statement error
 ALTER TABLE mytbl ADD IF NOT EXISTS result . v;
 ----
-Parser Error: Column definition requires a type or generated expression
+Binder Error: Table "mytbl" does not have a column with name "result"
 
 statement error
 ALTER TABLE mytbl ADD IF NOT EXISTS result . v bigint;
