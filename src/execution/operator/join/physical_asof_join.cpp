@@ -1356,9 +1356,9 @@ public:
 	//! Task management
 	bool TaskFinished() const;
 	//! Assign the next task
-	bool TryAssignTask() DUCKDB_EXCLUDES(gsource.lock);
-	//! Same, with the lock held, so that a caller can block on failure without missing an unblock
-	bool TryAssignTaskLocked() DUCKDB_REQUIRES(gsource.lock);
+	bool TryAssignTask();
+	//! Set up the local state for the task that was just assigned
+	void BeginTask();
 
 	void ExecuteSortTask(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &source);
 	void ExecuteMaterializeTask(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &source);
@@ -1402,6 +1402,8 @@ public:
 	TaskPtr task;
 	//! The task storage
 	Task task_local;
+	//! Whether this thread has returned any rows, i.e., whether the sink may be waiting on its local state
+	bool produced_output = false;
 	//! The start of the range of the current task, and the progress reported for it
 	idx_t task_begin = 0;
 	TaskProgressTracker task_progress;
@@ -1516,14 +1518,17 @@ bool AsOfLocalSourceState::TryAssignTask() {
 		}
 	}
 
-	annotated_lock_guard<annotated_mutex> guard(gsource.lock);
-	return TryAssignTaskLocked();
+	{
+		annotated_lock_guard<annotated_mutex> guard(gsource.lock);
+		if (!gsource.TryNextTaskLocked(task, task_local)) {
+			return false;
+		}
+	}
+	BeginTask();
+	return true;
 }
 
-bool AsOfLocalSourceState::TryAssignTaskLocked() {
-	if (!gsource.TryNextTaskLocked(task, task_local)) {
-		return false;
-	}
+void AsOfLocalSourceState::BeginTask() {
 	task_begin = task->begin_idx;
 	task_progress.Start();
 
@@ -1542,8 +1547,6 @@ bool AsOfLocalSourceState::TryAssignTaskLocked() {
 	case AsOfJoinSourceStage::DONE:
 		break;
 	}
-
-	return true;
 }
 
 bool AsOfGlobalSourceState::TryNextTaskLocked(TaskPtr &task, Task &task_local) {
@@ -1690,18 +1693,29 @@ SourceResultType PhysicalAsOfJoin::GetDataInternal(ExecutionContext &context, Da
 	// Therefore, we loop until we've produced tuples, or until the operator is actually done
 	while (gsource.HasUnfinishedTasks() && chunk.size() == 0) {
 		if (lsource.TaskFinished() && !lsource.TryAssignTask()) {
-			annotated_lock_guard<annotated_mutex> guard(gsource.lock);
-			if (!gsource.HasMoreTasks()) {
-				gsource.UnblockTasks();
-				break;
+			{
+				annotated_lock_guard<annotated_mutex> guard(gsource.lock);
+				if (!gsource.HasMoreTasks()) {
+					gsource.UnblockTasks();
+					break;
+				}
+				// TryAssignTask released the lock: another thread may have prepared the next stage and unblocked
+				// the blocked tasks in between, so look again before blocking, or no one would ever unblock this task.
+				if (!gsource.TryNextTaskLocked(lsource.task, lsource.task_local)) {
+					if (lsource.produced_output) {
+						// The rows this thread returned may be waiting in the sink, and a sink can refuse to make
+						// progress until this thread has combined its local state (a partitioned COPY flush does).
+						// Blocking here would then deadlock: the running tasks that would advance the stage are
+						// blocked in the sink. So finish instead and leave the remaining tasks (e.g., RIGHT) to the
+						// threads that are still running, at the cost of running them on fewer threads.
+						gsource.UnblockTasks();
+						break;
+					}
+					// Nothing from this thread has reached the sink yet, so it is safe to wait for the next stage
+					return gsource.BlockSource(input.interrupt_state);
+				}
 			}
-			// TryAssignTask released the lock: another thread may have prepared the next stage and unblocked the
-			// blocked tasks in between, so look again before blocking, or no one would ever unblock this task.
-			if (!lsource.TryAssignTaskLocked()) {
-				// there are more tasks available, but we can't execute them yet
-				// block the source
-				return gsource.BlockSource(input.interrupt_state);
-			}
+			lsource.BeginTask();
 		}
 		try {
 			lsource.ExecuteTask(context, chunk, input);
@@ -1717,7 +1731,11 @@ SourceResultType PhysicalAsOfJoin::GetDataInternal(ExecutionContext &context, Da
 		}
 	}
 
-	return chunk.size() > 0 ? SourceResultType::HAVE_MORE_OUTPUT : SourceResultType::FINISHED;
+	if (chunk.size() == 0) {
+		return SourceResultType::FINISHED;
+	}
+	lsource.produced_output = true;
+	return SourceResultType::HAVE_MORE_OUTPUT;
 }
 
 void AsOfLocalSourceState::ExecuteRightTask(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) {

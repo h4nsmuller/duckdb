@@ -8,7 +8,10 @@ statement ok
 PRAGMA threads=4;
 
 statement ok
-SET memory_limit='500MB';
+PRAGMA explain_output = PHYSICAL_ONLY;
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
 
 # Flush early so that the partitioned sink waits for every producer while the join is still running
 statement ok
@@ -24,6 +27,20 @@ CREATE TABLE r AS
 SELECT (DATE '1998-01-08' + INTERVAL ((i * 7919) % 1996) DAY)::DATE AS r_date, i AS r_id
 FROM range(2000) t(i);
 
+# Half of the rows match almost everything, the other half almost nothing, so one join task finishes
+# long before the other and its thread has to wait for the rest of the join inside the source
+statement ok
+CREATE TABLE r_skew AS
+SELECT (CASE WHEN i < 1000 THEN DATE '1998-01-01' ELSE DATE '2002-10-01' END + INTERVAL (i % 90) DAY)::DATE AS r_date,
+       i AS r_id
+FROM range(2000) t(i);
+
+# INNER: the threads that ran out of INNER tasks used to block until the stage completed
+query II
+EXPLAIN SELECT * FROM d JOIN r ON d.d_date >= r.r_date AND d.d_date + INTERVAL 90 DAY >= r.r_date;
+----
+physical_plan	<REGEX>:.*IE_JOIN.*
+
 query I
 SELECT count(*) FROM d JOIN r ON d.d_date >= r.r_date AND d.d_date + INTERVAL 90 DAY >= r.r_date;
 ----
@@ -33,9 +50,109 @@ statement ok
 COPY (
 	SELECT *, hash(d_sk, r_id) % 2 AS part
 	FROM d JOIN r ON d.d_date >= r.r_date AND d.d_date + INTERVAL 90 DAY >= r.r_date
-) TO '{TEST_DIR}/partitioned_iejoin' (FORMAT PARQUET, PARTITION_BY (part));
+) TO '{TEST_DIR}/partitioned_iejoin_inner' (FORMAT PARQUET, PARTITION_BY (part));
 
 query I
-SELECT count(*) FROM read_parquet('{TEST_DIR}/partitioned_iejoin/**/*.parquet');
+SELECT count(*) FROM read_parquet('{TEST_DIR}/partitioned_iejoin_inner/**/*.parquet');
 ----
 1658949
+
+# LEFT: the threads that ran out of INNER tasks used to block waiting for the OUTER stage
+query II
+EXPLAIN SELECT * FROM d LEFT JOIN r_skew r ON d.d_date >= r.r_date AND d.d_date + INTERVAL 90 DAY >= r.r_date;
+----
+physical_plan	<REGEX>:.*IE_JOIN.*
+
+query I
+SELECT count(*) FROM d LEFT JOIN r_skew r ON d.d_date >= r.r_date AND d.d_date + INTERVAL 90 DAY >= r.r_date;
+----
+1831700
+
+statement ok
+COPY (
+	SELECT *, hash(d_sk, r_id) % 2 AS part
+	FROM d LEFT JOIN r_skew r ON d.d_date >= r.r_date AND d.d_date + INTERVAL 90 DAY >= r.r_date
+) TO '{TEST_DIR}/partitioned_iejoin_left' (FORMAT PARQUET, PARTITION_BY (part));
+
+query I
+SELECT count(*) FROM read_parquet('{TEST_DIR}/partitioned_iejoin_left/**/*.parquet');
+----
+1831700
+
+# FULL OUTER
+query II
+EXPLAIN SELECT * FROM d FULL OUTER JOIN r_skew r ON d.d_date >= r.r_date AND d.d_date + INTERVAL 90 DAY >= r.r_date;
+----
+physical_plan	<REGEX>:.*IE_JOIN.*
+
+query I
+SELECT count(*) FROM d FULL OUTER JOIN r_skew r ON d.d_date >= r.r_date AND d.d_date + INTERVAL 90 DAY >= r.r_date;
+----
+1831700
+
+statement ok
+COPY (
+	SELECT *, hash(d_sk, r_id) % 2 AS part
+	FROM d FULL OUTER JOIN r_skew r ON d.d_date >= r.r_date AND d.d_date + INTERVAL 90 DAY >= r.r_date
+) TO '{TEST_DIR}/partitioned_iejoin_full' (FORMAT PARQUET, PARTITION_BY (part));
+
+query I
+SELECT count(*) FROM read_parquet('{TEST_DIR}/partitioned_iejoin_full/**/*.parquet');
+----
+1831700
+
+# ANTI: the rows come out of the ANTI stage after the INNER stage
+statement ok
+CREATE TABLE rr AS SELECT r.*, j FROM r, range(50) t(j);
+
+statement ok
+SET prefer_range_joins=true;
+
+query II
+EXPLAIN SELECT * FROM rr r ANTI JOIN d ON d.d_date >= r.r_date AND d.d_date + INTERVAL 90 DAY >= r.r_date;
+----
+physical_plan	<REGEX>:.*IE_JOIN.*
+
+query I
+SELECT count(*) FROM rr r ANTI JOIN d ON d.d_date >= r.r_date AND d.d_date + INTERVAL 90 DAY >= r.r_date;
+----
+8900
+
+statement ok
+COPY (
+	SELECT *, hash(r_id, j) % 2 AS part
+	FROM rr r ANTI JOIN d ON d.d_date >= r.r_date AND d.d_date + INTERVAL 90 DAY >= r.r_date
+) TO '{TEST_DIR}/partitioned_iejoin_anti' (FORMAT PARQUET, PARTITION_BY (part));
+
+query I
+SELECT count(*) FROM read_parquet('{TEST_DIR}/partitioned_iejoin_anti/**/*.parquet');
+----
+8900
+
+statement ok
+SET prefer_range_joins=false;
+
+# ASOF RIGHT: the AsOf join source blocked the same way while waiting for its RIGHT stage
+statement ok
+CREATE TABLE dd AS SELECT d.*, j FROM d, range(1000) t(j);
+
+query II
+EXPLAIN SELECT * FROM dd ASOF RIGHT JOIN r_skew r ON dd.d_date >= r.r_date;
+----
+physical_plan	<REGEX>:.*ASOF_JOIN.*
+
+query I
+SELECT count(*) FROM dd ASOF RIGHT JOIN r_skew r ON dd.d_date >= r.r_date;
+----
+1828820
+
+statement ok
+COPY (
+	SELECT *, hash(d_sk, j, r_id) % 2 AS part
+	FROM dd ASOF RIGHT JOIN r_skew r ON dd.d_date >= r.r_date
+) TO '{TEST_DIR}/partitioned_asof_right' (FORMAT PARQUET, PARTITION_BY (part));
+
+query I
+SELECT count(*) FROM read_parquet('{TEST_DIR}/partitioned_asof_right/**/*.parquet');
+----
+1828820
