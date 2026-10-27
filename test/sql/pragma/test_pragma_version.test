@@ -43,3 +43,18 @@ query I
 select count(*) FROM (select codename from pragma_version() WHERE codename LIKE getvariable('codename'));
 ----
 1
+
+# release builds of a known version line must report that line's codename, not 'Unknown Version'
+query I
+SELECT count(*) FROM pragma_version()
+WHERE library_version NOT LIKE '%-%'
+  AND codename <> CASE
+    WHEN library_version LIKE 'v1.2.%' THEN 'Histrionicus'
+    WHEN library_version LIKE 'v1.3.%' THEN 'Ossivalis'
+    WHEN library_version LIKE 'v1.4.%' THEN 'Andium'
+    WHEN library_version LIKE 'v1.5.%' THEN 'Variegata'
+    WHEN library_version LIKE 'v2.0.%' THEN 'Cyanoptera'
+    WHEN library_version LIKE 'v2.1.%' THEN 'Islandica'
+    ELSE codename END;
+----
+0
