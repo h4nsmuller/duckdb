@@ -53,6 +53,7 @@
 #include "duckdb/optimizer/outer_join_simplification.hpp"
 #include "duckdb/optimizer/partial_aggregate_pushdown.hpp"
 #include "duckdb/optimizer/projection_pullup.hpp"
+#include "duckdb/optimizer/rank_window_topn.hpp"
 #include "duckdb/optimizer/projection_placement.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/logical_plan_verifier.hpp"
@@ -344,6 +345,12 @@ void Optimizer::RunBuiltInOptimizers() {
 	RunOptimizer(OptimizerType::OUTER_JOIN_SIMPLIFICATION, [&]() {
 		OuterJoinSimplification outer_join_simplification;
 		outer_join_simplification.VisitOperator(*plan);
+	});
+
+	// Adds a per-partition threshold filter below windows whose rank() / dense_rank() is filtered with rank <= k
+	RunOptimizer(OptimizerType::RANK_WINDOW_TOPN, [&]() {
+		RankWindowTopN rank_window_topn(*this);
+		plan = rank_window_topn.Optimize(std::move(plan));
 	});
 
 	// then we perform the join ordering optimization

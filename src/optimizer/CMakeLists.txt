@@ -42,6 +42,7 @@ add_library_unity(
   grouping_sets_optimizer.cpp
   in_clause_rewriter.cpp
   join_filter_pushdown_optimizer.cpp
+  rank_window_topn.cpp
   runtime_filter_cast.cpp
   late_materialization.cpp
   late_materialization_helper.cpp

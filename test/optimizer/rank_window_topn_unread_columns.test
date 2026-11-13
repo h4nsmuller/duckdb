@@ -1,0 +1,125 @@
+# name: test/optimizer/rank_window_topn_unread_columns.test
+# description: rank() / dense_rank() <= k over a window partition: a materialized window input keeps only the columns the plan reads
+# group: [optimizer]
+
+# The rule materializes a window input that is not a scan / projection / filter chain (a join, a recursive CTE) in a
+# CTE that both the pre-filter's probe side and its threshold aggregate read. A column of that input which nothing
+# reads is dead without the rewrite: REMOVE_UNUSED_COLUMNS drops its expression, so an expression that throws never
+# runs. The CTE must not bring it back to life.
+
+statement ok
+CREATE TABLE t AS SELECT i AS k, (i * 7) % 13 AS v, 'x' || i AS s FROM range(100000) r(i);
+
+statement ok
+CREATE TABLE u AS SELECT i AS k FROM range(100000) r(i);
+
+foreach disabled 'rank_window_topn' ''
+
+statement ok
+SET disabled_optimizers = {disabled};
+
+# 1. an unread column whose cast throws on every row, below a join
+query III nosort
+SELECT k, v, rk
+FROM (SELECT k, v, rank() OVER (ORDER BY v DESC) rk
+      FROM (SELECT t.k, t.v, CAST(t.s AS INTEGER) AS bad FROM t JOIN u ON t.k = u.k))
+WHERE rk <= 1 ORDER BY ALL LIMIT 3
+----
+11	12	1
+24	12	1
+37	12	1
+
+# 2. the same column selected by a star below the filter and dropped above it
+query III nosort
+SELECT k, v, rk
+FROM (SELECT *, rank() OVER (ORDER BY v DESC) rk
+      FROM (SELECT t.k, t.v, CAST(t.s AS INTEGER) AS bad FROM t JOIN u ON t.k = u.k))
+WHERE rk <= 1 ORDER BY ALL LIMIT 3
+----
+11	12	1
+24	12	1
+37	12	1
+
+# 3. with partitions
+query IIII nosort
+SELECT p, k, v, rk
+FROM (SELECT p, k, v, rank() OVER (PARTITION BY p ORDER BY v DESC, k) rk
+      FROM (SELECT t.k % 3 AS p, t.k, t.v, CAST(t.s AS INTEGER) AS bad FROM t JOIN u ON t.k = u.k))
+WHERE rk <= 2 ORDER BY ALL
+----
+0	24	12	1
+0	63	12	2
+1	37	12	1
+1	76	12	2
+2	11	12	1
+2	50	12	2
+
+# 4. a recursive CTE whose anchor leaves a column untyped: the recursive branch casts its BIGINT to the anchor's NULL
+# type, a cast that does not exist; nothing reads the column
+query III nosort
+WITH RECURSIVE h AS (
+	SELECT k, v, NULL AS parent FROM t WHERE k < 1000
+	UNION ALL
+	SELECT t.k, t.v, h.k AS parent FROM t JOIN h ON t.k = h.k + 1000 WHERE h.k < 3
+)
+SELECT k, v, rk FROM (SELECT k, v, rank() OVER (ORDER BY v DESC, k) rk FROM h) WHERE rk <= 3 ORDER BY ALL
+----
+11	12	1
+24	12	2
+37	12	3
+
+# 5. the columns the plan does read come out of the CTE unchanged: one read above the filter only (s), one read by
+# the ordering only (v), one by both (k)
+query III nosort
+SELECT k, s, rk
+FROM (SELECT k, s, rank() OVER (ORDER BY v DESC, k) rk
+      FROM (SELECT t.k, t.v, t.s, CAST(t.s AS INTEGER) AS bad FROM t JOIN u ON t.k = u.k))
+WHERE rk <= 3 ORDER BY ALL
+----
+11	x11	1
+24	x24	2
+37	x37	3
+
+# 6. a rank filter over a rank filter: the outer rewrite materializes the inner one's output, whose columns are the
+# inner CTE scan's
+query IIII nosort
+SELECT k, v, rk, rk2
+FROM (SELECT k, v, rk, rank() OVER (ORDER BY k DESC) rk2
+      FROM (SELECT k, v, rank() OVER (ORDER BY v DESC) rk
+            FROM (SELECT t.k, t.v, CAST(t.s AS INTEGER) AS bad FROM t JOIN u ON t.k = u.k))
+      WHERE rk <= 1)
+WHERE rk2 <= 2 ORDER BY ALL
+----
+99981	12	1	2
+99994	12	1	1
+
+# 7. a column that is read does throw, with or without the rewrite
+statement error
+SELECT k, bad, rk
+FROM (SELECT k, bad, rank() OVER (ORDER BY v DESC) rk
+      FROM (SELECT t.k, t.v, CAST(t.s AS INTEGER) AS bad FROM t JOIN u ON t.k = u.k))
+WHERE rk <= 1
+----
+Conversion Error
+
+endloop
+
+# the rewrite fires in CTE mode for these shapes, and the unread column is a NULL constant of the CTE definition
+statement ok
+SET disabled_optimizers = '';
+
+query II
+EXPLAIN SELECT k, v, rk
+FROM (SELECT k, v, rank() OVER (ORDER BY v DESC) rk
+      FROM (SELECT t.k, t.v, CAST(t.s AS INTEGER) AS bad FROM t JOIN u ON t.k = u.k))
+WHERE rk <= 1
+----
+physical_plan	<REGEX>:.*__rank_topn_cte_.*__rank_topn_threshold.*
+
+query II
+EXPLAIN SELECT k, v, rk
+FROM (SELECT k, v, rank() OVER (ORDER BY v DESC) rk
+      FROM (SELECT t.k, t.v, CAST(t.s AS INTEGER) AS bad FROM t JOIN u ON t.k = u.k))
+WHERE rk <= 1
+----
+physical_plan	<!REGEX>:.*CAST\(s AS INTEGER\).*

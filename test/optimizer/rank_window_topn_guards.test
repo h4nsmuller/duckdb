@@ -1,0 +1,506 @@
+# name: test/optimizer/rank_window_topn_guards.test
+# description: rank() / dense_rank() <= k over a window partition: one negative test per precondition next to a positive one, results on edge inputs
+# group: [optimizer]
+
+# the rule reads the table's distinct counts for its partition guard (in-memory statistics)
+require skip_reload
+
+statement ok
+CREATE TABLE t(p INTEGER, o INTEGER, o2 VARCHAR, v INTEGER);
+
+# partitions 1..4 and a NULL partition with ties and NULL keys, as in rank_window_topn.test
+statement ok
+INSERT INTO t VALUES
+	(1, 1, 'a', 1), (1, 1, 'b', 2), (1, 2, 'c', 3), (1, 3, 'd', 4), (1, 3, 'e', 5), (1, 4, 'f', 6), (1, NULL, 'g', 7),
+	(2, 10, 'a', 1), (2, 20, 'b', 2), (2, 20, 'c', 3), (2, 20, 'd', 4), (2, 30, 'e', 5),
+	(3, 5, 'x', 1), (3, NULL, 'y', 2), (3, NULL, 'z', 3),
+	(4, 7, 'q', 1), (4, 8, 'r', 2),
+	(NULL, 1, 'n', 1), (NULL, 2, 'n', 2), (NULL, 2, 'n', 3), (NULL, 3, 'n', 4);
+
+# filler partitions (20 rows each) so that the statistics are far on the firing side of the partition guard
+statement ok
+INSERT INTO t SELECT 100 + i % 100, i, 'z', i FROM range(2000) r(i);
+
+# DOUBLE keys: NaN, +-inf, +-0.0, NULL; p = 3 has only NULL keys
+statement ok
+CREATE TABLE f(p INTEGER, d DOUBLE, v INTEGER);
+
+statement ok
+INSERT INTO f VALUES (1, 'nan', 1), (1, 'inf', 2), (1, '-inf', 3), (1, 0.0, 4), (1, -0.0, 5), (1, 1.5, 6), (1, NULL, 7), (2, 'nan', 1), (2, 'nan', 2), (2, 3.0, 3), (2, NULL, 4), (3, NULL, 1), (3, NULL, 2);
+
+statement ok
+INSERT INTO f SELECT 100 + i % 50, i, i FROM range(2000) r(i);
+
+# nested keys with inner NULLs and NULL keys
+statement ok
+CREATE TABLE n(p INTEGER, s STRUCT(a INTEGER, b INTEGER), l INTEGER[], v INTEGER);
+
+statement ok
+INSERT INTO n VALUES (1, {'a': 1, 'b': NULL}, [1, NULL], 1), (1, {'a': 1, 'b': 2}, [1, 2], 2), (1, {'a': NULL, 'b': 5}, [NULL, 5], 3), (1, NULL, NULL, 4), (1, {'a': 1, 'b': 1}, [1], 5), (1, {'a': 2, 'b': NULL}, [2, NULL, 1], 6),
+	(2, {'a': NULL, 'b': NULL}, [NULL], 1), (2, {'a': 0, 'b': 0}, [], 2), (2, NULL, NULL, 3), (2, {'a': NULL, 'b': NULL}, [NULL], 4);
+
+statement ok
+INSERT INTO n SELECT 100 + i % 50, {'a': i, 'b': i}, [i], i FROM range(2000) r(i);
+
+statement ok
+SET explain_output = 'optimized_only';
+
+statement ok
+SET disabled_optimizers = '';
+
+statement ok
+SET disabled_optimizers = '';
+
+# every pin below looks for `__rank_topn_threshold`, the alias of the threshold column in the projection the rewrite
+# builds below the window: present = fired, absent = the plan was left alone
+
+# ---------------------------------------------------------------------------------------------------------------
+# POSITIVE: shapes without a pin so far
+# ---------------------------------------------------------------------------------------------------------------
+
+# the base shape every negative below is a one-step variation of
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 10 OR p IS NULL) WHERE rk <= 2
+----
+logical_opt	<REGEX>:.*__rank_topn_threshold.*
+
+# QUALIFY
+query II
+EXPLAIN SELECT p, o, v FROM t WHERE p < 10 OR p IS NULL QUALIFY rank() OVER (PARTITION BY p ORDER BY o) <= 2
+----
+logical_opt	<REGEX>:.*__rank_topn_threshold.*
+
+# dense_rank
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, dense_rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 10 OR p IS NULL) WHERE rk <= 2
+----
+logical_opt	<REGEX>:.*__rank_topn_threshold.*
+
+# M1: a volatile input is not copied but materialized once (a copy of random() would key the two sides differently)
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM (SELECT * FROM t WHERE (p < 10 OR p IS NULL) AND random() < 2)) WHERE rk <= 2
+----
+logical_opt	<REGEX>:.*__rank_topn_cte_.*__rank_topn_threshold.*
+
+# a set-operation input (CTE mode)
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM (SELECT * FROM t WHERE p < 10 UNION ALL SELECT * FROM t WHERE p IS NULL)) WHERE rk <= 2
+----
+logical_opt	<REGEX>:.*__rank_topn_cte_.*__rank_topn_threshold.*
+
+# a prepared limit is a constant by the time the rule runs
+statement ok
+PREPARE pq AS SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 3) WHERE rk <= $1 ORDER BY ALL
+
+query II
+EXPLAIN EXECUTE pq(1)
+----
+logical_opt	<REGEX>:.*__rank_topn_threshold.*
+
+# ---------------------------------------------------------------------------------------------------------------
+# TOGGLE: the rule's own name restores the plain window plan (QUALIFY shape)
+# ---------------------------------------------------------------------------------------------------------------
+
+statement ok
+SET disabled_optimizers = 'rank_window_topn';
+
+query II
+EXPLAIN SELECT p, o, v FROM t WHERE p < 10 OR p IS NULL QUALIFY rank() OVER (PARTITION BY p ORDER BY o) <= 2
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+statement ok
+SET disabled_optimizers = '';
+
+# ---------------------------------------------------------------------------------------------------------------
+# NEGATIVE per guard; the base shape above is the sibling positive unless one is given
+# ---------------------------------------------------------------------------------------------------------------
+
+# an OR with a disjunct that is not a rank predicate. A pre-filter on rk <= 1 would drop (1, 4, 6), which the
+# second disjunct keeps
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 10 OR p IS NULL) WHERE rk <= 1 OR v = 6
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+query III
+SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 10 OR p IS NULL) WHERE rk <= 1 OR v = 6 ORDER BY ALL
+----
+1	1	1
+1	1	2
+1	4	6
+2	10	1
+3	5	1
+4	7	1
+NULL	1	1
+
+# the rank side is not a bare column (a cast of the rank) ...
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 10 OR p IS NULL) WHERE rk::INTEGER <= 1
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+query III
+SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 10 OR p IS NULL) WHERE rk::INTEGER <= 1 ORDER BY ALL
+----
+1	1	1
+1	1	2
+2	10	1
+3	5	1
+4	7	1
+NULL	1	1
+
+# ... a constant that is not a BIGINT (the comparison casts the rank)
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 10 OR p IS NULL) WHERE rk <= 2.5
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+# >, <> and IS DISTINCT FROM keep the rows a threshold would remove; the constant on the left is flipped, so
+# `2 < rk` is `rk > 2` (no rewrite) and `2 >= rk` is `rk <= 2` (the sibling positive)
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 10 OR p IS NULL) WHERE rk > 4
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+query III
+SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 10 OR p IS NULL) WHERE rk > 4 ORDER BY ALL
+----
+1	4	6
+1	NULL	7
+2	30	5
+
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p = 1) WHERE rk <> 1
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+query III
+SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p = 1) WHERE rk <> 1 ORDER BY ALL
+----
+1	2	3
+1	3	4
+1	3	5
+1	4	6
+1	NULL	7
+
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p = 1) WHERE rk IS DISTINCT FROM 1
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 10 OR p IS NULL) WHERE 2 < rk
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 10 OR p IS NULL) WHERE 2 >= rk
+----
+logical_opt	<REGEX>:.*__rank_topn_threshold.*
+
+# the filter's column is computed from the rank by a projection in between (5 - rk <= 1 keeps the LAST ranks) ...
+query II
+EXPLAIN SELECT p, o, v, rk FROM (SELECT p, o, v, 5 - rk AS rk FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 10 OR p IS NULL)) WHERE rk <= 1
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+query IIII
+SELECT p, o, v, rk FROM (SELECT p, o, v, 5 - rk AS rk FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 10 OR p IS NULL)) WHERE rk <= 1 ORDER BY ALL
+----
+1	3	4	1
+1	3	5	1
+1	4	6	-1
+1	NULL	7	-2
+2	30	5	0
+NULL	3	4	1
+
+# ... while a projection that passes the rank through under another name fires
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT p, o, v, rk AS r2 FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 10 OR p IS NULL)) WHERE r2 <= 2
+----
+logical_opt	<REGEX>:.*__rank_topn_threshold.*
+
+# other window functions over the same window: ntile, cume_dist, a running count (dense_rank above is the
+# sibling positive). ntile(4) <= 2 keeps half of the partition, the count's value depends on the rows after it
+query II
+EXPLAIN SELECT p, o, v, rk FROM (SELECT *, ntile(4) OVER (PARTITION BY p ORDER BY o, v) rk FROM t WHERE p = 1) WHERE rk <= 2
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+query IIII
+SELECT p, o, v, rk FROM (SELECT *, ntile(4) OVER (PARTITION BY p ORDER BY o, v) rk FROM t WHERE p = 1) WHERE rk <= 2 ORDER BY ALL
+----
+1	1	1	1
+1	1	2	1
+1	2	3	2
+1	3	4	2
+
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, cume_dist() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p = 2) WHERE rk <= 1
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+query III
+SELECT p, o, v FROM (SELECT *, cume_dist() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p = 2) WHERE rk <= 1 ORDER BY ALL
+----
+2	10	1
+2	20	2
+2	20	3
+2	20	4
+2	30	5
+
+query II
+EXPLAIN SELECT p, o, v, rk FROM (SELECT *, count(*) OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p = 1) WHERE rk <= 2
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+query IIII
+SELECT p, o, v, rk FROM (SELECT *, count(*) OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p = 1) WHERE rk <= 2 ORDER BY ALL
+----
+1	1	1	2
+1	1	2	2
+
+# no ORDER BY in the window (every row has rank 1, there is no key to threshold)
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p) rk FROM t WHERE p < 10 OR p IS NULL) WHERE rk <= 1
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+query II
+SELECT p, count(*) FROM (SELECT *, rank() OVER (PARTITION BY p) rk FROM t WHERE p < 10 OR p IS NULL) WHERE rk <= 1 GROUP BY p ORDER BY ALL
+----
+1	7
+2	5
+3	3
+4	2
+NULL	4
+
+# an argument ordering (the rank follows v DESC, not the window's o) ...
+query II
+EXPLAIN SELECT p, o, v, rk FROM (SELECT *, rank(ORDER BY v DESC) OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p = 1) WHERE rk <= 2
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+query IIII
+SELECT p, o, v, rk FROM (SELECT *, rank(ORDER BY v DESC) OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p = 1) WHERE rk <= 2 ORDER BY ALL
+----
+1	1	1	2
+1	1	2	1
+1	2	3	1
+1	3	4	2
+1	3	5	1
+1	4	6	1
+1	NULL	7	1
+
+# ... and its sibling without the argument ordering
+query II
+EXPLAIN SELECT p, o, v, rk FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p = 1) WHERE rk <= 2
+----
+logical_opt	<REGEX>:.*__rank_topn_threshold.*
+
+# an EXCLUDE clause; the same frame without it is the default frame and fires
+query II
+EXPLAIN SELECT p, o, v, rk FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) rk FROM t WHERE p = 1) WHERE rk <= 2
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+query II
+EXPLAIN SELECT p, o, v, rk FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) rk FROM t WHERE p = 1) WHERE rk <= 2
+----
+logical_opt	<REGEX>:.*__rank_topn_threshold.*
+
+# two disjuncts on the same ranking
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p = 1) WHERE rk <= 1 OR rk = 3
+----
+logical_opt	<!REGEX>:.*__rank_topn_threshold.*
+
+query III
+SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p = 1) WHERE rk <= 1 OR rk = 3 ORDER BY ALL
+----
+1	1	1
+1	1	2
+1	2	3
+
+# ---------------------------------------------------------------------------------------------------------------
+# RESULT: the same rows with the rule disabled and enabled (every query below is a shape that the rule rewrites, see the plans after
+# the loop)
+# ---------------------------------------------------------------------------------------------------------------
+
+foreach disabled 'rank_window_topn' ''
+
+statement ok
+SET disabled_optimizers = {disabled};
+
+# QUALIFY
+query III
+SELECT p, o, v FROM t WHERE p < 3 QUALIFY rank() OVER (PARTITION BY p ORDER BY o) <= 2 ORDER BY ALL
+----
+1	1	1
+1	1	2
+2	10	1
+2	20	2
+2	20	3
+2	20	4
+
+# a volatile input (materialized once)
+query III
+SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM (SELECT * FROM t WHERE p < 3 AND random() < 2)) WHERE rk <= 2 ORDER BY ALL
+----
+1	1	1
+1	1	2
+2	10	1
+2	20	2
+2	20	3
+2	20	4
+
+# a UNION ALL input
+query III
+SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM (SELECT * FROM t WHERE p = 4 UNION ALL SELECT * FROM t WHERE p IS NULL)) WHERE rk <= 2 ORDER BY ALL
+----
+4	7	1
+4	8	2
+NULL	1	1
+NULL	2	2
+NULL	2	3
+
+# empty input
+query III
+SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < -5) WHERE rk <= 2 ORDER BY ALL
+----
+
+query I
+SELECT count(*) FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < -5) WHERE rk <= 2
+----
+0
+
+# DOUBLE keys: -inf first, +0.0 and -0.0 tie, NaN is the largest value, a partition of NULL keys keeps every row
+query IRII
+SELECT p, d, v, rk FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY d) rk FROM f WHERE p < 10) WHERE rk <= 2 ORDER BY ALL
+----
+1	-inf	3	1
+1	0.0	4	2
+1	0.0	5	2
+2	3.0	3	1
+2	nan	1	2
+2	nan	2	2
+3	NULL	1	1
+3	NULL	2	1
+
+query IRII
+SELECT p, d, v, rk FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY d DESC) rk FROM f WHERE p < 10) WHERE rk <= 2 ORDER BY ALL
+----
+1	inf	2	2
+1	nan	1	1
+2	nan	1	1
+2	nan	2	1
+3	NULL	1	1
+3	NULL	2	1
+
+query IRII
+SELECT p, d, v, rk FROM (SELECT *, dense_rank() OVER (PARTITION BY p ORDER BY d DESC NULLS FIRST) rk FROM f WHERE p < 10) WHERE rk <= 2 ORDER BY ALL
+----
+1	nan	1	2
+1	NULL	7	1
+2	nan	1	2
+2	nan	2	2
+2	NULL	4	1
+3	NULL	1	1
+3	NULL	2	1
+
+# STRUCT keys with inner NULLs (the raw-column mode compares the key with the threshold)
+query ITII
+SELECT p, s, v, rk FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY s) rk FROM n WHERE p < 10) WHERE rk <= 2 ORDER BY p, rk, v
+----
+1	{'a': 1, 'b': 1}	5	1
+1	{'a': 1, 'b': 2}	2	2
+2	{'a': 0, 'b': 0}	2	1
+2	{'a': NULL, 'b': NULL}	1	2
+2	{'a': NULL, 'b': NULL}	4	2
+
+query ITII
+SELECT p, s, v, rk FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY s DESC NULLS LAST) rk FROM n WHERE p < 10) WHERE rk <= 3 ORDER BY p, rk, v
+----
+1	{'a': NULL, 'b': 5}	3	1
+1	{'a': 2, 'b': NULL}	6	2
+1	{'a': 1, 'b': NULL}	1	3
+2	{'a': NULL, 'b': NULL}	1	1
+2	{'a': NULL, 'b': NULL}	4	1
+2	{'a': 0, 'b': 0}	2	3
+
+# LIST keys with inner NULLs
+query ITII
+SELECT p, l, v, rk FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY l) rk FROM n WHERE p < 10) WHERE rk <= 2 ORDER BY p, rk, v
+----
+1	[1]	5	1
+1	[1, 2]	2	2
+2	[]	2	1
+2	[NULL]	1	2
+2	[NULL]	4	2
+
+query ITII
+SELECT p, l, v, rk FROM (SELECT *, dense_rank() OVER (PARTITION BY p ORDER BY l DESC) rk FROM n WHERE p < 10) WHERE rk <= 3 ORDER BY p, rk, v
+----
+1	[NULL, 5]	3	1
+1	[2, NULL, 1]	6	2
+1	[1, NULL]	1	3
+2	[NULL]	1	1
+2	[NULL]	4	1
+2	[]	2	2
+2	NULL	3	3
+
+# a prepared limit: every execution takes its own k
+statement ok
+PREPARE q AS SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < 3) WHERE rk <= $1 ORDER BY ALL
+
+query III
+EXECUTE q(1)
+----
+1	1	1
+1	1	2
+2	10	1
+
+query III
+EXECUTE q(3)
+----
+1	1	1
+1	1	2
+1	2	3
+2	10	1
+2	20	2
+2	20	3
+2	20	4
+
+query III
+EXECUTE q(1)
+----
+1	1	1
+1	1	2
+2	10	1
+
+endloop
+
+# the edge-input queries above are fired shapes
+statement ok
+SET disabled_optimizers = '';
+
+query II
+EXPLAIN SELECT p, o, v FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY o) rk FROM t WHERE p < -5) WHERE rk <= 2
+----
+logical_opt	<REGEX>:.*__rank_topn_threshold.*
+
+query II
+EXPLAIN SELECT p, d, v, rk FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY d DESC) rk FROM f WHERE p < 10) WHERE rk <= 2
+----
+logical_opt	<REGEX>:.*__rank_topn_threshold.*
+
+query II
+EXPLAIN SELECT p, s, v, rk FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY s DESC NULLS LAST) rk FROM n WHERE p < 10) WHERE rk <= 3
+----
+logical_opt	<REGEX>:.*__rank_topn_threshold.*
+
+query II
+EXPLAIN SELECT p, l, v, rk FROM (SELECT *, dense_rank() OVER (PARTITION BY p ORDER BY l DESC) rk FROM n WHERE p < 10) WHERE rk <= 3
+----
+logical_opt	<REGEX>:.*__rank_topn_threshold.*

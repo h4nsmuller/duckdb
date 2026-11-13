@@ -262,6 +262,12 @@
       ]
     },
     {
+      "reason": "Queries with a throwing expression in a column that only the optimizer removes.",
+      "paths": [
+        "test/optimizer/rank_window_topn_unread_columns.test"
+      ]
+    },
+    {
       "reason": "Checks pruning of a throwing unused secure-view output and safe caller filter pushdown.",
       "paths": [
         "test/sql/sql_export/secure_view_sql_export.test"
