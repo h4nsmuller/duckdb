@@ -17,6 +17,11 @@ PROFILE_FILENAME = "duckdb_profile.json"
 
 ENABLE_PROFILING = "PRAGMA enable_profiling=json"
 PROFILE_OUTPUT = f"PRAGMA profile_output='{PROFILE_FILENAME}'"
+# The cost of a plan is computed from the rows that its operators actually produced. With several threads these
+# depend on the order in which independent pipelines happen to run: a runtime join filter that is pushed into the
+# scan on the build side of another join only applies if its own (small) build finishes before that scan starts.
+# A single thread runs the pipelines in a fixed order, so the same plan always has the same cost.
+SINGLE_THREADED = "SET threads=1"
 
 BANNER_SIZE = 52
 RETRIES = 2
@@ -181,7 +186,7 @@ def op_inspect(op) -> PlanCost:
 
 def query_plan_cost(cli, dbname, query):
     try:
-        command = [cli, '--readonly', dbname, '-c', f"{ENABLE_PROFILING};{PROFILE_OUTPUT};{query}"]
+        command = [cli, '--readonly', dbname, '-c', f"{SINGLE_THREADED};{ENABLE_PROFILING};{PROFILE_OUTPUT};{query}"]
         attempts = RETRIES + 1
         for attempt in range(1, attempts + 1):
             completed = run_command(
