@@ -1,0 +1,353 @@
+# name: test/optimizer/semi_join_to_inner.test
+# description: A SEMI join whose right side is distinct on the join keys becomes an INNER join
+# group: [optimizer]
+
+# l / r: duplicate and NULL keys; pk: PRIMARY KEY; cpk: composite PRIMARY KEY (a, b), a alone repeats; un: UNIQUE NOT NULL;
+# ls / rs / rv: VARCHAR keys (rs is NOCASE); lb: BIGINT keys against r's INTEGER; ld / rd: DOUBLE keys with NaN and -0.0
+statement ok
+CREATE TABLE l(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO l VALUES (1, 10), (1, 11), (2, 20), (3, 30), (NULL, 40), (NULL, 41), (4, 40), (5, 1);
+
+statement ok
+CREATE TABLE r(k INTEGER, c INTEGER);
+
+statement ok
+INSERT INTO r VALUES (1, 1), (1, 1), (1, 2), (2, 5), (NULL, 7), (NULL, 7), (5, 9), (5, 1);
+
+statement ok
+CREATE TABLE pk(k INTEGER PRIMARY KEY, c INTEGER);
+
+statement ok
+INSERT INTO pk VALUES (1, 1), (2, 2), (3, 3), (5, 5);
+
+statement ok
+CREATE TABLE cpk(a INTEGER, b INTEGER, c INTEGER, PRIMARY KEY (a, b));
+
+statement ok
+INSERT INTO cpk VALUES (1, 10, 0), (1, 11, 0), (2, 20, 0), (5, 2, 0);
+
+statement ok
+CREATE TABLE un(k INTEGER UNIQUE NOT NULL, c INTEGER);
+
+statement ok
+INSERT INTO un VALUES (1, 1), (2, 2), (4, 4);
+
+statement ok
+CREATE TABLE ls(s VARCHAR);
+
+statement ok
+INSERT INTO ls VALUES ('a'), ('A'), ('b'), (NULL), ('c');
+
+statement ok
+CREATE TABLE rs(s VARCHAR COLLATE NOCASE);
+
+statement ok
+INSERT INTO rs VALUES ('a'), ('A'), ('B'), (NULL);
+
+statement ok
+CREATE TABLE rv(s VARCHAR);
+
+statement ok
+INSERT INTO rv VALUES ('a'), ('a'), ('B'), (NULL), ('c');
+
+statement ok
+CREATE TABLE lb(k BIGINT);
+
+statement ok
+INSERT INTO lb VALUES (1), (1), (2), (4294967297), (NULL);
+
+statement ok
+CREATE TABLE ld(d DOUBLE);
+
+statement ok
+INSERT INTO ld VALUES ('nan'), ('nan'), (0.0), (-0.0), (1.5), (NULL), ('inf');
+
+statement ok
+CREATE TABLE rd(d DOUBLE);
+
+statement ok
+INSERT INTO rd VALUES ('nan'), ('nan'), (0.0), (1.5), (1.5), (NULL), ('-inf');
+
+statement ok
+SET explain_output = 'optimized_only';
+
+# ---------------------------------------------------------------------------------------------------------------
+# 1. the SEMI join is converted. The pins look for the
+#    `Join Type: INNER` / `SEMI` text of the Comparison Join box.
+# ---------------------------------------------------------------------------------------------------------------
+
+statement ok
+RESET disabled_optimizers;
+
+# DISTINCT right side
+query II
+EXPLAIN SELECT * FROM l WHERE k IN (SELECT DISTINCT k FROM r);
+----
+logical_opt	<REGEX>:(?s).*Join Type: INNER.*
+
+query II
+EXPLAIN SELECT * FROM l WHERE k IN (SELECT DISTINCT k FROM r);
+----
+logical_opt	<!REGEX>:(?s).*SEMI.*
+
+# the SEMI join of an INTERSECT over DISTINCT inputs, the null-safe condition is kept
+query II
+EXPLAIN SELECT DISTINCT k FROM l INTERSECT SELECT DISTINCT k FROM r;
+----
+logical_opt	<REGEX>:(?s).*Join Type: INNER.*IS NOT DISTINCT FROM.*
+
+query II
+EXPLAIN SELECT DISTINCT k FROM l INTERSECT SELECT DISTINCT k FROM r;
+----
+logical_opt	<!REGEX>:(?s).*SEMI.*
+
+# UNIQUE NOT NULL, a composite PRIMARY KEY with every key column an equality key
+query II
+EXPLAIN SELECT * FROM l WHERE k IN (SELECT k FROM un);
+----
+logical_opt	<!REGEX>:(?s).*SEMI.*
+
+query II
+EXPLAIN SELECT * FROM l WHERE (k, v) IN (SELECT a, b FROM cpk);
+----
+logical_opt	<REGEX>:(?s).*Join Type: INNER.*
+
+query II
+EXPLAIN SELECT * FROM l WHERE (k, v) IN (SELECT a, b FROM cpk);
+----
+logical_opt	<!REGEX>:(?s).*SEMI.*
+
+# VARCHAR and DOUBLE keys convert like any other type
+query II
+EXPLAIN SELECT * FROM ls WHERE s IN (SELECT DISTINCT s FROM rv);
+----
+logical_opt	<!REGEX>:(?s).*SEMI.*
+
+query II
+EXPLAIN SELECT * FROM ld WHERE d IN (SELECT DISTINCT d FROM rd);
+----
+logical_opt	<!REGEX>:(?s).*SEMI.*
+
+# ---------------------------------------------------------------------------------------------------------------
+# 2. with the optimizer disabled the SEMI join is back
+# ---------------------------------------------------------------------------------------------------------------
+
+statement ok
+SET disabled_optimizers = 'semi_join_to_inner';
+
+query II
+EXPLAIN SELECT * FROM l WHERE k IN (SELECT DISTINCT k FROM r);
+----
+logical_opt	<REGEX>:(?s).*Join Type: SEMI.*
+
+query II
+EXPLAIN SELECT DISTINCT k FROM l INTERSECT SELECT DISTINCT k FROM r;
+----
+logical_opt	<REGEX>:(?s).*Join Type: SEMI.*
+
+# ---------------------------------------------------------------------------------------------------------------
+# 3. not converted. Every pin asserts `Join Type: SEMI` (or the Any Join box) still present: a converted join
+#    leaves `Join Type: INNER` and no SEMI, so the pin fails. The sibling positive next to each negative differs only
+#    in the violated precondition.
+# ---------------------------------------------------------------------------------------------------------------
+
+statement ok
+RESET disabled_optimizers;
+
+# the right side reads a (materialized) CTE: stays SEMI although it is DISTINCT on the key ...
+query II
+EXPLAIN WITH d AS MATERIALIZED (SELECT k FROM r) SELECT * FROM l WHERE k IN (SELECT DISTINCT k FROM d);
+----
+logical_opt	<REGEX>:(?s).*Join Type: SEMI.*
+
+query II
+EXPLAIN WITH d AS MATERIALIZED (SELECT k FROM r) SELECT * FROM l WHERE k IN (SELECT DISTINCT k FROM d);
+----
+logical_opt	<!REGEX>:(?s).*INNER.*
+
+# ... sibling: the same query with the CTE inlined converts
+query II
+EXPLAIN WITH d AS NOT MATERIALIZED (SELECT k FROM r) SELECT * FROM l WHERE k IN (SELECT DISTINCT k FROM d);
+----
+logical_opt	<!REGEX>:(?s).*SEMI.*
+
+# no equality condition (the right side is distinct on k, but `<` is not a key: several d rows pass per l row) ...
+query II
+EXPLAIN SELECT * FROM l SEMI JOIN (SELECT DISTINCT k FROM r) d ON l.k < d.k;
+----
+logical_opt	<REGEX>:(?s).*Join Type: SEMI.*
+
+# ... an equality whose right key is an expression ...
+query II
+EXPLAIN SELECT * FROM l SEMI JOIN (SELECT DISTINCT k FROM r) d ON l.k = d.k + 1;
+----
+logical_opt	<REGEX>:(?s).*Join Type: SEMI.*
+
+# ... a cast on the right key (BIGINT probe against the INTEGER subquery column) ...
+query II
+EXPLAIN SELECT * FROM lb WHERE k IN (SELECT DISTINCT k FROM r);
+----
+logical_opt	<REGEX>:(?s).*Join Type: SEMI.*CAST.*
+
+# ... a collation on the keys (the condition compares lower(..) of both sides) ...
+query II
+EXPLAIN SELECT * FROM ls WHERE s IN (SELECT DISTINCT s FROM rs);
+----
+logical_opt	<REGEX>:(?s).*Join Type: SEMI.*
+
+# ... sibling: the plain equality on the same right side converts
+query II
+EXPLAIN SELECT * FROM l SEMI JOIN (SELECT DISTINCT k FROM r) d ON l.k = d.k;
+----
+logical_opt	<!REGEX>:(?s).*SEMI.*
+
+# a SEMI join the binder plans as an Any Join (both condition sides read both tables) is not touched: the
+# Any Join box stays and no INNER join appears
+query II
+EXPLAIN SELECT * FROM l SEMI JOIN (SELECT DISTINCT k FROM r) d ON l.k + d.k < l.v - d.k;
+----
+logical_opt	<REGEX>:(?s).*─ Any Join ─.*
+
+query II
+EXPLAIN SELECT * FROM l SEMI JOIN (SELECT DISTINCT k FROM r) d ON l.k + d.k < l.v - d.k;
+----
+logical_opt	<!REGEX>:(?s).*INNER.*
+
+# half of a composite PRIMARY KEY is not a key (cpk.a = 1 twice): stays SEMI; the sibling with both key
+# columns is in section 1
+query II
+EXPLAIN SELECT * FROM l WHERE k IN (SELECT a FROM cpk);
+----
+logical_opt	<REGEX>:(?s).*Join Type: SEMI.*
+
+statement ok
+RESET disabled_optimizers;
+
+# ---------------------------------------------------------------------------------------------------------------
+# 4. results: the rows are those of the SEMI join. A conversion that ignores a precondition
+#    would duplicate probe rows (marked "sensitive").
+# ---------------------------------------------------------------------------------------------------------------
+
+# empty left side
+query II
+SELECT * FROM (SELECT * FROM l WHERE v < 0) e WHERE k IN (SELECT DISTINCT k FROM r) ORDER BY ALL;
+----
+
+# empty right side through a PRIMARY KEY
+query II
+SELECT * FROM l WHERE k IN (SELECT k FROM pk WHERE c > 100) ORDER BY ALL;
+----
+
+# INTERSECT of DISTINCT inputs: the NULL keys match each other once
+query I
+SELECT DISTINCT k FROM l INTERSECT SELECT DISTINCT k FROM r ORDER BY ALL;
+----
+1
+2
+5
+NULL
+
+# IS NOT DISTINCT FROM against a PRIMARY KEY: no NULL on the right, the NULL probe rows drop
+query II
+SELECT * FROM l WHERE EXISTS (SELECT 1 FROM pk WHERE pk.k IS NOT DISTINCT FROM l.k) ORDER BY ALL;
+----
+1	10
+1	11
+2	20
+3	30
+5	1
+
+# UNIQUE NOT NULL
+query II
+SELECT * FROM l WHERE k IN (SELECT k FROM un) ORDER BY ALL;
+----
+1	10
+1	11
+2	20
+4	40
+
+# composite PRIMARY KEY, both key columns / one of them (sensitive: cpk.a = 1 twice)
+query II
+SELECT * FROM l WHERE (k, v) IN (SELECT a, b FROM cpk) ORDER BY ALL;
+----
+1	10
+1	11
+2	20
+
+query II
+SELECT * FROM l WHERE k IN (SELECT a FROM cpk) ORDER BY ALL;
+----
+1	10
+1	11
+2	20
+5	1
+
+# CTE right side
+query II
+WITH d AS MATERIALIZED (SELECT k FROM r) SELECT * FROM l WHERE k IN (SELECT DISTINCT k FROM d) ORDER BY ALL;
+----
+1	10
+1	11
+2	20
+5	1
+
+# inequality only (sensitive: k = 1 is below 2 and 5), expression key
+query II
+SELECT * FROM l SEMI JOIN (SELECT DISTINCT k FROM r) d ON l.k < d.k ORDER BY ALL;
+----
+1	10
+1	11
+2	20
+3	30
+4	40
+
+query II
+SELECT * FROM l SEMI JOIN (SELECT DISTINCT k FROM r) d ON l.k = d.k + 1 ORDER BY ALL;
+----
+2	20
+3	30
+
+# Any Join (sensitive: (1, 10) passes for d.k = 1 and 2)
+query II
+SELECT * FROM l SEMI JOIN (SELECT DISTINCT k FROM r) d ON l.k + d.k < l.v - d.k ORDER BY ALL;
+----
+1	10
+1	11
+2	20
+3	30
+4	40
+
+# VARCHAR keys: binary collation, NOCASE on the right column ('a' and 'A' both match, 'b' matches 'B')
+query I
+SELECT * FROM ls WHERE s IN (SELECT DISTINCT s FROM rv) ORDER BY ALL;
+----
+a
+c
+
+query I
+SELECT * FROM ls WHERE s IN (SELECT DISTINCT s FROM rs) ORDER BY ALL;
+----
+A
+a
+b
+
+# BIGINT probe against INTEGER keys: 4294967297 must not wrap to 1
+query I
+SELECT * FROM lb WHERE k IN (SELECT DISTINCT k FROM r) ORDER BY ALL;
+----
+1
+1
+2
+
+# DOUBLE keys: NaN equals NaN, -0.0 equals 0.0, NULL and the infinities do not match
+query I
+SELECT * FROM ld WHERE d IN (SELECT DISTINCT d FROM rd) ORDER BY ALL;
+----
+-0.0
+0.0
+1.5
+nan
+nan
+

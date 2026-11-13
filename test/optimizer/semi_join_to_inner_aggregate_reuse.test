@@ -1,0 +1,122 @@
+# name: test/optimizer/semi_join_to_inner_aggregate_reuse.test
+# description: The SEMI join that the aggregate reuse optimizer absorbs is not converted into an INNER join before join ordering
+# group: [optimizer]
+
+# `o.k IN (SELECT k FROM fact GROUP BY k HAVING sum(v) > ..)` next to a join with `fact` and an outer sum(f.v):
+# AGGREGATE_REUSE (after JOIN_ORDER) computes the outer aggregate from the exported state of the subquery, scans `fact`
+# once and turns the SEMI join into an INNER join itself. The GROUP BY of the subquery also makes its key distinct, so
+# SEMI_JOIN_TO_INNER (before JOIN_ORDER) could convert the SEMI join first; the join order optimizer would then move
+# the subquery, the reuse would no longer find its shape and `fact` would be scanned and aggregated twice. Such a
+# SEMI join is left alone if the aggregated table is scanned outside the subquery as well.
+# SEMI join alone when the aggregated table is scanned outside the subquery as well.
+
+statement ok
+CREATE TABLE reuse_dim(id INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO reuse_dim VALUES (10, 'x'), (20, 'b'), (30, 'x'), (40, 'd');
+
+statement ok
+CREATE TABLE reuse_owner(k INTEGER, dim_id INTEGER);
+
+statement ok
+INSERT INTO reuse_owner VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+
+statement ok
+CREATE TABLE reuse_fact(k INTEGER, v INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO reuse_fact VALUES (1, 10, 1), (1, 20, 2), (2, 5, 3), (3, 40, 4), (3, 50, 5), (4, NULL, 6);
+
+# duplicate and NULL ids: only DISTINCT makes the subquery over it distinct on the key
+statement ok
+CREATE TABLE picked(id INTEGER);
+
+statement ok
+INSERT INTO picked VALUES (10), (10), (30), (40), (NULL);
+
+statement ok
+SET explain_output = 'physical_only';
+
+# 1. the reuse fires: one scan of reuse_fact, the exported state combined above the join, no SEMI left
+query II
+EXPLAIN SELECT o.k, d.label, sum(f.v)
+FROM reuse_owner o JOIN reuse_dim d ON o.dim_id = d.id JOIN reuse_fact f USING (k)
+WHERE o.k IN (SELECT k FROM reuse_fact GROUP BY k HAVING sum(v) > 25)
+GROUP BY o.k, d.label;
+----
+physical_plan	<!REGEX>:(?s).*reuse_fact.*reuse_fact.*
+
+query II
+EXPLAIN SELECT o.k, d.label, sum(f.v)
+FROM reuse_owner o JOIN reuse_dim d ON o.dim_id = d.id JOIN reuse_fact f USING (k)
+WHERE o.k IN (SELECT k FROM reuse_fact GROUP BY k HAVING sum(v) > 25)
+GROUP BY o.k, d.label;
+----
+physical_plan	<REGEX>:(?s).*combine_aggr.*
+
+query II
+EXPLAIN SELECT o.k, d.label, sum(f.v)
+FROM reuse_owner o JOIN reuse_dim d ON o.dim_id = d.id JOIN reuse_fact f USING (k)
+WHERE o.k IN (SELECT k FROM reuse_fact GROUP BY k HAVING sum(v) > 25)
+GROUP BY o.k, d.label;
+----
+physical_plan	<!REGEX>:(?s).*Join Type: SEMI.*
+
+# 2. both rewrites in one plan: the SEMI join against `SELECT DISTINCT id FROM picked` is an INNER join
+#    (semi_join_to_inner), and the reuse fires as above - no SEMI join left, one scan of reuse_fact
+query II
+EXPLAIN SELECT o.k, d.label, sum(f.v)
+FROM reuse_owner o JOIN reuse_dim d ON o.dim_id = d.id JOIN reuse_fact f USING (k)
+WHERE o.k IN (SELECT k FROM reuse_fact GROUP BY k HAVING sum(v) > 25)
+  AND o.dim_id IN (SELECT DISTINCT id FROM picked)
+GROUP BY o.k, d.label;
+----
+physical_plan	<REGEX>:(?s).*combine_aggr.*Join Type: INNER.*picked.*
+
+query II
+EXPLAIN SELECT o.k, d.label, sum(f.v)
+FROM reuse_owner o JOIN reuse_dim d ON o.dim_id = d.id JOIN reuse_fact f USING (k)
+WHERE o.k IN (SELECT k FROM reuse_fact GROUP BY k HAVING sum(v) > 25)
+  AND o.dim_id IN (SELECT DISTINCT id FROM picked)
+GROUP BY o.k, d.label;
+----
+physical_plan	<!REGEX>:(?s).*(reuse_fact.*reuse_fact|Join Type: SEMI).*
+
+# 3. without a second scan of the aggregated table there is nothing to reuse: the SEMI join is converted
+query II
+EXPLAIN SELECT o.k, o.dim_id FROM reuse_owner o WHERE o.k IN (SELECT k FROM reuse_fact GROUP BY k HAVING sum(v) > 25);
+----
+physical_plan	<REGEX>:(?s).*Join Type: INNER.*
+
+query II
+EXPLAIN SELECT o.k, o.dim_id FROM reuse_owner o WHERE o.k IN (SELECT k FROM reuse_fact GROUP BY k HAVING sum(v) > 25);
+----
+physical_plan	<!REGEX>:(?s).*Join Type: (RIGHT_)?SEMI.*
+
+# 4. the rows
+query ITI
+SELECT o.k, d.label, sum(f.v)
+FROM reuse_owner o JOIN reuse_dim d ON o.dim_id = d.id JOIN reuse_fact f USING (k)
+WHERE o.k IN (SELECT k FROM reuse_fact GROUP BY k HAVING sum(v) > 25)
+GROUP BY o.k, d.label ORDER BY ALL;
+----
+1	x	30
+3	x	90
+
+query ITI
+SELECT o.k, d.label, sum(f.v)
+FROM reuse_owner o JOIN reuse_dim d ON o.dim_id = d.id JOIN reuse_fact f USING (k)
+WHERE o.k IN (SELECT k FROM reuse_fact GROUP BY k HAVING sum(v) > 25)
+  AND o.dim_id IN (SELECT DISTINCT id FROM picked)
+GROUP BY o.k, d.label ORDER BY ALL;
+----
+1	x	30
+3	x	90
+
+query II
+SELECT o.k, o.dim_id FROM reuse_owner o WHERE o.k IN (SELECT k FROM reuse_fact GROUP BY k HAVING sum(v) > 25) ORDER BY ALL;
+----
+1	10
+3	30
+

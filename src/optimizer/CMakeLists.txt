@@ -31,6 +31,7 @@ add_library_unity(
   cte_runtime_filter_pushdown.cpp
   cte_inlining.cpp
   deliminator.cpp
+  distinctness.cpp
   duplicate_eliminated_domain_optimizer.cpp
   multi_stage_aggregate_rewriter.cpp
   expression_heuristics.cpp
@@ -70,6 +71,7 @@ add_library_unity(
   scalar_aggregate_merger.cpp
   type_pushdown.cpp
   scalar_fn_pushdown.cpp
+  semi_join_to_inner.cpp
   self_join_aggregate.cpp
   projection_pullup.cpp
   projection_placement.cpp

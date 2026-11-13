@@ -36,6 +36,7 @@
 #include "duckdb/optimizer/scalar_aggregate_merger.hpp"
 #include "duckdb/optimizer/scalar_fn_pushdown.hpp"
 #include "duckdb/optimizer/self_join_aggregate.hpp"
+#include "duckdb/optimizer/semi_join_to_inner.hpp"
 #include "duckdb/optimizer/statistics_propagator.hpp"
 #include "duckdb/optimizer/aggregate_function_rewriter.hpp"
 #include "duckdb/optimizer/aggregate_reuse.hpp"
@@ -344,6 +345,13 @@ void Optimizer::RunBuiltInOptimizers() {
 	RunOptimizer(OptimizerType::OUTER_JOIN_SIMPLIFICATION, [&]() {
 		OuterJoinSimplification outer_join_simplification;
 		outer_join_simplification.VisitOperator(*plan);
+	});
+
+	// converts SEMI joins against a side that is distinct on the join keys into INNER joins, so that the join order
+	// optimizer can place the relations of that side freely
+	RunOptimizer(OptimizerType::SEMI_JOIN_TO_INNER, [&]() {
+		SemiJoinToInner semi_join_to_inner;
+		semi_join_to_inner.Optimize(*plan);
 	});
 
 	// then we perform the join ordering optimization
