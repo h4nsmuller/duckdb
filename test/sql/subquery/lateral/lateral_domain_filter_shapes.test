@@ -124,10 +124,11 @@ SELECT count(*) FROM shape_range WHERE id=3;
 ----
 8
 
+# the predicate reaches the outer side before it is materialized, through the join above the lateral
 query II
 EXPLAIN SELECT count(*) FROM shape_range WHERE id=3;
 ----
-physical_plan	<REGEX>:[\s\S]*id = 3[\s\S]*id = 3[\s\S]*
+physical_plan	<REGEX>:[\s\S]*__duckdb_delim[\s\S]*id = 3[\s\S]*RANGE[\s\S]*
 
 statement ok
 CREATE TABLE owners(person INTEGER, class INTEGER);

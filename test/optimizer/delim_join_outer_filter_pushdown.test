@@ -1,0 +1,136 @@
+# name: test/optimizer/delim_join_outer_filter_pushdown.test
+# description: Predicates on the outer side of lateral joins / correlated subqueries reach the outer side through the joins between them
+# group: [optimizer]
+
+statement ok
+CREATE TABLE fact AS
+SELECT i AS id, i % 500 AS ticket, (i * 7 + i // 500) % 40 AS item, i % 30 AS d FROM range(5000) t(i);
+
+statement ok
+CREATE TABLE dim AS SELECT i AS d, i % 6 AS moy FROM range(30) t(i);
+
+statement ok
+CREATE TABLE item AS SELECT i AS item, 'n' || i AS name FROM range(0, 60, 2) t(i);
+
+# three chained laterals, a regular outer join above them, outer-only predicates in the WHERE clause
+query IIIIIT
+SELECT count(*), sum(b.m), sum(c.m), sum(e.m), count(it.name), max(it.name)
+FROM fact f JOIN dim ON f.d = dim.d
+LEFT JOIN LATERAL (SELECT min(f2.item) AS m FROM fact f2 WHERE f2.ticket = f.ticket AND f2.item <> f.item) b ON TRUE
+LEFT JOIN LATERAL (SELECT min(f3.item) AS m FROM fact f3 WHERE f3.ticket = f.ticket AND f3.item <> f.item AND f3.item > coalesce(b.m, 0)) c ON TRUE
+LEFT JOIN LATERAL (SELECT min(f4.item) AS m FROM fact f4 WHERE f4.ticket = f.ticket AND f4.item <> f.item AND f4.item > coalesce(c.m, 0)) e ON TRUE
+LEFT JOIN item it ON it.item = b.m
+WHERE dim.moy = 1 AND f.item < 10;
+----
+208	685	1386	2137	103	n8
+
+# the predicates are applied by the scans of the outer side: no filter is left on a scan of the materialized outer side
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*), sum(b.m), sum(c.m), sum(e.m), count(it.name), max(it.name)
+FROM fact f JOIN dim ON f.d = dim.d
+LEFT JOIN LATERAL (SELECT min(f2.item) AS m FROM fact f2 WHERE f2.ticket = f.ticket AND f2.item <> f.item) b ON TRUE
+LEFT JOIN LATERAL (SELECT min(f3.item) AS m FROM fact f3 WHERE f3.ticket = f.ticket AND f3.item <> f.item AND f3.item > coalesce(b.m, 0)) c ON TRUE
+LEFT JOIN LATERAL (SELECT min(f4.item) AS m FROM fact f4 WHERE f4.ticket = f.ticket AND f4.item <> f.item AND f4.item > coalesce(c.m, 0)) e ON TRUE
+LEFT JOIN item it ON it.item = b.m
+WHERE dim.moy = 1 AND f.item < 10;
+----
+physical_plan	<!REGEX>:[\s\S]*"name": "FILTER"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*), sum(b.m), sum(c.m), sum(e.m), count(it.name), max(it.name)
+FROM fact f JOIN dim ON f.d = dim.d
+LEFT JOIN LATERAL (SELECT min(f2.item) AS m FROM fact f2 WHERE f2.ticket = f.ticket AND f2.item <> f.item) b ON TRUE
+LEFT JOIN LATERAL (SELECT min(f3.item) AS m FROM fact f3 WHERE f3.ticket = f.ticket AND f3.item <> f.item AND f3.item > coalesce(b.m, 0)) c ON TRUE
+LEFT JOIN LATERAL (SELECT min(f4.item) AS m FROM fact f4 WHERE f4.ticket = f.ticket AND f4.item <> f.item AND f4.item > coalesce(c.m, 0)) e ON TRUE
+LEFT JOIN item it ON it.item = b.m
+WHERE dim.moy = 1 AND f.item < 10;
+----
+physical_plan	<REGEX>:[\s\S]*"Filters": "\(?item < 10\)?"[\s\S]*
+
+# regular joins between the laterals (each lateral's result is joined before the next lateral)
+query IIIIT
+SELECT count(*), sum(b.m), sum(c.m), count(it.name), min(it2.name)
+FROM fact f JOIN dim ON f.d = dim.d
+LEFT JOIN LATERAL (SELECT min(f2.item) AS m FROM fact f2 WHERE f2.ticket = f.ticket AND f2.item <> f.item) b ON TRUE
+LEFT JOIN item it ON it.item = b.m
+LEFT JOIN LATERAL (SELECT min(f3.item) AS m FROM fact f3 WHERE f3.ticket = f.ticket AND f3.item <> f.item AND f3.item > b.m) c ON TRUE
+LEFT JOIN item it2 ON it2.item = c.m
+WHERE dim.moy = 1 AND f.item < 10;
+----
+208	685	1386	103	n10
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*), sum(b.m), sum(c.m), count(it.name), min(it2.name)
+FROM fact f JOIN dim ON f.d = dim.d
+LEFT JOIN LATERAL (SELECT min(f2.item) AS m FROM fact f2 WHERE f2.ticket = f.ticket AND f2.item <> f.item) b ON TRUE
+LEFT JOIN item it ON it.item = b.m
+LEFT JOIN LATERAL (SELECT min(f3.item) AS m FROM fact f3 WHERE f3.ticket = f.ticket AND f3.item <> f.item AND f3.item > b.m) c ON TRUE
+LEFT JOIN item it2 ON it2.item = c.m
+WHERE dim.moy = 1 AND f.item < 10;
+----
+physical_plan	<!REGEX>:[\s\S]*"name": "FILTER"[\s\S]*
+
+# an inner join above the laterals: the predicate passes it on either side
+query II
+SELECT count(*), sum(b.m)
+FROM item it JOIN (fact f LEFT JOIN LATERAL (SELECT min(f2.item) AS m FROM fact f2 WHERE f2.ticket = f.ticket AND f2.item <> f.item) b ON TRUE) ON it.item = f.item
+WHERE f.d = 3 AND f.item < 10;
+----
+21	86
+
+# must not move: a predicate on the null-supplying side of the outer join above the laterals
+query II
+SELECT count(*), sum(b.m)
+FROM fact f
+LEFT JOIN LATERAL (SELECT min(f2.item) AS m FROM fact f2 WHERE f2.ticket = f.ticket AND f2.item <> f.item) b ON TRUE
+LEFT JOIN item it ON it.item = b.m
+WHERE it.name IS NULL AND f.item < 10;
+----
+624	2300
+
+# must not move: the laterals are on the null-supplying side of the join above them
+query II
+SELECT count(*), count(f.id)
+FROM item it LEFT JOIN (fact f LEFT JOIN LATERAL (SELECT min(f2.item) AS m FROM fact f2 WHERE f2.ticket = f.ticket AND f2.item <> f.item) b ON TRUE) ON it.item = f.item
+WHERE f.d IS NULL OR f.d = 3;
+----
+94	84
+
+query II
+SELECT count(*), count(f.id)
+FROM (fact f LEFT JOIN LATERAL (SELECT min(f2.item) AS m FROM fact f2 WHERE f2.ticket = f.ticket AND f2.item <> f.item) b ON TRUE) FULL JOIN item it ON it.item = f.item
+WHERE f.d IS NULL OR f.d = 3;
+----
+177	167
+
+# must not move: a predicate on the lateral's own output
+query II
+SELECT count(*), sum(b.m)
+FROM fact f
+LEFT JOIN LATERAL (SELECT min(f2.item) AS m FROM fact f2 WHERE f2.ticket = f.ticket AND f2.item <> f.item) b ON TRUE
+LEFT JOIN item it ON it.item = b.m
+WHERE b.m IS NULL OR b.m >= 3;
+----
+2418	17282
+
+# a predicate that can fail stays above the join that removes the rows it fails on
+query II
+SELECT count(*), sum(b.m)
+FROM (SELECT * FROM fact WHERE item > 0) f
+LEFT JOIN LATERAL (SELECT min(f2.item) AS m FROM fact f2 WHERE f2.ticket = f.ticket AND f2.item <> f.item) b ON TRUE
+JOIN item it ON it.item = f.item AND it.item > 0
+WHERE 100 // f.item > 30;
+----
+124	104
+
+# correlated scalar subquery above a regular outer join, outer-only predicate
+query III
+SELECT count(*), sum(c), count(name) FROM (
+	SELECT f.id, it.name, (SELECT count(*) FROM fact f2 WHERE f2.ticket = f.ticket AND f2.item > f.item) AS c
+	FROM fact f LEFT JOIN item it ON it.item = f.item
+) WHERE id < 100;
+----
+100	543	50

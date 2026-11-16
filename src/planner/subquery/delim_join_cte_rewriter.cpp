@@ -391,57 +391,124 @@ static bool RewriteFilterThroughProjections(unique_ptr<Expression> &expr,
 	return true;
 }
 
+//! A filter over columns of one child of a join commutes with the join.
+static bool JoinSidePreservesFilter(JoinType join_type, idx_t child_idx) {
+	switch (join_type) {
+	case JoinType::INNER:
+		return true;
+	case JoinType::LEFT:
+	case JoinType::SINGLE:
+	case JoinType::SEMI:
+	case JoinType::ANTI:
+	case JoinType::MARK:
+		return child_idx == 0;
+	case JoinType::RIGHT:
+	case JoinType::RIGHT_SEMI:
+	case JoinType::RIGHT_ANTI:
+		return child_idx == 1;
+	default:
+		return false;
+	}
+}
+
+//! Follows a filter predicate from the child of its filter towards a delim join whose LHS provides every column it
+//! references: through projections that forward those columns, through other filters and through the sides of joins
+//! that a filter on that side commutes with. Rewrites `expr` to the bindings of that LHS.
+static optional_ptr<LogicalComparisonJoin> FindDelimJoinInputForFilter(LogicalFilter &filter,
+                                                                       unique_ptr<Expression> &expr) {
+	reference<LogicalOperator> input = *filter.children[0];
+	bool below_projection = false;
+	bool below_join = false;
+	while (true) {
+		auto &op = input.get();
+		idx_t child_idx = 0;
+		switch (op.type) {
+		case LogicalOperatorType::LOGICAL_DELIM_JOIN: {
+			auto &delim_join = op.Cast<LogicalComparisonJoin>();
+			if (below_projection && PropagatesBuildSide(delim_join.join_type)) {
+				return nullptr;
+			}
+			return FilterReferencesDelimInput(delim_join, *expr) ? &delim_join : nullptr;
+		}
+		case LogicalOperatorType::LOGICAL_PROJECTION: {
+			if (ExpressionBarrier::Required(*expr) || ExpressionBarrier::Contains(*expr)) {
+				return nullptr;
+			}
+			for (auto &projected : op.expressions) {
+				if (ExpressionBarrier::Required(*projected) || ExpressionBarrier::Contains(*projected)) {
+					return nullptr;
+				}
+			}
+			if (!RewriteFilterThroughProjections(expr, {op.Cast<LogicalProjection>()})) {
+				return nullptr;
+			}
+			below_projection = true;
+			break;
+		}
+		case LogicalOperatorType::LOGICAL_FILTER:
+			if (!below_join || op.HasProjectionMap()) {
+				return nullptr;
+			}
+			break;
+		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+		case LogicalOperatorType::LOGICAL_ANY_JOIN:
+		case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
+			// The filter runs on fewer rows below the join, which must not change what it computes.
+			if (op.HasProjectionMap() || expr->IsVolatile() || expr->CanThrow() || ExpressionBarrier::Required(*expr) ||
+			    ExpressionBarrier::Contains(*expr)) {
+				return nullptr;
+			}
+			auto join_type = op.type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT ? JoinType::INNER
+			                                                                       : op.Cast<LogicalJoin>().join_type;
+			column_binding_set_t filter_bindings;
+			if (!GetExpressionColumnBindings(*expr, filter_bindings) || filter_bindings.empty()) {
+				return nullptr;
+			}
+			optional_idx side;
+			for (idx_t candidate = 0; candidate < op.children.size(); candidate++) {
+				if (JoinSidePreservesFilter(join_type, candidate) &&
+				    ChildContainsBindings(*op.children[candidate], filter_bindings)) {
+					side = candidate;
+					break;
+				}
+			}
+			if (!side.IsValid()) {
+				return nullptr;
+			}
+			child_idx = side.GetIndex();
+			below_join = true;
+			break;
+		}
+		default:
+			return nullptr;
+		}
+		input = *op.children[child_idx];
+	}
+}
+
+//! Moves the filter predicates that only reference the LHS of a delim join below the filter into that input. The delim
+//! join is reached through projections that forward the referenced columns and through the join sides the predicate
+//! commutes with.
 static bool PushEligibleFilterExpressionsIntoDelimJoinInputs(unique_ptr<LogicalOperator> &plan) {
 	auto &filter = plan->Cast<LogicalFilter>();
 	if (filter.HasProjectionMap()) {
 		return false;
 	}
-	reference<LogicalOperator> input = *filter.children[0];
-	vector<reference<LogicalProjection>> projections;
-	while (input.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		auto &projection = input.get().Cast<LogicalProjection>();
-		projections.push_back(projection);
-		input = *projection.children[0];
-	}
-	if (input.get().type != LogicalOperatorType::LOGICAL_DELIM_JOIN) {
-		return false;
-	}
 
 	bool changed = false;
-	auto &delim_join = input.get().Cast<LogicalComparisonJoin>();
-	if (!projections.empty() && PropagatesBuildSide(delim_join.join_type)) {
-		return false;
-	}
-	for (auto &projection : projections) {
-		for (auto &expr : projection.get().expressions) {
-			if (ExpressionBarrier::Required(*expr) || ExpressionBarrier::Contains(*expr)) {
-				return false;
-			}
-		}
-	}
 	vector<unique_ptr<Expression>> remaining_expressions;
 	auto expressions = std::move(filter.expressions);
+	filter.expressions.clear();
 	LogicalFilter::SplitPredicates(expressions);
 	for (auto &expr : expressions) {
-		if (!projections.empty()) {
-			if (!ExpressionBarrier::Required(*expr) && !ExpressionBarrier::Contains(*expr)) {
-				auto rewritten = expr->Copy();
-				if (RewriteFilterThroughProjections(rewritten, projections) &&
-				    FilterReferencesDelimInput(delim_join, *rewritten)) {
-					AddFilterToOperator(delim_join.children[0], std::move(rewritten));
-					changed = true;
-					continue;
-				}
-			}
+		auto rewritten = expr->Copy();
+		auto delim_join = FindDelimJoinInputForFilter(filter, rewritten);
+		if (!delim_join) {
 			remaining_expressions.push_back(std::move(expr));
 			continue;
 		}
-		if (FilterReferencesDelimInput(delim_join, *expr)) {
-			AddFilterToOperator(delim_join.children[0], std::move(expr));
-			changed = true;
-			continue;
-		}
-		remaining_expressions.push_back(std::move(expr));
+		AddFilterToOperator(delim_join->children[0], std::move(rewritten));
+		changed = true;
 	}
 
 	if (remaining_expressions.empty()) {
