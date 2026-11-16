@@ -1,0 +1,96 @@
+# name: test/optimizer/grouping_sets_cascade_gate.test
+# description: With wide aggregate states the grouping sets cascade is applied only when its coarser levels read fewer rows than the input holds
+# group: [optimizer]
+
+statement ok
+CREATE TABLE facts AS
+SELECT i AS id, i % 100 AS a, i % 20 AS b, i % 5 AS c, i % 1000 AS x, i % 10 AS v
+FROM range(300000) t(i);
+
+# few groups in the finest set: the coarser sets are computed from its exported states
+query II
+EXPLAIN SELECT a, b, approx_count_distinct(x), count(*) FROM facts GROUP BY ROLLUP (a, b);
+----
+physical_plan	<REGEX>:.*CTE.*
+
+query II
+EXPLAIN SELECT a, b, approx_count_distinct(x), min(x) FROM facts GROUP BY CUBE (a, b);
+----
+physical_plan	<REGEX>:.*CTE.*
+
+# the finest set has one group per input row and the states are sketches: every coarser set would merge as many
+# sketches as the input has rows
+query II
+EXPLAIN SELECT a, id, approx_count_distinct(x), count(*) FROM facts GROUP BY ROLLUP (a, id);
+----
+physical_plan	<!REGEX>:.*CTE.*
+
+# narrow states are cheap to combine: the cascade stays
+query II
+EXPLAIN SELECT a, id, sum(v), count(*), min(x), avg(v) FROM facts GROUP BY ROLLUP (a, id);
+----
+physical_plan	<REGEX>:.*CTE.*
+
+query II
+EXPLAIN SELECT a, id, sum(v), approx_count_distinct(x) FROM facts GROUP BY GROUPING SETS ((a, id), (a), ());
+----
+physical_plan	<!REGEX>:.*CTE.*
+
+# .. also when the input is read through a materialized CTE
+query II
+EXPLAIN WITH f AS MATERIALIZED (SELECT * FROM facts)
+SELECT a, id, approx_count_distinct(x) FROM f GROUP BY ROLLUP (a, id);
+----
+physical_plan	<!REGEX>:.*__grouping_sets_cte.*
+
+# many grouping sets of which only one reads the near-unique finest set: the others still read far fewer rows
+query II
+EXPLAIN SELECT a, b, c, id, approx_count_distinct(x) FROM facts
+GROUP BY GROUPING SETS ((a, b, c, id), (a, b, c), (a, b), (a, c), (b, c), (a), (b), (c), ());
+----
+physical_plan	<REGEX>:.*__grouping_sets_cte.*
+
+# a unique column that is not grouped on does not matter
+query II
+EXPLAIN SELECT a, b, approx_count_distinct(id) FROM facts GROUP BY ROLLUP (a, b);
+----
+physical_plan	<REGEX>:.*CTE.*
+
+# without distinct count statistics for a group the cascade stays
+query II
+EXPLAIN SELECT i, i % 10, approx_count_distinct(i) FROM range(300000) t(i) GROUP BY ROLLUP (i, i % 10);
+----
+physical_plan	<REGEX>:.*CTE.*
+
+# small inputs are not gated
+statement ok
+CREATE TABLE small AS SELECT i AS id, i % 7 AS a, i % 3 AS v FROM range(1000) t(i);
+
+query II
+EXPLAIN SELECT a, id, approx_count_distinct(v) FROM small GROUP BY ROLLUP (a, id);
+----
+physical_plan	<REGEX>:.*CTE.*
+
+# the results do not depend on the decision
+query IIII
+SELECT count(*), count(a), count(id), sum(s) FROM (SELECT a, id, sum(v) s, approx_count_distinct(x) d FROM facts GROUP BY ROLLUP (a, id));
+----
+300101	300100	300000	4050000
+
+query IIII
+SELECT count(*), count(a), count(b), sum(s) FROM (SELECT a, b, sum(v) s FROM facts GROUP BY ROLLUP (a, b));
+----
+201	200	100	4050000
+
+statement ok
+SET disabled_optimizers='grouping_sets';
+
+query IIII
+SELECT count(*), count(a), count(id), sum(s) FROM (SELECT a, id, sum(v) s, approx_count_distinct(x) d FROM facts GROUP BY ROLLUP (a, id));
+----
+300101	300100	300000	4050000
+
+query IIII
+SELECT count(*), count(a), count(b), sum(s) FROM (SELECT a, b, sum(v) s FROM facts GROUP BY ROLLUP (a, b));
+----
+201	200	100	4050000

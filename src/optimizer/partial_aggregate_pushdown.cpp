@@ -6,6 +6,7 @@
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/scalar/generic_common.hpp"
 #include "duckdb/function/builtin_function_lookup.hpp"
+#include "duckdb/optimizer/aggregate_rewrite_helper.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/relation_statistics/relation_statistics_extractor.hpp"
 #include "duckdb/optimizer/relation_statistics/relation_statistics_helper.hpp"
@@ -150,18 +151,7 @@ static unique_ptr<BaseStatistics> GetBaseColumnStatistics(ClientContext &context
 	if (op.type != LogicalOperatorType::LOGICAL_GET) {
 		return nullptr;
 	}
-	auto &get = op.Cast<LogicalGet>();
-	auto &column_ids = get.GetColumnIds();
-	if (column_index >= column_ids.size()) {
-		return nullptr;
-	}
-	unique_ptr<BaseStatistics> stats;
-	if (get.function.statistics_extended) {
-		TableFunctionGetStatisticsInput input(get.bind_data.get(), column_ids[column_index]);
-		stats = get.function.statistics_extended(context, input);
-	} else if (get.function.statistics) {
-		stats = get.function.statistics(context, get.bind_data.get(), column_ids[column_index].GetPrimaryIndex());
-	}
+	auto stats = AggregateRewriteHelper::GetScanColumnStatistics(context, op.Cast<LogicalGet>(), column_index);
 	if (stats) {
 		// an outer join above the scan can add NULL values
 		stats->Set(StatsInfo::CAN_HAVE_NULL_VALUES);

@@ -297,7 +297,7 @@ void Optimizer::RunBuiltInOptimizers() {
 	// rewrite aggregates over multiple grouping sets (ROLLUP/CUBE/GROUPING SETS) into explicit aggregate plans
 	RunOptimizer(OptimizerType::GROUPING_SETS, [&]() {
 		GroupingSetsOptimizer grouping_sets_optimizer(*this);
-		grouping_sets_optimizer.VisitOperator(plan);
+		grouping_sets_optimizer.Optimize(plan);
 	});
 
 	// Optional aggregate recipes own their optimizer strategy; DISTINCT remains controlled by its dedicated setting.

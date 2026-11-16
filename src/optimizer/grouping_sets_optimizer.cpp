@@ -53,6 +53,44 @@ struct GroupingSetLevel {
 //! The maximum number of grouping sets that are rewritten into separate aggregates
 static constexpr idx_t MAX_REWRITE_GROUPING_SETS = 1024;
 
+//! Every coarser grouping set of the cascade re-aggregates the exported states of a finer set instead of the input.
+//! That costs more than aggregating the input once more when the states are wide (a sketch is copied and merged per
+//! group and level, where the aggregate updates a single register per row) and the finer sets are not smaller than
+//! the input: with a state of at least CASCADE_WIDE_STATE_SIZE bytes the cascade is skipped unless the coarser sets
+//! together are estimated to read at most one row per CASCADE_MIN_ROW_REDUCTION rows they would read from the input.
+static constexpr idx_t CASCADE_WIDE_STATE_SIZE = 64;
+static constexpr idx_t CASCADE_MIN_ROW_REDUCTION = 2;
+
+static bool HasWideState(const LogicalAggregate &aggr) {
+	for (auto &expr : aggr.expressions) {
+		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+			continue;
+		}
+		auto &aggregate = expr->Cast<BoundAggregateExpression>();
+		if (!aggregate.Function().HasStateSizeCallback()) {
+			continue;
+		}
+		AggregateStateInput state_input(aggregate.Function(), aggregate.BindInfo().get());
+		if (aggregate.Function().GetStateSizeCallback()(state_input) >= CASCADE_WIDE_STATE_SIZE) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! Whether the coarser levels of the cascade are estimated to read few enough rows for the cascade to pay off
+static bool CascadeReducesInput(const vector<GroupingSetLevel> &levels, idx_t input_cardinality,
+                                const vector<idx_t> &set_groups) {
+	// the rows the coarser levels read from their source levels, against the rows they would read from the input
+	double cascade_rows = 0;
+	for (idx_t level_idx = 1; level_idx < levels.size(); level_idx++) {
+		auto &source = levels[levels[level_idx].source_level.GetIndex()];
+		cascade_rows += static_cast<double>(set_groups[source.grouping_set_idx]);
+	}
+	auto input_rows = static_cast<double>(levels.size() - 1) * static_cast<double>(input_cardinality);
+	return cascade_rows * static_cast<double>(CASCADE_MIN_ROW_REDUCTION) <= input_rows;
+}
+
 static bool CanRewriteAggregate(const BoundAggregateExpression &aggregate) {
 	if (aggregate.IsDistinct() || aggregate.GetOrderBys()) {
 		// DISTINCT / ORDER BY aggregates cannot be computed by combining states of a finer aggregation
@@ -266,6 +304,13 @@ bool GroupingSetsOptimizer::TryRewriteGroupingSets(unique_ptr<LogicalOperator> &
 		// Explicit branches support arbitrary aggregates and expose single grouping sets to subsequent rewrites.
 		return TryExpandGroupingSets(op);
 	}
+	auto estimates = grouping_set_estimates.find(aggr.group_index);
+	if (estimates != grouping_set_estimates.end() &&
+	    !CascadeReducesInput(levels, estimates->second.input_cardinality, estimates->second.set_groups)) {
+		// the coarser levels would re-aggregate (nearly) as many rows as the input holds, from wide exported states -
+		// leave the grouping sets to the aggregate
+		return false;
+	}
 
 	const idx_t group_count = aggr.groups.size();
 	const idx_t aggregate_count = aggr.expressions.size();
@@ -461,6 +506,48 @@ bool GroupingSetsOptimizer::TryRewriteGroupingSets(unique_ptr<LogicalOperator> &
 	result->ResolveOperatorTypes();
 	op = std::move(result);
 	return true;
+}
+
+void GroupingSetsOptimizer::EstimateGroupingSets(AggregateInputEstimator &estimator, LogicalOperator &op) {
+	for (auto &child : op.children) {
+		EstimateGroupingSets(estimator, *child);
+	}
+	if (op.type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY || op.children.size() != 1) {
+		return;
+	}
+	auto &aggr = op.Cast<LogicalAggregate>();
+	if (aggr.grouping_sets.size() < 2 || !HasWideState(aggr)) {
+		return;
+	}
+	auto &input = *op.children[0];
+	auto input_cardinality = estimator.EstimateCardinality(input);
+	if (!input_cardinality.IsValid() ||
+	    input_cardinality.GetIndex() < AggregateInputEstimator::MIN_GATED_INPUT_CARDINALITY) {
+		return;
+	}
+	GroupingSetEstimates estimates;
+	estimates.input_cardinality = input_cardinality.GetIndex();
+	for (auto &grouping_set : aggr.grouping_sets) {
+		vector<reference<Expression>> groups;
+		for (auto &group_idx : grouping_set) {
+			groups.push_back(*aggr.groups[group_idx.GetIndex()]);
+		}
+		auto group_count = estimator.EstimateGroupCount(input, groups, estimates.input_cardinality);
+		if (!group_count.IsValid()) {
+			return;
+		}
+		estimates.set_groups.push_back(group_count.GetIndex());
+	}
+	grouping_set_estimates[aggr.group_index] = std::move(estimates);
+}
+
+void GroupingSetsOptimizer::Optimize(unique_ptr<LogicalOperator> &plan) {
+	if (!mandatory_aggregate_lowering) {
+		// estimate the grouping sets on the plan as it is before any aggregate is rewritten
+		AggregateInputEstimator estimator(optimizer.context, *plan);
+		EstimateGroupingSets(estimator, *plan);
+	}
+	VisitOperator(plan);
 }
 
 void GroupingSetsOptimizer::VisitOperator(unique_ptr<LogicalOperator> &op) {

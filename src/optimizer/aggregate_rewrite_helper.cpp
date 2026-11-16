@@ -8,8 +8,13 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 
 namespace duckdb {
 
@@ -133,6 +138,243 @@ unique_ptr<LogicalOperator> AggregateRewriteHelper::CreateCTERef(Optimizer &opti
 		replacement_map[input_bindings[col_idx]] = ColumnBinding(cte_ref_index, ProjectionIndex(col_idx));
 	}
 	return make_uniq<LogicalCTERef>(cte_ref_index, cte_index, input_types, input_names);
+}
+
+unique_ptr<BaseStatistics> AggregateRewriteHelper::GetScanColumnStatistics(ClientContext &context, LogicalGet &get,
+                                                                           idx_t column_index) {
+	auto &column_ids = get.GetColumnIds();
+	if (column_index >= column_ids.size()) {
+		return nullptr;
+	}
+	if (get.function.statistics_extended) {
+		TableFunctionGetStatisticsInput input(get.bind_data.get(), column_ids[column_index]);
+		return get.function.statistics_extended(context, input);
+	}
+	if (get.function.statistics) {
+		return get.function.statistics(context, get.bind_data.get(), column_ids[column_index].GetPrimaryIndex());
+	}
+	return nullptr;
+}
+
+AggregateInputEstimator::AggregateInputEstimator(ClientContext &context_p, LogicalOperator &plan) : context(context_p) {
+	CollectCTEDefinitions(plan);
+}
+
+void AggregateInputEstimator::CollectCTEDefinitions(LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && op.children.size() == 2) {
+		materialized_ctes.emplace(op.Cast<LogicalMaterializedCTE>().table_index, op);
+	}
+	for (auto &child : op.children) {
+		CollectCTEDefinitions(*child);
+	}
+}
+
+optional_idx AggregateInputEstimator::EstimateCardinality(LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_GET: {
+		auto &get = op.Cast<LogicalGet>();
+		if (!get.function.cardinality || !get.bind_data) {
+			return optional_idx();
+		}
+		auto node_stats = get.function.cardinality(context, get.bind_data.get());
+		if (!node_stats || !node_stats->has_estimated_cardinality) {
+			return optional_idx();
+		}
+		return node_stats->estimated_cardinality;
+	}
+	case LogicalOperatorType::LOGICAL_CTE_REF: {
+		auto cte_index = op.Cast<LogicalCTERef>().cte_index;
+		auto entry = materialized_ctes.find(cte_index);
+		if (entry == materialized_ctes.end()) {
+			return optional_idx();
+		}
+		auto cached = cte_cardinalities.find(cte_index);
+		if (cached != cte_cardinalities.end()) {
+			return cached->second;
+		}
+		auto cardinality = EstimateCardinality(*entry->second.get().children[0]);
+		cte_cardinalities[cte_index] = cardinality;
+		return cardinality;
+	}
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+		if (op.children.size() != 2) {
+			return optional_idx();
+		}
+		return EstimateCardinality(*op.children[1]);
+	case LogicalOperatorType::LOGICAL_UNION: {
+		idx_t cardinality = 0;
+		for (auto &child : op.children) {
+			auto child_cardinality = EstimateCardinality(*child);
+			if (!child_cardinality.IsValid()) {
+				return optional_idx();
+			}
+			auto max_remaining = NumericLimits<idx_t>::Maximum() - 1 - cardinality;
+			cardinality += MinValue<idx_t>(child_cardinality.GetIndex(), max_remaining);
+		}
+		return cardinality;
+	}
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+		auto &aggr = op.Cast<LogicalAggregate>();
+		if (aggr.groups.empty() && aggr.grouping_sets.size() <= 1) {
+			return 1;
+		}
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
+		auto join_type = op.Cast<LogicalComparisonJoin>().join_type;
+		if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::MARK ||
+		    join_type == JoinType::SINGLE) {
+			return EstimateCardinality(*op.children[0]);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+	optional_idx cardinality;
+	for (auto &child : op.children) {
+		auto child_cardinality = EstimateCardinality(*child);
+		if (!child_cardinality.IsValid()) {
+			return optional_idx();
+		}
+		if (!cardinality.IsValid() || child_cardinality.GetIndex() > cardinality.GetIndex()) {
+			cardinality = child_cardinality;
+		}
+	}
+	return cardinality;
+}
+
+bool AggregateInputEstimator::GetBaseColumn(LogicalOperator &op, ColumnBinding binding, BaseColumn &result) {
+	bool owns_table_index = false;
+	for (auto &table_index : op.GetTableIndex()) {
+		if (table_index == binding.table_index) {
+			owns_table_index = true;
+			break;
+		}
+	}
+	if (!owns_table_index) {
+		for (auto &child : op.children) {
+			if (GetBaseColumn(*child, binding, result)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	const auto column_index = binding.column_index.GetIndex();
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION: {
+		if (column_index >= op.expressions.size() ||
+		    op.expressions[column_index]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return false;
+		}
+		return GetBaseColumn(*op.children[0], op.expressions[column_index]->Cast<BoundColumnRefExpression>().Binding(),
+		                     result);
+	}
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+		auto &aggr = op.Cast<LogicalAggregate>();
+		if (binding.table_index != aggr.group_index || column_index >= aggr.groups.size() ||
+		    aggr.groups[column_index]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return false;
+		}
+		return GetBaseColumn(*op.children[0], aggr.groups[column_index]->Cast<BoundColumnRefExpression>().Binding(),
+		                     result);
+	}
+	case LogicalOperatorType::LOGICAL_CTE_REF: {
+		auto entry = materialized_ctes.find(op.Cast<LogicalCTERef>().cte_index);
+		if (entry == materialized_ctes.end()) {
+			return false;
+		}
+		auto &definition = *entry->second.get().children[0];
+		auto definition_bindings = definition.GetColumnBindings();
+		if (column_index >= definition_bindings.size()) {
+			return false;
+		}
+		return GetBaseColumn(definition, definition_bindings[column_index], result);
+	}
+	case LogicalOperatorType::LOGICAL_GET: {
+		auto stats = AggregateRewriteHelper::GetScanColumnStatistics(context, op.Cast<LogicalGet>(), column_index);
+		if (!stats) {
+			return false;
+		}
+		auto distinct_count = stats->GetDistinctCount();
+		if (distinct_count == 0) {
+			if (stats->CanHaveNoNull()) {
+				// no distinct count statistics
+				return false;
+			}
+			// the column only holds NULL values
+			distinct_count = 1;
+		}
+		auto table_cardinality = EstimateCardinality(op);
+		if (!table_cardinality.IsValid()) {
+			return false;
+		}
+		result.table_index = binding.table_index;
+		result.distinct_count = distinct_count;
+		result.table_cardinality = table_cardinality.GetIndex();
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
+//! a * b, capped at limit (limit >= a, b >= 1)
+static idx_t CappedMultiply(idx_t a, idx_t b, idx_t limit) {
+	if (a > limit / b) {
+		return limit;
+	}
+	return MinValue<idx_t>(a * b, limit);
+}
+
+optional_idx AggregateInputEstimator::EstimateGroupCount(LogicalOperator &input,
+                                                         const vector<reference<Expression>> &groups,
+                                                         idx_t input_cardinality) {
+	column_binding_set_t bindings;
+	for (auto &group : groups) {
+		if (group.get().IsVolatile()) {
+			return optional_idx();
+		}
+		ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
+		    group.get(), [&](const BoundColumnRefExpression &ref) { bindings.insert(ref.Binding()); });
+	}
+	// the distinct value combinations of each scan
+	struct ScanGroups {
+		TableIndex table_index;
+		idx_t group_count;
+		idx_t table_cardinality;
+	};
+	vector<ScanGroups> scans;
+	for (auto &binding : bindings) {
+		BaseColumn column;
+		if (!GetBaseColumn(input, binding, column)) {
+			return optional_idx();
+		}
+		if (column.table_cardinality == 0) {
+			// an empty table has no groups
+			return 0;
+		}
+		bool found = false;
+		for (auto &scan : scans) {
+			if (scan.table_index == column.table_index) {
+				scan.group_count = CappedMultiply(scan.group_count, column.distinct_count, scan.table_cardinality);
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			scans.push_back({column.table_index, MinValue(column.distinct_count, column.table_cardinality),
+			                 column.table_cardinality});
+		}
+	}
+	idx_t group_count = 1;
+	for (auto &scan : scans) {
+		if (input_cardinality == 0) {
+			return 0;
+		}
+		group_count = CappedMultiply(MinValue(group_count, input_cardinality), scan.group_count, input_cardinality);
+	}
+	return MinValue(group_count, MaxValue<idx_t>(input_cardinality, 1));
 }
 
 } // namespace duckdb
