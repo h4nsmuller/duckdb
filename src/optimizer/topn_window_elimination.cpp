@@ -3,6 +3,9 @@
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/helper.hpp"
+#include "duckdb/common/operator/add.hpp"
+#include "duckdb/common/operator/multiply.hpp"
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/function/builtin_function_lookup.hpp"
@@ -10,12 +13,17 @@
 #include "duckdb/optimizer/remove_unused_columns.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression_nullability.hpp"
+#include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cte.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_empty_result.hpp"
+#include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -32,6 +40,7 @@
 #include "duckdb/function/aggregate/minmax_n_helpers.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/enums/order_type.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
 
 namespace duckdb {
 
@@ -210,6 +219,303 @@ bool IsRecreatableByLateMaterialization(const Expression &expr) {
 	return false;
 }
 
+//! Whether the ORDER BY of the window has to be folded into one sort key: the top-n aggregates order by a single
+//! value, ascending or descending, NULLS LAST
+bool RequiresSortKey(const BoundWindowExpression &window_expr) {
+	return window_expr.OrderBy().size() != 1 || window_expr.OrderBy()[0].null_order != OrderByNullType::NULLS_LAST;
+}
+
+//! Folds the ORDER BY keys into one BLOB whose ascending order is the window order, with the direction and the NULL
+//! order of every key. A struct of the keys does not have that order: a NULL field of a struct sorts after every value
+//! whatever the requested NULL order is.
+unique_ptr<Expression> CreateOrderSortKey(ClientContext &context, vector<BoundOrderByNode> &orders) {
+	vector<unique_ptr<Expression>> sort_key_args;
+	sort_key_args.reserve(orders.size() * 2);
+	for (auto &order : orders) {
+		auto modifier = order.GetOrderModifier();
+		sort_key_args.push_back(std::move(order.expression));
+		sort_key_args.push_back(make_uniq<BoundConstantExpression>(Value(modifier)));
+	}
+	return BindBuiltinScalarFunction(context, "create_sort_key", std::move(sort_key_args));
+}
+
+//! With a limit above 1 the sort key aggregate keeps a heap of limit rows per partition. It replaces the window only
+//! when limit * partitions * factor is at most the number of input rows, i.e. the heaps hold about 3% of the input
+constexpr idx_t SORT_KEY_HEAP_GUARD_FACTOR = 32;
+//! With a limit of 1 the sort key aggregate needs at least this many input rows per value of every partition column
+constexpr idx_t SORT_KEY_ROWS_PER_PARTITION = 16;
+//! Heaps (or partitions) of at most this many rows in total are small whatever the size of the input is
+constexpr idx_t SORT_KEY_SMALL_HEAP_ROWS = 10000;
+
+idx_t SaturatingMultiply(idx_t left, idx_t right) {
+	idx_t result;
+	if (!TryMultiplyOperator::Operation(left, right, result)) {
+		return NumericLimits<idx_t>::Maximum() - 1;
+	}
+	return MinValue<idx_t>(result, NumericLimits<idx_t>::Maximum() - 1);
+}
+
+idx_t SaturatingAdd(idx_t left, idx_t right) {
+	idx_t result;
+	if (!TryAddOperator::Operation(left, right, result)) {
+		return NumericLimits<idx_t>::Maximum() - 1;
+	}
+	return MinValue<idx_t>(result, NumericLimits<idx_t>::Maximum() - 1);
+}
+
+//! Upper bounds of row counts and distinct counts below an operator, taken from the statistics of the scanned tables
+//! and followed through the operators that preserve the identity of a column. An invalid result means "unknown".
+//! The cardinality estimates of the plan are not used: they are estimates of the expected size and say nothing about
+//! the number of distinct partitions.
+class TableStatisticsEstimator {
+public:
+	explicit TableStatisticsEstimator(ClientContext &context) : context(context) {
+	}
+
+	//! An upper bound of the number of rows the operator produces
+	optional_idx Rows(LogicalOperator &op) const {
+		switch (op.type) {
+		case LogicalOperatorType::LOGICAL_GET: {
+			auto &get = op.Cast<LogicalGet>();
+			if (!get.children.empty() || !get.function.cardinality || !get.bind_data) {
+				return optional_idx();
+			}
+			auto node_stats = get.function.cardinality(context, get.bind_data.get());
+			if (!node_stats || !node_stats->has_estimated_cardinality) {
+				return optional_idx();
+			}
+			return node_stats->estimated_cardinality;
+		}
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+			auto &aggr = op.Cast<LogicalAggregate>();
+			if (aggr.groups.empty()) {
+				return 1;
+			}
+			auto &child = *op.children[0];
+			auto child_rows = Rows(child);
+			if (!child_rows.IsValid()) {
+				return optional_idx();
+			}
+			idx_t groups = 1;
+			for (auto &group : aggr.groups) {
+				auto distinct = Distinct(child, *group);
+				if (!distinct.IsValid()) {
+					groups = child_rows.GetIndex();
+					break;
+				}
+				groups = SaturatingMultiply(groups, distinct.GetIndex());
+			}
+			groups = MinValue<idx_t>(groups, child_rows.GetIndex());
+			return SaturatingMultiply(groups, MaxValue<idx_t>(aggr.grouping_sets.size(), 1));
+		}
+		case LogicalOperatorType::LOGICAL_UNION: {
+			idx_t total = 0;
+			for (auto &child : op.children) {
+				auto child_rows = Rows(*child);
+				if (!child_rows.IsValid()) {
+					return optional_idx();
+				}
+				total = SaturatingAdd(total, child_rows.GetIndex());
+			}
+			return total;
+		}
+		case LogicalOperatorType::LOGICAL_EXCEPT:
+		case LogicalOperatorType::LOGICAL_INTERSECT:
+			return Rows(*op.children[0]);
+		case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+			return Rows(*op.children[1]);
+		case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
+			return 1;
+		case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
+			return op.Cast<LogicalExpressionGet>().expressions.size();
+		case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
+			return 0;
+		default: {
+			// the maximum of the children: a bound for filters and projections, a rough estimate for joins
+			if (op.children.empty()) {
+				return optional_idx();
+			}
+			idx_t result = 0;
+			for (auto &child : op.children) {
+				auto child_rows = Rows(*child);
+				if (!child_rows.IsValid()) {
+					return optional_idx();
+				}
+				result = MaxValue<idx_t>(result, child_rows.GetIndex());
+			}
+			return result;
+		}
+		}
+	}
+
+	//! An upper bound of the number of distinct values of the expression over the output of scope
+	optional_idx Distinct(LogicalOperator &scope, const Expression &expr) const {
+		optional_idx estimate;
+		if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			estimate = Distinct(scope, expr.Cast<BoundColumnRefExpression>().Binding());
+		} else if (expr.GetExpressionClass() == ExpressionClass::BOUND_CASE) {
+			// a CASE returns one of its result expressions
+			auto &case_expr = expr.Cast<BoundCaseExpression>();
+			estimate = Distinct(scope, case_expr.Else());
+			for (auto &check : case_expr.CaseChecks()) {
+				auto distinct = Distinct(scope, *check.then_expr);
+				if (!estimate.IsValid() || !distinct.IsValid()) {
+					return optional_idx();
+				}
+				estimate = SaturatingAdd(estimate.GetIndex(), distinct.GetIndex());
+			}
+		} else {
+			// a function of columns does not have more values than the combinations of the columns
+			column_binding_set_t bindings;
+			ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
+			    expr, [&](const BoundColumnRefExpression &colref) { bindings.insert(colref.Binding()); });
+			idx_t combinations = 1;
+			for (auto &binding : bindings) {
+				auto distinct = Distinct(scope, binding);
+				if (!distinct.IsValid()) {
+					return optional_idx();
+				}
+				combinations = SaturatingMultiply(combinations, distinct.GetIndex());
+			}
+			estimate = combinations;
+			auto modulo_values = ModuloValues(expr);
+			if (modulo_values.IsValid()) {
+				estimate = MinValue<idx_t>(combinations, modulo_values.GetIndex());
+			}
+		}
+		if (!estimate.IsValid()) {
+			return optional_idx();
+		}
+		// a small type does not have more values than its domain and NULL
+		idx_t domain = NumericLimits<idx_t>::Maximum();
+		switch (expr.GetReturnType().id()) {
+		case LogicalTypeId::BOOLEAN:
+			domain = 3;
+			break;
+		case LogicalTypeId::TINYINT:
+		case LogicalTypeId::UTINYINT:
+			domain = idx_t(NumericLimits<uint8_t>::Maximum()) + 2;
+			break;
+		case LogicalTypeId::SMALLINT:
+		case LogicalTypeId::USMALLINT:
+			domain = idx_t(NumericLimits<uint16_t>::Maximum()) + 2;
+			break;
+		default:
+			break;
+		}
+		return MinValue<idx_t>(estimate.GetIndex(), domain);
+	}
+
+private:
+	//! x % c has at most 2 * |c| + 1 values
+	static optional_idx ModuloValues(const Expression &expr) {
+		if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+			return optional_idx();
+		}
+		auto &function = expr.Cast<BoundFunctionExpression>();
+		auto &children = function.GetChildren();
+		if (function.Function().GetName().GetIdentifierName() != "%" || children.size() != 2 ||
+		    children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return optional_idx();
+		}
+		auto &modulus = children[1]->Cast<BoundConstantExpression>().GetValue();
+		if (modulus.IsNull() || !modulus.type().IsIntegral()) {
+			return optional_idx();
+		}
+		auto modulus_bigint = modulus.DefaultTryCastAs(LogicalType::BIGINT);
+		if (!modulus_bigint || modulus_bigint->IsNull()) {
+			return optional_idx();
+		}
+		const auto modulus_value = BigIntValue::Get(*modulus_bigint);
+		if (modulus_value == NumericLimits<int64_t>::Minimum()) {
+			return optional_idx();
+		}
+		return SaturatingAdd(SaturatingMultiply(NumericCast<idx_t>(AbsValue(modulus_value)), 2), 1);
+	}
+
+	//! The operator in the subtree that produces the table index
+	static optional_ptr<LogicalOperator> FindProducer(LogicalOperator &op, TableIndex table_index) {
+		for (auto &index : op.GetTableIndex()) {
+			if (index == table_index) {
+				return op;
+			}
+		}
+		for (auto &child : op.children) {
+			auto result = FindProducer(*child, table_index);
+			if (result) {
+				return result;
+			}
+		}
+		return nullptr;
+	}
+
+	optional_idx Distinct(LogicalOperator &scope, const ColumnBinding &binding) const {
+		auto producer = FindProducer(scope, binding.table_index);
+		if (!producer) {
+			return optional_idx();
+		}
+		auto &op = *producer;
+		const auto column = binding.column_index.GetIndex();
+		switch (op.type) {
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+			if (column >= op.expressions.size()) {
+				return optional_idx();
+			}
+			return Distinct(*op.children[0], *op.expressions[column]);
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+			auto &aggr = op.Cast<LogicalAggregate>();
+			if (binding.table_index != aggr.group_index || column >= aggr.groups.size()) {
+				return optional_idx();
+			}
+			return Distinct(*op.children[0], *aggr.groups[column]);
+		}
+		case LogicalOperatorType::LOGICAL_GET: {
+			auto &get = op.Cast<LogicalGet>();
+			auto &column_ids = get.GetColumnIds();
+			if (column >= column_ids.size() || column_ids[column].IsVirtualColumn() || !get.bind_data) {
+				return optional_idx();
+			}
+			unique_ptr<BaseStatistics> stats;
+			if (get.function.statistics_extended) {
+				TableFunctionGetStatisticsInput input(get.bind_data.get(), column_ids[column]);
+				stats = get.function.statistics_extended(context, input);
+			} else if (get.function.statistics) {
+				stats = get.function.statistics(context, get.bind_data.get(), column_ids[column].GetPrimaryIndex());
+			}
+			if (!stats || stats->GetDistinctCount() == 0) {
+				return optional_idx();
+			}
+			return stats->GetDistinctCount();
+		}
+		case LogicalOperatorType::LOGICAL_UNION:
+		case LogicalOperatorType::LOGICAL_EXCEPT:
+		case LogicalOperatorType::LOGICAL_INTERSECT: {
+			idx_t total = 0;
+			for (auto &child : op.children) {
+				auto child_bindings = child->GetColumnBindings();
+				if (column >= child_bindings.size()) {
+					return optional_idx();
+				}
+				auto distinct = Distinct(*child, child_bindings[column]);
+				if (!distinct.IsValid()) {
+					return optional_idx();
+				}
+				total = SaturatingAdd(total, distinct.GetIndex());
+				if (op.type != LogicalOperatorType::LOGICAL_UNION) {
+					break;
+				}
+			}
+			return total;
+		}
+		default:
+			return optional_idx();
+		}
+	}
+
+private:
+	ClientContext &context;
+};
+
 } // namespace
 
 TopNWindowElimination::TopNWindowElimination(ClientContext &context_p, Optimizer &optimizer,
@@ -234,7 +540,10 @@ unique_ptr<LogicalOperator> TopNWindowElimination::Optimize(unique_ptr<LogicalOp
 
 unique_ptr<LogicalOperator> TopNWindowElimination::OptimizeInternal(unique_ptr<LogicalOperator> op,
                                                                     ColumnBindingReplacer &replacer) {
-	const auto limit = CanOptimize(*op);
+	auto limit = CanOptimize(*op);
+	if (limit.IsValid() && limit.GetIndex() > 0 && SortKeyAggregateIsTooLarge(*op, limit.GetIndex())) {
+		limit = optional_idx();
+	}
 	if (!limit.IsValid()) {
 		// Traverse through query plan to find grouped top-n pattern
 		if (op->children.size() > 1) {
@@ -336,6 +645,58 @@ unique_ptr<LogicalOperator> TopNWindowElimination::OptimizeInternal(unique_ptr<L
 	return unique_ptr<LogicalOperator>(std::move(op));
 }
 
+bool TopNWindowElimination::SortKeyAggregateIsTooLarge(LogicalOperator &filter, const idx_t limit) const {
+	reference<LogicalOperator> child = *filter.children[0];
+	while (child.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		child = *child.get().children[0];
+	}
+	auto &window = child.get().Cast<LogicalWindow>();
+	auto &window_expr = window.expressions[0]->Cast<BoundWindowExpression>();
+	if (!RequiresSortKey(window_expr)) {
+		return false;
+	}
+	// The aggregate builds a sort key for every input row and keeps limit keys and payloads per partition in memory.
+	// Unlike the window it cannot spill, so it only replaces the window where the statistics of the scanned tables
+	// bound its state.
+	auto &input = *window.children[0];
+	const TableStatisticsEstimator estimator(context);
+	const auto rows = estimator.Rows(input);
+	if (limit <= 1) {
+		// One row per partition needs no heap. Keep the window when one partition column alone has nearly as many
+		// values as the input has rows (a lower bound of the number of partitions): partitions of a few rows are as
+		// cheap to sort as to aggregate.
+		if (!rows.IsValid()) {
+			return false;
+		}
+		idx_t partitions = 0;
+		for (auto &partition : window_expr.Partitions()) {
+			auto distinct = estimator.Distinct(input, *partition);
+			if (distinct.IsValid()) {
+				partitions = MaxValue<idx_t>(partitions, distinct.GetIndex());
+			}
+		}
+		return partitions > SORT_KEY_SMALL_HEAP_ROWS &&
+		       SaturatingMultiply(partitions, SORT_KEY_ROWS_PER_PARTITION) > rows.GetIndex();
+	}
+	// A heap of limit rows per partition: an unknown number of partitions keeps the window
+	idx_t partitions = 1;
+	for (auto &partition : window_expr.Partitions()) {
+		auto distinct = estimator.Distinct(input, *partition);
+		if (!distinct.IsValid()) {
+			return true;
+		}
+		partitions = SaturatingMultiply(partitions, distinct.GetIndex());
+	}
+	const auto heap_rows = SaturatingMultiply(partitions, limit);
+	if (heap_rows <= SORT_KEY_SMALL_HEAP_ROWS) {
+		return false;
+	}
+	if (!rows.IsValid()) {
+		return true;
+	}
+	return SaturatingMultiply(heap_rows, SORT_KEY_HEAP_GUARD_FACTOR) > rows.GetIndex();
+}
+
 unique_ptr<Expression>
 TopNWindowElimination::CreateAggregateExpression(vector<unique_ptr<Expression>> aggregate_params,
                                                  const bool requires_arg,
@@ -362,7 +723,6 @@ unique_ptr<LogicalOperator>
 TopNWindowElimination::CreateAggregateOperator(LogicalWindow &window, vector<unique_ptr<Expression>> args,
                                                const TopNWindowEliminationParameters &params) const {
 	auto &window_expr = window.expressions[0]->Cast<BoundWindowExpression>();
-	D_ASSERT(window_expr.OrderBy().size() == 1);
 
 	vector<unique_ptr<Expression>> aggregate_params;
 	aggregate_params.reserve(3);
@@ -375,7 +735,11 @@ TopNWindowElimination::CreateAggregateOperator(LogicalWindow &window, vector<uni
 		aggregate_params.push_back(BindBuiltinScalarFunction(context, "struct_pack", std::move(args)));
 	}
 
-	aggregate_params.push_back(std::move(window_expr.OrderByMutable()[0].expression));
+	if (RequiresSortKey(window_expr)) {
+		aggregate_params.push_back(CreateOrderSortKey(context, window_expr.OrderByMutable()));
+	} else {
+		aggregate_params.push_back(std::move(window_expr.OrderByMutable()[0].expression));
+	}
 	if (params.limit > 1) {
 		aggregate_params.push_back(std::move(make_uniq<BoundConstantExpression>(Value::BIGINT(params.limit))));
 	}
@@ -684,15 +1048,18 @@ optional_idx TopNWindowElimination::CanOptimize(LogicalOperator &op) {
 	if (!window_expr.ArgOrders().empty()) {
 		return cant_optimize;
 	}
-	if (window_expr.OrderBy().size() != 1) {
+	if (window_expr.OrderBy().empty()) {
 		return cant_optimize;
 	}
-	if (window_expr.OrderBy()[0].type != OrderType::DESCENDING &&
-	    window_expr.OrderBy()[0].type != OrderType::ASCENDING) {
-		return cant_optimize;
-	}
-	if (window_expr.OrderBy()[0].null_order != OrderByNullType::NULLS_LAST) {
-		return cant_optimize;
+	// A single NULLS LAST key is aggregated directly. Several keys, or a NULLS FIRST key, are folded into one sort
+	// key (RequiresSortKey), for which every key needs a resolved direction and NULL order.
+	for (auto &order : window_expr.OrderBy()) {
+		if (order.type != OrderType::DESCENDING && order.type != OrderType::ASCENDING) {
+			return cant_optimize;
+		}
+		if (order.null_order != OrderByNullType::NULLS_LAST && order.null_order != OrderByNullType::NULLS_FIRST) {
+			return cant_optimize;
+		}
 	}
 
 	// We have found a grouped top-n window construct!
@@ -749,7 +1116,7 @@ vector<unique_ptr<Expression>> TopNWindowElimination::GenerateAggregatePayload(c
 		}
 	}
 
-	if (aggregate_args.size() == 1) {
+	if (aggregate_args.size() == 1 && !RequiresSortKey(window_expr)) {
 		// If we only project the aggregate value itself, we do not need it as an arg
 		auto column_references = ColumnReferenceExtractor::GetReferences(&window_expr.OrderByMutable()[0].expression);
 		if (column_references.size() != 1) {
@@ -929,7 +1296,8 @@ TopNWindowElimination::ExtractOptimizerParameters(const LogicalWindow &window, c
 	params.payload_type = aggregate_payload.size() > 1 ? TopNPayloadType::STRUCT_PACK : TopNPayloadType::SINGLE_COLUMN;
 	auto &window_expr = window.expressions[0]->Cast<BoundWindowExpression>();
 	params.partition_count = window_expr.Partitions().size();
-	params.order_type = window_expr.OrderBy()[0].type;
+	// A sort key carries the direction of every key: its smallest values are the first rows of the partition
+	params.order_type = RequiresSortKey(window_expr) ? OrderType::ASCENDING : window_expr.OrderBy()[0].type;
 
 	// The statistics of a column binding are those at the top of the plan: a filter above the window (e.g. on the
 	// result of a decorrelated LATERAL join) can have narrowed them to non-NULL although the input of the window

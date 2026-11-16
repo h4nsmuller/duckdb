@@ -52,6 +52,8 @@ public:
 
 private:
 	unique_ptr<LogicalOperator> OptimizeInternal(unique_ptr<LogicalOperator> op, ColumnBindingReplacer &replacer);
+	//! Whether the aggregate over a sort key of several ORDER BY keys would cost more than the window it replaces
+	bool SortKeyAggregateIsTooLarge(LogicalOperator &filter, idx_t limit) const;
 
 	unique_ptr<LogicalOperator> CreateAggregateOperator(LogicalWindow &window, vector<unique_ptr<Expression>> args,
 	                                                    const TopNWindowEliminationParameters &params) const;

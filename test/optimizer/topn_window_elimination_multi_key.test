@@ -1,0 +1,510 @@
+# name: test/optimizer/topn_window_elimination_multi_key.test
+# description: Top-N window elimination with several ORDER BY keys, mixed directions and NULL orders
+# group: [optimizer]
+
+statement ok
+SET explain_output = OPTIMIZED_ONLY;
+
+statement ok
+CREATE TABLE t AS SELECT i, i % 7 AS p, i % 1000 AS q, CASE WHEN i % 5 = 0 THEN NULL ELSE i % 4 END AS a, CASE WHEN i % 3 = 0 THEN NULL ELSE (i * 37) % 11 END AS b, 'v' || i AS s FROM range(20000) r(i);
+
+# several keys, same direction: NULL keys sort last per key
+query II
+EXPLAIN SELECT p, i, s FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a, b, i) rn FROM t) WHERE rn = 1 ORDER BY p;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query III
+SELECT p, i, s FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a, b, i) rn FROM t) WHERE rn = 1 ORDER BY p;
+----
+0	308	v308
+1	176	v176
+2	44	v44
+3	836	v836
+4	88	v88
+5	572	v572
+6	748	v748
+
+# mixed directions
+query II
+EXPLAIN SELECT p, i, a, b FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a DESC, b, i) rn FROM t) WHERE rn = 1 ORDER BY p;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query IIII
+SELECT p, i, a, b FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a DESC, b, i) rn FROM t) WHERE rn = 1 ORDER BY p;
+----
+0	539	3	0
+1	407	3	0
+2	583	3	0
+3	143	3	0
+4	11	3	0
+5	187	3	0
+6	671	3	0
+
+# all descending: a NULL key still sorts last, unlike in a descending row comparison
+query II
+EXPLAIN SELECT p, i, a, b FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a DESC, b DESC, i DESC) rn FROM t) WHERE rn = 1 ORDER BY p;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query IIII
+SELECT p, i, a, b FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a DESC, b DESC, i DESC) rn FROM t) WHERE rn = 1 ORDER BY p;
+----
+0	19159	3	10
+1	19951	3	10
+2	19819	3	10
+3	19687	3	10
+4	19247	3	10
+5	19423	3	10
+6	19907	3	10
+
+# explicit NULL orders per key
+query II
+EXPLAIN SELECT p, i, a, b FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a DESC NULLS FIRST, b ASC NULLS FIRST, i DESC) rn FROM t) WHERE rn = 1 ORDER BY p;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query IIII
+SELECT p, i, a, b FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a DESC NULLS FIRST, b ASC NULLS FIRST, i DESC) rn FROM t) WHERE rn = 1 ORDER BY p;
+----
+0	19950	NULL	NULL
+1	19965	NULL	NULL
+2	19980	NULL	NULL
+3	19995	NULL	NULL
+4	19905	NULL	NULL
+5	19920	NULL	NULL
+6	19935	NULL	NULL
+
+# top 3 with the row number in the result
+query II
+EXPLAIN SELECT p, i, a, b, rn FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a NULLS FIRST, b DESC, i) rn FROM t WHERE p < 3) WHERE rn <= 3 ORDER BY p, rn;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query IIIII
+SELECT p, i, a, b, rn FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a NULLS FIRST, b DESC, i) rn FROM t WHERE p < 3) WHERE rn <= 3 ORDER BY p, rn;
+----
+0	140	NULL	10	1
+0	910	NULL	10	2
+0	1295	NULL	10	3
+1	85	NULL	10	1
+1	470	NULL	10	2
+1	1240	NULL	10	3
+2	415	NULL	10	1
+2	800	NULL	10	2
+2	1570	NULL	10	3
+
+# strict comparison
+query II
+EXPLAIN SELECT p, i, a, b, rn FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a NULLS FIRST, b DESC, i) rn FROM t WHERE p < 3) WHERE rn < 3 ORDER BY p, rn;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query IIIII
+SELECT p, i, a, b, rn FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a NULLS FIRST, b DESC, i) rn FROM t WHERE p < 3) WHERE rn < 3 ORDER BY p, rn;
+----
+0	140	NULL	10	1
+0	910	NULL	10	2
+1	85	NULL	10	1
+1	470	NULL	10	2
+2	415	NULL	10	1
+2	800	NULL	10	2
+
+# a single NULLS FIRST key
+query II
+EXPLAIN SELECT p, i, n FROM (SELECT p, i, nullif(i, 9) AS n, row_number() OVER (PARTITION BY p ORDER BY nullif(i, 9) NULLS FIRST) rn FROM t WHERE i < 21) WHERE rn = 1 ORDER BY p;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query III
+SELECT p, i, n FROM (SELECT p, i, nullif(i, 9) AS n, row_number() OVER (PARTITION BY p ORDER BY nullif(i, 9) NULLS FIRST) rn FROM t WHERE i < 21) WHERE rn = 1 ORDER BY p;
+----
+0	0	0
+1	1	1
+2	9	NULL
+3	3	3
+4	4	4
+5	5	5
+6	6	6
+
+# a single DESC NULLS FIRST key, top 2
+query II
+EXPLAIN SELECT p, i, rn FROM (SELECT p, i, row_number() OVER (PARTITION BY p ORDER BY nullif(i, 9) DESC NULLS FIRST) rn FROM t WHERE i < 21) WHERE rn <= 2 ORDER BY p, rn;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query III
+SELECT p, i, rn FROM (SELECT p, i, row_number() OVER (PARTITION BY p ORDER BY nullif(i, 9) DESC NULLS FIRST) rn FROM t WHERE i < 21) WHERE rn <= 2 ORDER BY p, rn;
+----
+0	14	1
+0	7	2
+1	15	1
+1	8	2
+2	9	1
+2	16	2
+3	17	1
+3	10	2
+4	18	1
+4	11	2
+5	19	1
+5	12	2
+6	20	1
+6	13	2
+
+# no partition, top 4
+query II
+EXPLAIN SELECT i, a, b, rn FROM (SELECT *, row_number() OVER (ORDER BY b DESC, a, i) rn FROM t) WHERE rn <= 4 ORDER BY rn;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query IIII
+SELECT i, a, b, rn FROM (SELECT *, row_number() OVER (ORDER BY b DESC, a, i) rn FROM t) WHERE rn <= 4 ORDER BY rn;
+----
+8	0	10	1
+52	0	10	2
+184	0	10	3
+272	0	10	4
+
+# no partition, top 1
+query II
+EXPLAIN SELECT i, a, b FROM (SELECT *, row_number() OVER (ORDER BY b DESC, a, i) rn FROM t) WHERE rn = 1;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query III
+SELECT i, a, b FROM (SELECT *, row_number() OVER (ORDER BY b DESC, a, i) rn FROM t) WHERE rn = 1;
+----
+8	0	10
+
+# no partition, empty input
+query II
+EXPLAIN SELECT i, a, b FROM (SELECT *, row_number() OVER (ORDER BY b DESC, a, i) rn FROM t WHERE i < 0) WHERE rn = 1;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query III
+SELECT i, a, b FROM (SELECT *, row_number() OVER (ORDER BY b DESC, a, i) rn FROM t WHERE i < 0) WHERE rn = 1;
+----
+
+# the partition key repeated in the order, an expression key and a VARCHAR key
+query II
+EXPLAIN SELECT p, i FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY p, a + b DESC, s) rn FROM t) WHERE rn = 1 ORDER BY p;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query II
+SELECT p, i FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY p, a + b DESC, s) rn FROM t) WHERE rn = 1 ORDER BY p;
+----
+0	10843
+1	10403
+2	10271
+3	10139
+4	10007
+5	10183
+6	10051
+
+# only the partition column is selected
+query II
+EXPLAIN SELECT p FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a, i) rn FROM t) WHERE rn <= 2 ORDER BY p;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query I
+SELECT p FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a, i) rn FROM t) WHERE rn <= 2 ORDER BY p;
+----
+0
+0
+1
+1
+2
+2
+3
+3
+4
+4
+5
+5
+6
+6
+
+# the only payload column is one of the order keys
+query II
+EXPLAIN SELECT p, i FROM (SELECT p, i, row_number() OVER (PARTITION BY p ORDER BY a, i) rn FROM t) WHERE rn <= 2 ORDER BY p, i;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query II
+SELECT p, i FROM (SELECT p, i, row_number() OVER (PARTITION BY p ORDER BY a, i) rn FROM t) WHERE rn <= 2 ORDER BY p, i;
+----
+0	28
+0	56
+1	8
+1	36
+2	16
+2	44
+3	24
+3	52
+4	4
+4	32
+5	12
+5	68
+6	48
+6	76
+
+# QUALIFY
+query II
+EXPLAIN SELECT p, i, a, b FROM t QUALIFY row_number() OVER (PARTITION BY p ORDER BY b DESC, a DESC, i DESC) = 1 ORDER BY p;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query IIII
+SELECT p, i, a, b FROM t QUALIFY row_number() OVER (PARTITION BY p ORDER BY b DESC, a DESC, i DESC) = 1 ORDER BY p;
+----
+0	19159	3	10
+1	19951	3	10
+2	19819	3	10
+3	19687	3	10
+4	19247	3	10
+5	19423	3	10
+6	19907	3	10
+
+# two partition columns, one of them nullable, under an aggregate
+query II
+EXPLAIN SELECT p, a, count(*), sum(i) FROM (SELECT *, row_number() OVER (PARTITION BY p, a ORDER BY b, i DESC) rn FROM t) WHERE rn <= 2 GROUP BY ALL ORDER BY ALL;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query IIII
+SELECT p, a, count(*), sum(i) FROM (SELECT *, row_number() OVER (PARTITION BY p, a ORDER BY b, i DESC) rn FROM t) WHERE rn <= 2 GROUP BY ALL ORDER BY ALL;
+----
+0	0	2	38808
+0	1	2	39270
+0	2	2	38192
+0	3	2	39270
+0	NULL	2	38115
+1	0	2	38852
+1	1	2	39006
+1	2	2	38544
+1	3	2	38698
+1	NULL	2	38775
+2	0	2	39204
+2	1	2	37818
+2	2	2	38280
+2	3	2	39666
+2	NULL	2	39435
+3	0	2	38940
+3	1	2	37862
+3	2	2	38940
+3	3	2	38478
+3	NULL	2	38940
+4	0	2	38676
+4	1	2	39138
+4	2	2	39600
+4	3	2	38522
+4	NULL	2	38445
+5	0	2	39028
+5	1	2	37950
+5	2	2	39336
+5	3	2	38874
+5	NULL	2	39105
+6	0	2	39072
+6	1	2	39534
+6	2	2	38148
+6	3	2	38610
+6	NULL	2	38610
+
+# over a join
+query II
+EXPLAIN SELECT p, i, j FROM (SELECT t.p, t.i, u.i AS j, row_number() OVER (PARTITION BY t.p ORDER BY u.a DESC, t.i, u.i) rn FROM t JOIN t u ON t.i = u.i + 50) WHERE rn = 1 ORDER BY p;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query III
+SELECT p, i, j FROM (SELECT t.p, t.i, u.i AS j, row_number() OVER (PARTITION BY t.p ORDER BY u.a DESC, t.i, u.i) rn FROM t JOIN t u ON t.i = u.i + 50) WHERE rn = 1 ORDER BY p;
+----
+0	77	27
+1	57	7
+2	93	43
+3	73	23
+4	53	3
+5	61	11
+6	69	19
+
+# rank() keeps ties: not rewritten
+query II
+EXPLAIN SELECT p, i FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY a, b) rn FROM t WHERE i < 60) WHERE rn = 1 ORDER BY p, i;
+----
+logical_opt	<REGEX>:.*Window.*
+
+query II
+SELECT p, i FROM (SELECT *, rank() OVER (PARTITION BY p ORDER BY a, b) rn FROM t WHERE i < 60) WHERE rn = 1 ORDER BY p, i;
+----
+0	28
+1	8
+2	44
+3	52
+4	4
+5	12
+6	48
+
+# dense_rank() keeps ties: not rewritten
+query II
+EXPLAIN SELECT p, i FROM (SELECT *, dense_rank() OVER (PARTITION BY p ORDER BY a, b) rn FROM t WHERE p < 2 AND i < 60) WHERE rn <= 2 ORDER BY p, i;
+----
+logical_opt	<REGEX>:.*Window.*
+
+query II
+SELECT p, i FROM (SELECT *, dense_rank() OVER (PARTITION BY p ORDER BY a, b) rn FROM t WHERE p < 2 AND i < 60) WHERE rn <= 2 ORDER BY p, i;
+----
+0	28
+0	56
+1	8
+1	36
+
+# a row number other than a prefix
+query II
+EXPLAIN SELECT p, i FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a, b, i) rn FROM t) WHERE rn = 2 ORDER BY p;
+----
+logical_opt	<REGEX>:.*Window.*
+
+query II
+SELECT p, i FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a, b, i) rn FROM t) WHERE rn = 2 ORDER BY p;
+----
+0	616
+1	484
+2	352
+3	1144
+4	704
+5	1496
+6	1364
+
+# a row number range that is not a prefix
+query II
+EXPLAIN SELECT p, i FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a, b, i) rn FROM t WHERE i < 110) WHERE rn > 13 ORDER BY p;
+----
+logical_opt	<REGEX>:.*Window.*
+
+query II
+SELECT p, i FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a, b, i) rn FROM t WHERE i < 110) WHERE rn > 13 ORDER BY p;
+----
+0	35
+0	0
+0	105
+1	50
+1	85
+1	15
+2	100
+2	65
+2	30
+3	80
+3	10
+3	45
+4	25
+4	95
+4	60
+5	5
+5	75
+6	20
+6	90
+
+# another window function over the same window
+query II
+EXPLAIN SELECT p, i, c FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a, b, i) rn, count(*) OVER (PARTITION BY p ORDER BY a, b, i) c FROM t) WHERE rn = 1 ORDER BY p;
+----
+logical_opt	<REGEX>:.*Window.*
+
+query III
+SELECT p, i, c FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a, b, i) rn, count(*) OVER (PARTITION BY p ORDER BY a, b, i) c FROM t) WHERE rn = 1 ORDER BY p;
+----
+0	308	1
+1	176	1
+2	44	1
+3	836	1
+4	88	1
+5	572	1
+6	748	1
+
+# a second predicate on the row number filter
+query II
+EXPLAIN SELECT p, i FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a, b, i) rn FROM t) WHERE rn <= 2 AND i > 40 ORDER BY p, i;
+----
+logical_opt	<REGEX>:.*Window.*
+
+query II
+SELECT p, i FROM (SELECT *, row_number() OVER (PARTITION BY p ORDER BY a, b, i) rn FROM t) WHERE rn <= 2 AND i > 40 ORDER BY p, i;
+----
+0	308
+0	616
+1	176
+1	484
+2	44
+2	352
+3	836
+3	1144
+4	88
+4	704
+5	572
+5	1496
+6	748
+6	1364
+
+# the first row of 1000 partitions
+query II
+EXPLAIN SELECT q, i FROM (SELECT q, i, row_number() OVER (PARTITION BY q ORDER BY a, i) rn FROM t WHERE q < 3) WHERE rn = 1 ORDER BY q;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query II
+SELECT q, i FROM (SELECT q, i, row_number() OVER (PARTITION BY q ORDER BY a, i) rn FROM t WHERE q < 3) WHERE rn = 1 ORDER BY q;
+----
+0	0
+1	1
+2	2
+
+# the top 2 of 1000 partitions: the heaps stay small
+query II
+EXPLAIN SELECT q, i, rn FROM (SELECT q, i, row_number() OVER (PARTITION BY q ORDER BY a, i) rn FROM t WHERE q < 3) WHERE rn <= 2 ORDER BY q, rn;
+----
+logical_opt	<!REGEX>:.*Window.*
+
+query III
+SELECT q, i, rn FROM (SELECT q, i, row_number() OVER (PARTITION BY q ORDER BY a, i) rn FROM t WHERE q < 3) WHERE rn <= 2 ORDER BY q, rn;
+----
+0	0	1
+0	1000	2
+1	1	1
+1	1001	2
+2	2	1
+2	1002	2
+
+# the top 3 of single-row partitions: the heaps would hold the whole input, the window stays
+query II
+EXPLAIN SELECT i, s, rn FROM (SELECT i, s, row_number() OVER (PARTITION BY i ORDER BY a, s) rn FROM t WHERE i < 5) WHERE rn <= 3 ORDER BY i;
+----
+logical_opt	<REGEX>:.*Window.*
+
+query III
+SELECT i, s, rn FROM (SELECT i, s, row_number() OVER (PARTITION BY i ORDER BY a, s) rn FROM t WHERE i < 5) WHERE rn <= 3 ORDER BY i;
+----
+0	v0	1
+1	v1	1
+2	v2	1
+3	v3	1
+4	v4	1
+
+# the first row of single-row partitions: the window stays
+query II
+EXPLAIN SELECT i, s FROM (SELECT i, s, row_number() OVER (PARTITION BY i ORDER BY a, s) rn FROM t WHERE i < 5) WHERE rn = 1 ORDER BY i;
+----
+logical_opt	<REGEX>:.*Window.*
+
+query II
+SELECT i, s FROM (SELECT i, s, row_number() OVER (PARTITION BY i ORDER BY a, s) rn FROM t WHERE i < 5) WHERE rn = 1 ORDER BY i;
+----
+0	v0
+1	v1
+2	v2
+3	v3
+4	v4
+
