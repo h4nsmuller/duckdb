@@ -1,0 +1,222 @@
+# name: test/sql/join/inner/test_join_multi_key_runtime_filter_key_domain.test
+# description: A build side above 5% of the probe side still gets a filter for a key column of which it holds few distinct values
+# group: [inner]
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+SET threads=4;
+
+statement ok
+SET dynamic_or_filter_threshold=0;
+
+# 20000 tickets of 12 rows each
+statement ok
+CREATE TABLE probe AS
+SELECT i AS v,
+       (i % 3000)::INTEGER AS item,
+       (i // 12)::BIGINT AS ticket,
+       ((i // 12) * 1000003)::BIGINT AS sparse_ticket,
+       CASE WHEN i % 17 = 0 THEN NULL ELSE (i // 12)::BIGINT END AS null_ticket
+FROM range(240000) t(i);
+
+# 10% as many rows as the probe side, but only 2% of its tickets: 60 items per ticket, of which 12 are on the probe side
+statement ok
+CREATE TABLE dup_build AS
+SELECT ((12 * t + j) % 3000)::INTEGER AS item,
+       t::BIGINT AS ticket,
+       (t * 1000003)::BIGINT AS sparse_ticket,
+       CASE WHEN (12 * t + j) % 17 = 0 THEN NULL ELSE t::BIGINT END AS null_ticket
+FROM (SELECT x * 50 + x % 50 AS t FROM range(400) u(x)), range(60) v(j);
+
+# 10% as many rows as the probe side, and over half of its tickets
+statement ok
+CREATE TABLE wide_build AS
+SELECT item, ticket, sparse_ticket FROM probe WHERE hash(v) % 10 = 0;
+
+# 2% of the tickets, but 40% as many rows as the probe side
+statement ok
+CREATE TABLE heavy_build AS
+SELECT ((12 * t + j) % 3000)::INTEGER AS item, t::BIGINT AS ticket
+FROM (SELECT x * 50 + x % 50 AS t FROM range(400) u(x)), range(240) v(j);
+
+# reference results without any join filters
+statement ok
+SET disabled_optimizers = 'join_order,build_side_probe_side,compressed_materialization,join_filter_pushdown';
+
+statement ok
+CREATE TABLE e_dense AS SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.ticket = b.ticket;
+
+statement ok
+CREATE TABLE e_nulls AS SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.null_ticket = b.null_ticket;
+
+statement ok
+CREATE TABLE e_ndf AS
+SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.null_ticket IS NOT DISTINCT FROM b.null_ticket;
+
+statement ok
+CREATE TABLE e_wide AS SELECT p.v FROM probe p JOIN wide_build b ON p.item = b.item AND p.ticket = b.ticket;
+
+statement ok
+CREATE TABLE e_heavy AS SELECT p.v FROM probe p JOIN heavy_build b ON p.item = b.item AND p.ticket = b.ticket;
+
+statement ok
+SET disabled_optimizers = 'join_order,build_side_probe_side,compressed_materialization';
+
+# ticket gets a prefix-range filter; item does not, the build side holds every item
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM probe p JOIN dup_build b ON p.item = b.item AND p.ticket = b.ticket;
+----
+analyzed_plan	<REGEX>:.*ticket IN PRF\(ticket\).*
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM probe p JOIN dup_build b ON p.item = b.item AND p.ticket = b.ticket;
+----
+analyzed_plan	<!REGEX>:.*item IN (PRF|BF)\(item\).*
+
+query I
+SELECT count(*) FROM (
+    (SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.ticket = b.ticket EXCEPT ALL TABLE e_dense)
+    UNION ALL
+    (TABLE e_dense EXCEPT ALL SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.ticket = b.ticket)
+);
+----
+0
+
+# a sparse key column gets a bloom filter
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM probe p JOIN dup_build b ON p.item = b.item AND p.sparse_ticket = b.sparse_ticket;
+----
+analyzed_plan	<REGEX>:.*sparse_ticket IN BF\(sparse_ticket\).*
+
+query I
+SELECT count(*) FROM (
+    (SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.sparse_ticket = b.sparse_ticket
+     EXCEPT ALL TABLE e_dense)
+    UNION ALL
+    (TABLE e_dense EXCEPT ALL
+     SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.sparse_ticket = b.sparse_ticket)
+);
+----
+0
+
+# NULL keys on both sides
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM probe p JOIN dup_build b ON p.item = b.item AND p.null_ticket = b.null_ticket;
+----
+analyzed_plan	<REGEX>:.*null_ticket IN PRF\(null_ticket\).*
+
+query I
+SELECT count(*) FROM (
+    (SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.null_ticket = b.null_ticket
+     EXCEPT ALL TABLE e_nulls)
+    UNION ALL
+    (TABLE e_nulls EXCEPT ALL
+     SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.null_ticket = b.null_ticket)
+);
+----
+0
+
+# NULL-safe keys keep the probe rows with a NULL key
+query II
+EXPLAIN ANALYZE
+SELECT count(*) FROM probe p JOIN dup_build b ON p.item = b.item AND p.null_ticket IS NOT DISTINCT FROM b.null_ticket;
+----
+analyzed_plan	<REGEX>:.*null_ticket IN PRF\(null_ticket\).*
+
+query I
+SELECT count(*) FROM (
+    (SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.null_ticket IS NOT DISTINCT FROM b.null_ticket
+     EXCEPT ALL TABLE e_ndf)
+    UNION ALL
+    (TABLE e_ndf EXCEPT ALL
+     SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.null_ticket IS NOT DISTINCT FROM b.null_ticket)
+);
+----
+0
+
+# a build side of the same size that holds over half of the tickets keeps only the min/max ranges
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM probe p JOIN wide_build b ON p.item = b.item AND p.ticket = b.ticket;
+----
+analyzed_plan	<!REGEX>:.*IN (PRF|BF)\(.*
+
+query I
+SELECT count(*) FROM (
+    (SELECT p.v FROM probe p JOIN wide_build b ON p.item = b.item AND p.ticket = b.ticket EXCEPT ALL TABLE e_wide)
+    UNION ALL
+    (TABLE e_wide EXCEPT ALL SELECT p.v FROM probe p JOIN wide_build b ON p.item = b.item AND p.ticket = b.ticket)
+);
+----
+0
+
+# so does a build side with few tickets that is not much smaller than the probe side
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM probe p JOIN heavy_build b ON p.item = b.item AND p.ticket = b.ticket;
+----
+analyzed_plan	<!REGEX>:.*IN (PRF|BF)\(.*
+
+query I
+SELECT count(*) FROM (
+    (SELECT p.v FROM probe p JOIN heavy_build b ON p.item = b.item AND p.ticket = b.ticket EXCEPT ALL TABLE e_heavy)
+    UNION ALL
+    (TABLE e_heavy EXCEPT ALL SELECT p.v FROM probe p JOIN heavy_build b ON p.item = b.item AND p.ticket = b.ticket)
+);
+----
+0
+
+# and a key without a distinct count: the build key is an aggregate
+query II
+EXPLAIN ANALYZE
+SELECT count(*) FROM probe p JOIN (SELECT item, max(ticket) AS ticket FROM dup_build GROUP BY item, ticket) b
+ON p.item = b.item AND p.ticket = b.ticket;
+----
+analyzed_plan	<!REGEX>:.*IN (PRF|BF)\(.*
+
+# the same results when finalize runs as several parallel tasks, single-threaded, and with a forced external join
+statement ok
+PRAGMA verify_parallelism;
+
+query I
+SELECT count(*) FROM (
+    (SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.sparse_ticket = b.sparse_ticket
+     EXCEPT ALL TABLE e_dense)
+    UNION ALL
+    (TABLE e_dense EXCEPT ALL
+     SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.sparse_ticket = b.sparse_ticket)
+);
+----
+0
+
+statement ok
+PRAGMA disable_verify_parallelism;
+
+statement ok
+SET threads=1;
+
+query I
+SELECT count(*) FROM (
+    (SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.null_ticket = b.null_ticket
+     EXCEPT ALL TABLE e_nulls)
+    UNION ALL
+    (TABLE e_nulls EXCEPT ALL
+     SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.null_ticket = b.null_ticket)
+);
+----
+0
+
+statement ok
+SET debug_force_external=true;
+
+query I
+SELECT count(*) FROM (
+    (SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.ticket = b.ticket EXCEPT ALL TABLE e_dense)
+    UNION ALL
+    (TABLE e_dense EXCEPT ALL SELECT p.v FROM probe p JOIN dup_build b ON p.item = b.item AND p.ticket = b.ticket)
+);
+----
+0
+
+statement ok
+RESET debug_force_external;

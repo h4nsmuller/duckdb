@@ -378,6 +378,8 @@ static constexpr double NON_FILTERING_RATIO_THRESHOLD = 0.1;
 static constexpr idx_t NON_FILTERING_BUILD_SIDE_THRESHOLD = 4194304;
 //! Max build/probe ratio at which a multi-key join builds per-key-column filters
 static constexpr double MULTI_KEY_RATIO_THRESHOLD = 0.05;
+//! Max build/probe ratio at which it builds one for a key column of which the build side holds few distinct values
+static constexpr double MULTI_KEY_SELECTIVE_RATIO_THRESHOLD = 0.25;
 //! A join is expected to stay in memory while its estimated build side is below this share of the memory budget
 static constexpr idx_t LIKELY_IN_MEMORY_BUILD_MEMORY_FRACTION = 4;
 //! Bound replicated prefix-range filter state independently of the radix partitions
@@ -1515,9 +1517,22 @@ bool JoinFilterPushdownInfo::CanUseInFilter(const ClientContext &context, option
 	       (cmp == ExpressionType::COMPARE_EQUAL || cmp == ExpressionType::COMPARE_NOT_DISTINCT_FROM);
 }
 
+bool JoinFilterPushdownInfo::BuildKeyIsSelective(idx_t filter_idx, idx_t build_count) const {
+	if (filter_idx >= key_domains.size()) {
+		return false;
+	}
+	auto &domain = key_domains[filter_idx];
+	if (domain.build_distinct_count == 0 || domain.probe_distinct_count == 0) {
+		return false;
+	}
+	// there cannot be more distinct keys than rows on the build side
+	const auto build_keys = static_cast<double>(MinValue(domain.build_distinct_count, build_count));
+	return build_keys <= MULTI_KEY_RATIO_THRESHOLD * static_cast<double>(domain.probe_distinct_count);
+}
+
 bool JoinFilterPushdownInfo::CanUseBloomFilter(const JoinFilterPushdownFilter &info, const ClientContext &context,
                                                const PhysicalComparisonJoin &op, const ExpressionType &cmp,
-                                               optional_ptr<JoinHashTable> ht) const {
+                                               idx_t filter_idx, optional_ptr<JoinHashTable> ht) const {
 	if (!ht) {
 		return false;
 	}
@@ -1546,9 +1561,11 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const JoinFilterPushdownFilter &i
 		return false;
 	}
 
-	// per-key filters only pay off when the build side is much smaller than the probe side
+	// per-key filters only pay off when the build side is much smaller than the probe side, or when it has many
+	// rows per value of this key column, so that the column still rejects most of the probe side
 	if (!ht->HasSingleEqualityKey() && build_to_probe_ratio > MULTI_KEY_RATIO_THRESHOLD) {
-		return false;
+		return build_to_probe_ratio <= MULTI_KEY_SELECTIVE_RATIO_THRESHOLD &&
+		       BuildKeyIsSelective(filter_idx, build_count);
 	}
 
 	return true;
@@ -1971,7 +1988,8 @@ vector<JoinFilterPushdownCandidate> JoinFilterPushdownInfo::FilterFinalizer::Pre
 			    ht && gstate && (allow_bloom_filters || allow_prefix_range_filters) &&
 			    pushdown_column.mode == JoinFilterPushdownMode::RECONSTRUCT_EXPRESSION &&
 			    runtime_filter_input_type == ht->conditions[key_idx].GetLHS().GetReturnType() &&
-			    !Value::NotDistinctFrom(min_val, max_val) && pushdown.CanUseBloomFilter(info, context, op, cmp, ht);
+			    !Value::NotDistinctFrom(min_val, max_val) &&
+			    pushdown.CanUseBloomFilter(info, context, op, cmp, filter_idx, ht);
 			candidates.push_back({info, pushdown_column, std::move(min_val), std::move(max_val),
 			                      reconstruct_filter_expression, can_emit_runtime_filter});
 		}

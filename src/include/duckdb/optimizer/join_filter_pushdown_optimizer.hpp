@@ -16,6 +16,7 @@
 namespace duckdb {
 class Optimizer;
 class LogicalCTERef;
+class RelationStatsExtractor;
 
 enum class EqualityPropagation { DISABLED, ENABLED };
 
@@ -24,6 +25,7 @@ enum class EqualityPropagation { DISABLED, ENABLED };
 class JoinFilterPushdownOptimizer : public LogicalOperatorVisitor {
 public:
 	explicit JoinFilterPushdownOptimizer(Optimizer &optimizer);
+	~JoinFilterPushdownOptimizer() override;
 
 public:
 	void Optimize(LogicalOperator &op);
@@ -43,6 +45,8 @@ private:
 	void CollectCTEFilters(LogicalOperator &op);
 	void GenerateCTEFilters(LogicalMaterializedCTE &cte);
 	void GenerateJoinFilters(LogicalComparisonJoin &join);
+	//! Estimates the distinct values of the equality keys of a join on several of them
+	void SetKeyDomains(LogicalComparisonJoin &join, JoinFilterPushdownInfo &info);
 	static bool CanGenerateJoinFilters(const LogicalComparisonJoin &join);
 	static void GetCTEFilterTargets(LogicalOperator &op, vector<JoinFilterPushdownColumn> columns,
 	                                reference_map_t<LogicalCTERef, vector<JoinFilterPushdownColumn>> &targets);
@@ -50,5 +54,6 @@ private:
 private:
 	Optimizer &optimizer;
 	reference_map_t<LogicalComparisonJoin, vector<JoinFilterPushdownFilter>> cte_filters;
+	unique_ptr<RelationStatsExtractor> stats_extractor;
 };
 } // namespace duckdb

@@ -9,6 +9,7 @@
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/function/scalar/struct_utils.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/relation_statistics/relation_statistics_extractor.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -38,6 +39,9 @@ struct FilterTarget {
 };
 
 JoinFilterPushdownOptimizer::JoinFilterPushdownOptimizer(Optimizer &optimizer) : optimizer(optimizer) {
+}
+
+JoinFilterPushdownOptimizer::~JoinFilterPushdownOptimizer() {
 }
 
 static bool IsJoinFilterPushdownIntegralType(const LogicalType &type) {
@@ -756,6 +760,59 @@ bool JoinFilterPushdownOptimizer::CanGenerateJoinFilters(const LogicalComparison
 	return true;
 }
 
+//! The statistics of the column a join key refers to, if its number of distinct values is known rather than
+//! derived from the cardinality or the value range
+static optional_ptr<const RelationColumnStats> GetKeyColumnStats(const RelationStats &stats, const Expression &key) {
+	if (key.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return nullptr;
+	}
+	auto column = stats.GetColumnStats(key.Cast<BoundColumnRefExpression>().Binding());
+	if (!column) {
+		return nullptr;
+	}
+	switch (column->total_domain.source) {
+	case DistinctCountSource::HLL:
+	case DistinctCountSource::EXACT:
+		return column;
+	default:
+		return nullptr;
+	}
+}
+
+void JoinFilterPushdownOptimizer::SetKeyDomains(LogicalComparisonJoin &join, JoinFilterPushdownInfo &info) {
+	idx_t equality_count = 0;
+	for (auto &cond_idx : info.join_condition) {
+		const auto cmp = join.conditions[cond_idx].GetComparisonType();
+		if (cmp == ExpressionType::COMPARE_EQUAL || cmp == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			equality_count++;
+		}
+	}
+	if (equality_count < 2) {
+		return;
+	}
+	if (!stats_extractor) {
+		stats_extractor = make_uniq<RelationStatsExtractor>(optimizer.GetContext());
+	}
+	auto probe_stats = stats_extractor->Extract(*join.children[0]);
+	auto build_stats = stats_extractor->Extract(*join.children[1]);
+	if (!probe_stats || !build_stats) {
+		return;
+	}
+	info.key_domains.resize(info.join_condition.size());
+	for (idx_t filter_idx = 0; filter_idx < info.join_condition.size(); filter_idx++) {
+		auto &cond = join.conditions[info.join_condition[filter_idx]];
+		auto probe_column = GetKeyColumnStats(*probe_stats, cond.GetLHS());
+		auto build_column = GetKeyColumnStats(*build_stats, cond.GetRHS());
+		if (!probe_column || !build_column) {
+			continue;
+		}
+		// The build side holds the values that the filters and joins below it have left of the column, while the
+		// probe column draws from all of its values, however many of its rows remain.
+		info.key_domains[filter_idx].build_distinct_count = build_column->current_domain.distinct_count;
+		info.key_domains[filter_idx].probe_distinct_count = probe_column->total_domain.distinct_count;
+	}
+}
+
 void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &join) {
 	if (!CanGenerateJoinFilters(join)) {
 		return;
@@ -869,6 +926,7 @@ void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &joi
 	}
 	const idx_t child_idx = join.children[1]->type == LogicalOperatorType::LOGICAL_DELIM_GET ? 0 : 1;
 	pushdown_info->build_side_has_filter = IsFiltering(join.children[child_idx]);
+	SetKeyDomains(join, *pushdown_info);
 
 	// set up the filter pushdown in the join itself
 	join.filter_pushdown = std::move(pushdown_info);

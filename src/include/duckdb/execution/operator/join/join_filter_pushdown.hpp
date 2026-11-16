@@ -113,9 +113,17 @@ struct JoinFilterPushdownUtil {
 	static bool JoinTypeIsSupported(JoinType join_type);
 };
 
+//! The estimated number of distinct values of a join key on either side, zero when unknown
+struct JoinFilterKeyDomain {
+	idx_t build_distinct_count = 0;
+	idx_t probe_distinct_count = 0;
+};
+
 struct JoinFilterPushdownInfo {
 	//! The join condition indexes for which we compute the min/max aggregates
 	vector<idx_t> join_condition;
+	//! The key domains of a join on several equality keys, indexed like join_condition
+	vector<JoinFilterKeyDomain> key_domains;
 	//! The probes to push the filter into
 	vector<JoinFilterPushdownFilter> probe_info;
 	//! Min/Max aggregates
@@ -155,8 +163,10 @@ private:
 
 	bool CanUseInFilter(const ClientContext &context, optional_ptr<JoinHashTable> ht, const ExpressionType &cmp) const;
 	bool CanUseBloomFilter(const JoinFilterPushdownFilter &info, const ClientContext &context,
-	                       const PhysicalComparisonJoin &op, const ExpressionType &cmp,
+	                       const PhysicalComparisonJoin &op, const ExpressionType &cmp, idx_t filter_idx,
 	                       optional_ptr<JoinHashTable> ht = nullptr) const;
+	//! Whether the build side holds few of the distinct values of the probe column of a join condition
+	bool BuildKeyIsSelective(idx_t filter_idx, idx_t build_count) const;
 };
 
 } // namespace duckdb
