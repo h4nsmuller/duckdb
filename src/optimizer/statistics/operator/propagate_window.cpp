@@ -15,6 +15,11 @@ unique_ptr<NodeStatistics> StatisticsPropagator::PropagateStatistics(LogicalWind
 	// then propagate to each of the order expressions
 	for (auto &window_expr : window.expressions) {
 		auto &over_expr = window_expr->Cast<BoundWindowExpression>();
+		// Statistics can be propagated more than once, and the partitions can change in between (a partition that an
+		// earlier propagation folded to a constant is dropped as functionally dependent): start from scratch so that
+		// the statistics stay aligned with the partitions and the frame bounds
+		over_expr.PartitionsStatsMutable().clear();
+		over_expr.ExprStatsMutable().clear();
 		for (auto &expr : over_expr.PartitionsMutable()) {
 			over_expr.PartitionsStatsMutable().push_back(PropagateExpression(expr));
 		}

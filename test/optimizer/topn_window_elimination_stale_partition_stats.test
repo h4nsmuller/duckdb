@@ -1,0 +1,60 @@
+# name: test/optimizer/topn_window_elimination_stale_partition_stats.test
+# description: The statistics of the window partitions must stay aligned with the partitions when statistics are propagated twice
+# group: [optimizer]
+
+statement ok
+CREATE TABLE t AS SELECT i AS x, 1999 + i % 4 AS g, i % 10 AS a FROM range(10000) r(i);
+
+# The filter over the two counts makes the optimizer propagate statistics early. That folds the first partition to a
+# constant, which is then dropped, and the second propagation must not leave the statistics of the dropped partition
+# in front of those of g: the aggregate that replaces the window would size its perfect hash table with them.
+query III
+SELECT g, x, rn
+FROM (
+	SELECT x, g, row_number() OVER (PARTITION BY CASE WHEN x IS NULL THEN 1 ELSE 0 END, g ORDER BY x) AS rn
+	FROM (
+		SELECT *
+		FROM (
+			SELECT *, count(*) OVER (PARTITION BY a) AS c2
+			FROM (SELECT *, count(*) OVER (PARTITION BY g) AS c1 FROM t)
+		)
+		WHERE c1 > 5 OR c2 > 5
+	)
+)
+WHERE rn <= 2
+ORDER BY g, rn;
+----
+1999	0	1
+1999	4	2
+2000	1	1
+2000	5	2
+2001	2	1
+2001	6	2
+2002	3	1
+2002	7	2
+
+# The same with several order keys
+query III
+SELECT g, x, rn
+FROM (
+	SELECT x, g, row_number() OVER (PARTITION BY CASE WHEN x IS NULL THEN 1 ELSE 0 END, g ORDER BY a DESC, x) AS rn
+	FROM (
+		SELECT *
+		FROM (
+			SELECT *, count(*) OVER (PARTITION BY a) AS c2
+			FROM (SELECT *, count(*) OVER (PARTITION BY g) AS c1 FROM t)
+		)
+		WHERE c1 > 5 OR c2 > 5
+	)
+)
+WHERE rn <= 2
+ORDER BY g, rn;
+----
+1999	8	1
+1999	28	2
+2000	9	1
+2000	29	2
+2001	18	1
+2001	38	2
+2002	19	1
+2002	39	2
