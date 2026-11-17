@@ -53,6 +53,10 @@ public:
 	CSVErrorHandler &error_handler;
 	map<idx_t, shared_ptr<CSVBufferHandle>> buffer_handles;
 	idx_t empty_lines = 0;
+	//! The buffer that is being scanned
+	const char *buffer_ptr = nullptr;
+	//! Whether the line that the buffer starts in held only spaces in the buffers before
+	bool only_spaces_before_buffer = true;
 	//! Adds a Value to the result
 	static inline void AddValue(ColumnCountResult &result, idx_t buffer_pos);
 	//! Adds a Row to the result

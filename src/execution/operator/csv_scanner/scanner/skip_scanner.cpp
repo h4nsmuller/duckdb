@@ -19,26 +19,13 @@ void SkipResult::QuotedNewLine(SkipResult &result) {
 	// nop
 }
 
-bool SkipResult::OnlySpacesBefore(idx_t buffer_pos) const {
-	for (idx_t i = buffer_pos; i > 0; i--) {
-		const char c = buffer_ptr[i - 1];
-		if (c == '\n' || c == '\r') {
-			return true;
-		}
-		if (c != ' ') {
-			return false;
-		}
-	}
-	return only_spaces_before_buffer;
-}
-
 void SkipResult::SetComment(SkipResult &result, idx_t buffer_pos) {
 	if (result.comment) {
 		// The comment continues in this buffer
 		return;
 	}
 	// A comment line holds nothing but spaces before the comment
-	if (result.OnlySpacesBefore(buffer_pos)) {
+	if (OnlySpacesBefore(result.buffer_ptr, buffer_pos, result.only_spaces_before_buffer)) {
 		result.cur_line_starts_as_comment = true;
 	}
 	result.comment = true;
@@ -96,7 +83,8 @@ void SkipScanner::FinalizeChunkProcess() {
 	// We continue skipping until we skipped enough rows, or we have nothing else to read.
 	while (!FinishedFile() && result.row_count < result.rows_to_skip) {
 		if (cur_buffer_handle) {
-			result.only_spaces_before_buffer = result.OnlySpacesBefore(cur_buffer_handle->actual_size);
+			result.only_spaces_before_buffer = ScannerResult::OnlySpacesBefore(
+			    result.buffer_ptr, cur_buffer_handle->actual_size, result.only_spaces_before_buffer);
 		}
 		cur_buffer_handle = buffer_manager->GetBuffer(++iterator.pos.buffer_idx);
 		if (cur_buffer_handle) {

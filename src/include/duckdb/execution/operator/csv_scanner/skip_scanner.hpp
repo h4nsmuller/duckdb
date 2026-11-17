@@ -45,8 +45,6 @@ public:
 	static inline bool UnsetComment(SkipResult &result, idx_t buffer_pos);
 	//! Internal code to add a row
 	inline void InternalAddRow();
-	//! Whether only spaces stand between the start of the line and a position of the buffer
-	bool OnlySpacesBefore(idx_t buffer_pos) const;
 };
 
 //! Scanner used to skip lines in a CSV File

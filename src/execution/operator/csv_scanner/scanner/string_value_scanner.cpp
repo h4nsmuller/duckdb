@@ -205,21 +205,13 @@ void StringValueResult::SetComment(StringValueResult &result, idx_t buffer_pos) 
 
 bool StringValueResult::UnsetComment(StringValueResult &result, idx_t buffer_pos) {
 	bool done = false;
-	if (result.last_position.buffer_pos < result.position_before_comment) {
-		bool all_empty = true;
-		for (idx_t i = result.last_position.buffer_pos; i < result.position_before_comment; i++) {
-			if (result.buffer_ptr[i] != ' ') {
-				all_empty = false;
-				break;
-			}
-		}
-		if (!all_empty) {
-			done = AddRow(result, result.position_before_comment);
-		}
-	} else {
-		if (result.cur_col_id != 0) {
-			done = AddRow(result, result.position_before_comment);
-		}
+	// A comment line holds nothing but spaces before the comment, every other comment ends a row
+	bool comment_line = result.cur_col_id == 0;
+	for (idx_t i = result.last_position.buffer_pos; i < result.position_before_comment && comment_line; i++) {
+		comment_line = result.buffer_ptr[i] == ' ';
+	}
+	if (!comment_line) {
+		done = AddRow(result, result.position_before_comment);
 	}
 	if (result.number_of_rows == 0) {
 		result.first_line_is_comment = true;

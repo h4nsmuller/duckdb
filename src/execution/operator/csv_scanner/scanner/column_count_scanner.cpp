@@ -77,7 +77,12 @@ bool ColumnCountResult::AddRow(ColumnCountResult &result, idx_t buffer_pos) {
 }
 
 void ColumnCountResult::SetComment(ColumnCountResult &result, idx_t buffer_pos) {
-	if (!result.states.WasStandard() && !result.states.WasState(CSVState::DELIMITER)) {
+	if (result.comment) {
+		// The comment continues in this buffer
+		return;
+	}
+	// A comment line holds nothing but spaces before the comment
+	if (OnlySpacesBefore(result.buffer_ptr, buffer_pos, result.only_spaces_before_buffer)) {
 		result.cur_line_starts_as_comment = true;
 	}
 	result.comment = true;
@@ -122,6 +127,7 @@ ColumnCountScanner::ColumnCountScanner(shared_ptr<CSVBufferManager> buffer_manag
 	if (cur_buffer_handle) {
 		actual_size = cur_buffer_handle->actual_size;
 		result.buffer_handles[0] = cur_buffer_handle;
+		result.buffer_ptr = buffer_handle_ptr;
 	}
 	result.last_position = {iterator.pos.buffer_idx, iterator.pos.buffer_pos, actual_size};
 	result.current_buffer_size = actual_size;
@@ -167,6 +173,8 @@ void ColumnCountScanner::FinalizeChunkProcess() {
 	while (!FinishedFile() && result.result_position < result.result_size && !result.error) {
 		if (iterator.pos.buffer_pos == cur_buffer_handle->actual_size) {
 			// Move to next buffer
+			result.only_spaces_before_buffer = ScannerResult::OnlySpacesBefore(
+			    buffer_handle_ptr, cur_buffer_handle->actual_size, result.only_spaces_before_buffer);
 			cur_buffer_handle = buffer_manager->GetBuffer(++iterator.pos.buffer_idx);
 
 			if (!cur_buffer_handle) {
@@ -217,6 +225,7 @@ void ColumnCountScanner::FinalizeChunkProcess() {
 			}
 			iterator.pos.buffer_pos = 0;
 			buffer_handle_ptr = cur_buffer_handle->Ptr();
+			result.buffer_ptr = buffer_handle_ptr;
 		}
 		Process(result);
 	}

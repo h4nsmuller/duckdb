@@ -88,6 +88,20 @@ public:
 	static inline bool IsCommentSet(const ScannerResult &result) {
 		return result.comment == true;
 	}
+	//! Whether only spaces stand between the start of the line and buffer_pos: a comment there is a comment line.
+	//! only_spaces_before_buffer is the answer for the part of the line in the buffers before
+	static inline bool OnlySpacesBefore(const char *buffer_ptr, idx_t buffer_pos, bool only_spaces_before_buffer) {
+		for (idx_t i = buffer_pos; i > 0; i--) {
+			const char c = buffer_ptr[i - 1];
+			if (c == '\n' || c == '\r') {
+				return true;
+			}
+			if (c != ' ') {
+				return false;
+			}
+		}
+		return only_spaces_before_buffer;
+	}
 
 	inline bool IsStateCurrent(CSVState state) const {
 		return states.states[1] == state;
