@@ -421,11 +421,13 @@ private:
 	//! Main function, sets the correct start
 	void SetStart();
 	//! From a given initial state, it skips until we reach the until_state
-	bool SkipUntilState(CSVState initial_state, CSVState until_state, CSVIterator &current_iterator,
-	                    bool &quoted) const;
+	//! With foreign_line_breaks, a line break byte of another newline convention also ends the search: a comment
+	//! ends at such a byte
+	bool SkipUntilState(CSVState initial_state, CSVState until_state, CSVIterator &current_iterator, bool &quoted,
+	                    bool foreign_line_breaks = false) const;
 	//! If the current row we found is valid
 	bool IsRowValid(CSVIterator &current_iterator) const;
-	ValidRowInfo TryRow(CSVState state, idx_t start_pos, idx_t end_pos) const;
+	ValidRowInfo TryRow(CSVState state, idx_t start_pos, idx_t end_pos, bool foreign_line_breaks = false) const;
 	bool FirstValueEndsOnQuote(CSVIterator iterator) const;
 
 	StringValueResult result;

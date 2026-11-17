@@ -1821,7 +1821,7 @@ bool StringValueScanner::FirstValueEndsOnQuote(CSVIterator iterator) const {
 }
 
 bool StringValueScanner::SkipUntilState(CSVState initial_state, CSVState until_state, CSVIterator &current_iterator,
-                                        bool &quoted) const {
+                                        bool &quoted, bool foreign_line_breaks) const {
 	CSVStates current_state;
 	current_state.Initialize(initial_state);
 	bool first_column = true;
@@ -1852,7 +1852,16 @@ bool StringValueScanner::SkipUntilState(CSVState initial_state, CSVState until_s
 			return true;
 		}
 		if (current_state.IsState(CSVState::INVALID)) {
-			return false;
+			if (!foreign_line_breaks) {
+				return false;
+			}
+			// A line break byte of another convention is invalid in a value, but it ends a comment
+			const char byte = buffer_handle_ptr[current_iterator.pos.buffer_pos - 1];
+			const auto new_line = state_machine_strict->dialect_options.state_machine_options.new_line.GetValue();
+			if (new_line == NewLineIdentifier::SINGLE_N) {
+				return byte == '\r';
+			}
+			return new_line != NewLineIdentifier::NOT_SET && byte == '\n';
 		}
 	}
 	return false;
@@ -1915,12 +1924,13 @@ bool StringValueScanner::IsRowValid(CSVIterator &current_iterator) const {
 	return true;
 }
 
-ValidRowInfo StringValueScanner::TryRow(CSVState state, idx_t start_pos, idx_t end_pos) const {
+ValidRowInfo StringValueScanner::TryRow(CSVState state, idx_t start_pos, idx_t end_pos,
+                                        bool foreign_line_breaks) const {
 	auto current_iterator = iterator;
 	current_iterator.SetStart(start_pos);
 	current_iterator.SetEnd(end_pos);
 	bool quoted = false;
-	if (SkipUntilState(state, CSVState::RECORD_SEPARATOR, current_iterator, quoted)) {
+	if (SkipUntilState(state, CSVState::RECORD_SEPARATOR, current_iterator, quoted, foreign_line_breaks)) {
 		auto iterator_start = current_iterator;
 		idx_t current_pos = current_iterator.pos.buffer_pos;
 		current_iterator.SetEnd(iterator.GetEndPos());
@@ -1986,6 +1996,13 @@ void StringValueScanner::SetStart() {
 			}
 		}
 	}
+	// 4. We are in a comment that ends at a line break byte of another newline convention
+	if (!best_row.is_valid) {
+		auto comment_row = TryRow(CSVState::STANDARD_NEWLINE, iterator.pos.buffer_pos, iterator.GetEndPos(), true);
+		if (comment_row.is_valid) {
+			best_row = comment_row;
+		}
+	}
 	if (!best_row.is_valid) {
 		bool is_this_the_end =
 		    best_row.start_pos >= cur_buffer_handle->actual_size && cur_buffer_handle->is_last_buffer;
@@ -2007,7 +2024,7 @@ void StringValueScanner::SetStart() {
 		}
 	}
 
-	// 4. We have an error, if we have an error, we let life go on, the scanner will either ignore it
+	// 5. We have an error, if we have an error, we let life go on, the scanner will either ignore it
 	// or throw.
 	result.last_position = {iterator.pos.buffer_idx, iterator.pos.buffer_pos, result.buffer_size};
 	start_pos = iterator.GetGlobalCurrentPos();
