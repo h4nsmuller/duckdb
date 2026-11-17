@@ -198,6 +198,8 @@ public:
 	//! skipped.
 	bool CheckZonemapSegments(CollectionScanState &state);
 	void Scan(ScanOptions options, CollectionScanState &state, DataChunk &result);
+	//! Verifies that scanned values are in the domain of their type - stored values are not checked when they are read
+	static void VerifyScannedValues(const DataChunk &chunk);
 	void Scan(CollectionScanState &state, DataChunk &result, TableScanType type);
 	//! Synchronously prefetches the blocks required to scan the next row_count rows
 	void PrefetchScanIO(CollectionScanState &state, idx_t row_count) const;

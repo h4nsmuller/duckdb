@@ -987,6 +987,52 @@ bool RowGroup::PrepareScan(ScanOptions options, CollectionScanState &state) {
 	}
 }
 
+template <class T>
+static void VerifyEnumValues(const Vector &vector, idx_t enum_size) {
+	if (enum_size > NumericLimits<T>::Maximum()) {
+		// every value of the physical type is a position in the dictionary
+		return;
+	}
+	// the value under a NULL can be anything: only look at the validity if a value is out of range
+	T max_value = 0;
+	auto values = vector.Values<T>();
+	for (idx_t i = 0; i < values.size(); i++) {
+		max_value = MaxValue<T>(max_value, values[i].GetValueUnsafe());
+	}
+	if (max_value < enum_size) {
+		return;
+	}
+	for (auto entry : vector.ValidValues<T>()) {
+		if (entry.GetValue() >= enum_size) {
+			throw DataCorruptionException("ENUM value %llu is out of range for an ENUM type with %llu values",
+			                              idx_t(entry.GetValue()), enum_size);
+		}
+	}
+}
+
+void RowGroup::VerifyScannedValues(const DataChunk &chunk) {
+	for (auto &vector : chunk.data) {
+		auto &type = vector.GetType();
+		if (type.id() != LogicalTypeId::ENUM) {
+			continue;
+		}
+		auto enum_size = EnumType::GetSize(type);
+		switch (type.InternalType()) {
+		case PhysicalType::UINT8:
+			VerifyEnumValues<uint8_t>(vector, enum_size);
+			break;
+		case PhysicalType::UINT16:
+			VerifyEnumValues<uint16_t>(vector, enum_size);
+			break;
+		case PhysicalType::UINT32:
+			VerifyEnumValues<uint32_t>(vector, enum_size);
+			break;
+		default:
+			throw InternalException("ENUM can only have unsigned integers (except UINT64) as physical types");
+		}
+	}
+}
+
 void RowGroup::ProcessPreparedScan(ScanOptions options, CollectionScanState &state, DataChunk &result) {
 	const auto &column_ids = state.GetColumnIds();
 	auto &filter_info = state.GetFilterInfo();
@@ -1107,6 +1153,7 @@ void RowGroup::ProcessPreparedScan(ScanOptions options, CollectionScanState &sta
 		count = approved_tuple_count;
 	}
 	result.SetChildCardinality(count);
+	VerifyScannedValues(result);
 	FinishVector(state);
 }
 
