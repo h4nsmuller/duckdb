@@ -256,6 +256,23 @@ uint32_t UnshreddedVariantIterator::GetValuesIndex(idx_t row, idx_t child_index)
 	    .GetValueUnsafe();
 }
 
+idx_t UnshreddedVariantIterator::GetChildrenCount(idx_t row) const {
+	return data[row].GetChildValue<CHILDREN_INDEX>().GetValue().length;
+}
+
+//! Decode the nested data of an OBJECT/ARRAY value, the children must be part of the children of the row
+static VariantNestedData DecodeNestedChildren(const UnshreddedVariantIterator &unshredded, idx_t row,
+                                              idx_t value_index) {
+	auto nested = DecodeNestedData(unshredded.GetBlob(row), unshredded.GetByteOffset(row, value_index));
+	auto children_count = unshredded.GetChildrenCount(row);
+	if (nested.children_idx > children_count || nested.child_count > children_count - nested.children_idx) {
+		throw DataCorruptionException(
+		    "Variant children_idx (%d) with child_count (%d) is out of bounds for a value with %d children",
+		    nested.children_idx, nested.child_count, children_count);
+	}
+	return nested;
+}
+
 //===--------------------------------------------------------------------===//
 // Root / row validity
 //===--------------------------------------------------------------------===//
@@ -473,7 +490,7 @@ VariantArrayIterator::VariantArrayIterator(const VariantNode &array)
     : state(*array.state), row(array.row), shredded(array.kind == VariantNode::Kind::SHREDDED) {
 	if (!shredded) {
 		auto &unshredded = state.get().unshredded;
-		auto nested = DecodeNestedData(unshredded.GetBlob(row), unshredded.GetByteOffset(row, array.value_index));
+		auto nested = DecodeNestedChildren(unshredded, row, array.value_index);
 		base = nested.children_idx;
 		length = nested.child_count;
 		return;
@@ -502,7 +519,7 @@ VariantObjectIterator::VariantObjectIterator(const VariantNode &object, VariantI
     : state(*object.state), row(object.row), order(order), shredded(object.kind == VariantNode::Kind::SHREDDED) {
 	auto &unshredded = state.get().unshredded;
 	if (!shredded) {
-		auto nested = DecodeNestedData(unshredded.GetBlob(row), unshredded.GetByteOffset(row, object.value_index));
+		auto nested = DecodeNestedChildren(unshredded, row, object.value_index);
 		base = nested.children_idx;
 		raw_count = nested.child_count;
 	} else {
@@ -513,7 +530,7 @@ VariantObjectIterator::VariantObjectIterator(const VariantNode &object, VariantI
 		raw_count = typed_field_count;
 		if (object.overlay_value_index != 0) {
 			auto overlay_value_index = object.overlay_value_index - 1;
-			auto nested = DecodeNestedData(unshredded.GetBlob(row), unshredded.GetByteOffset(row, overlay_value_index));
+			auto nested = DecodeNestedChildren(unshredded, row, overlay_value_index);
 			overlay_base = nested.children_idx;
 			raw_count += nested.child_count;
 		}

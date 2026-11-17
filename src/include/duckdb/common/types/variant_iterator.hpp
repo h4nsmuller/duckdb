@@ -76,6 +76,8 @@ public:
 	uint32_t GetKeysIndex(idx_t row, idx_t child_index) const;
 	//! The value_id of children[child_index]
 	uint32_t GetValuesIndex(idx_t row, idx_t child_index) const;
+	//! The number of entries in the children list of the row
+	idx_t GetChildrenCount(idx_t row) const;
 
 private:
 	VectorIterator<UnshreddedVariantLayout> data;

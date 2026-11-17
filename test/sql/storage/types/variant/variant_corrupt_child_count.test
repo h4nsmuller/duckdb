@@ -1,0 +1,36 @@
+# name: test/sql/storage/types/variant/variant_corrupt_child_count.test
+# description: A stored VARIANT object or array that declares more children than the value has must throw, not allocate
+# group: [variant]
+
+require vector_size 2048
+
+# t0 (g GEOMETRY, v VARIANT, g2 GEOMETRY) holds 700 rows
+# a nested value of v declares a child count that exceeds the children of its row
+unzip data/storage/corrupt/variant_corrupt_child_count.db.gz {TEST_DIR}/variant_corrupt_child_count.db
+
+load {TEST_DIR}/variant_corrupt_child_count.db readonly
+
+query I
+SELECT count(*) FROM t0
+----
+700
+
+statement error
+SELECT count(*) FROM t0 WHERE v >= '0'
+----
+Data Corruption Error: Variant children_idx
+
+statement error
+SELECT count(*) FROM (SELECT v FROM t0 GROUP BY v)
+----
+Data Corruption Error: Variant children_idx
+
+statement error
+SELECT v FROM t0 ORDER BY v
+----
+Data Corruption Error: Variant children_idx
+
+query I
+SELECT 42
+----
+42
