@@ -1,0 +1,52 @@
+# name: test/sql/types/bit/bit_corrupt_padding.test
+# description: A stored BIT value whose padding byte is not a number of padding bits must throw a data corruption error
+# group: [bit]
+
+require vector_size 2048
+
+# t0 (a INTEGER, v BIT) holds 13 rows of 32 bits, the first byte of the stored value of v in the row a = 6 is 200
+unzip data/storage/corrupt/bit_corrupt_padding.db.gz {TEST_DIR}/bit_corrupt_padding.db
+
+load {TEST_DIR}/bit_corrupt_padding.db readonly
+
+statement error
+SELECT v::VARCHAR FROM t0
+----
+Data Corruption Error: Invalid BIT value: the number of padding bits is 200, expected at most 7
+
+statement error
+SELECT bit_length(v) FROM t0
+----
+Data Corruption Error: Invalid BIT value: the number of padding bits is 200, expected at most 7
+
+statement error
+SELECT v::BLOB FROM t0
+----
+Data Corruption Error: Invalid BIT value: the number of padding bits is 200, expected at most 7
+
+statement error
+SELECT ~v FROM t0
+----
+Data Corruption Error: Invalid BIT value: the number of padding bits is 200, expected at most 7
+
+statement error
+SELECT v << 1 FROM t0
+----
+Data Corruption Error: Invalid BIT value: the number of padding bits is 200, expected at most 7
+
+statement error
+SELECT bit_count(v) FROM t0
+----
+Data Corruption Error: Invalid BIT value: the number of padding bits is 200, expected at most 7
+
+# the other rows can be read
+query ITI
+SELECT a, v::VARCHAR, bit_length(v) FROM t0 WHERE a IN (5, 7) ORDER BY a
+----
+5	10101100111011110000101001010101	32
+7	10101100111011110000101001010111	32
+
+query I
+SELECT 42
+----
+42

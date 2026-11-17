@@ -19,7 +19,10 @@ char ComputePadding(idx_t len) {
 
 idx_t GetBitPadding(const bitstring_t &bit_string) {
 	auto data = const_data_ptr_cast(bit_string.GetData());
-	D_ASSERT(idx_t(data[0]) < 8);
+	if (DUCKDB_UNLIKELY(data[0] > 7)) {
+		throw DataCorruptionException("Invalid BIT value: the number of padding bits is %d, expected at most 7",
+		                              data[0]);
+	}
 	return data[0];
 }
 
@@ -76,7 +79,7 @@ uint8_t Bit::GetFirstByte(const bitstring_t &str) {
 	D_ASSERT(str.GetSize() > 1);
 
 	auto data = const_data_ptr_cast(str.GetData());
-	return data[1] & ((1 << (8 - data[0])) - 1);
+	return data[1] & ((1 << (8 - GetBitPadding(str))) - 1);
 }
 
 void Bit::Finalize(bitstring_t &str) {
