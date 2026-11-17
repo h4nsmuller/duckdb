@@ -239,6 +239,11 @@ static bool ToUnionMemberCast(Vector &source, Vector &result, idx_t count, CastP
 	return all_converted;
 }
 
+//! Stored UNION tags are not checked against the type when they are read
+[[noreturn]] static void ThrowUnionTagOutOfRange(union_tag_t tag, idx_t member_count) {
+	throw DataCorruptionException("UNION tag %d is out of range for a UNION type with %llu members", tag, member_count);
+}
+
 static bool UnionMemberToMemberCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	auto &cast_data = parameters.cast_data->Cast<UnionMemberBoundCastData>();
 	auto &lstate = parameters.local_state->Cast<StructCastLocalState>();
@@ -289,6 +294,9 @@ static bool UnionMemberToMemberCast(Vector &source, Vector &result, idx_t count,
 		} else {
 			// map the tag
 			auto source_tag = ConstantVector::GetData<union_tag_t>(source_tag_vector)[0];
+			if (source_tag >= source_member_count) {
+				ThrowUnionTagOutOfRange(source_tag, source_member_count);
+			}
 			auto mapped_tag = cast_data.tag_map[source_tag];
 			ConstantVector::GetData<union_tag_t>(result_tag_vector)[0] = UnsafeNumericCast<union_tag_t>(mapped_tag);
 			// the selected member failed to cast (under TRY_CAST) - the union becomes NULL
@@ -321,6 +329,9 @@ static bool UnionMemberToMemberCast(Vector &source, Vector &result, idx_t count,
 			auto entry = source_tag_entries[row_idx];
 			if (entry.IsValid()) {
 				// map the tag
+				if (entry.GetValue() >= source_member_count) {
+					ThrowUnionTagOutOfRange(entry.GetValue(), source_member_count);
+				}
 				auto target_tag = cast_data.tag_map[entry.GetValue()];
 				FlatVector::GetDataMutable<union_tag_t>(result_tag_vector)[row_idx] =
 				    UnsafeNumericCast<union_tag_t>(target_tag);

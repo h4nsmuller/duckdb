@@ -1,0 +1,51 @@
+# name: test/sql/types/union/union_corrupt_tag.test
+# description: A stored UNION tag that does not name a member of the type must throw a data corruption error
+# group: [union]
+
+require vector_size 2048
+
+# t0 (a INTEGER, u UNION(n INTEGER, s VARCHAR)) holds 13 rows, the stored tag of u in the row a = 6 is 7
+unzip data/storage/corrupt/union_corrupt_tag.db.gz {TEST_DIR}/union_corrupt_tag.db
+
+load {TEST_DIR}/union_corrupt_tag.db readonly
+
+statement error
+SELECT u::VARCHAR FROM t0
+----
+Data Corruption Error: UNION tag 7 is out of range for a UNION type with 2 members
+
+statement error
+SELECT u::UNION(n INTEGER, s VARCHAR, d DOUBLE) FROM t0
+----
+Data Corruption Error: UNION tag 7 is out of range for a UNION type with 2 members
+
+statement error
+SELECT TRY_CAST(u AS UNION(n BIGINT, s VARCHAR)) FROM t0
+----
+Data Corruption Error: UNION tag 7 is out of range for a UNION type with 2 members
+
+statement error
+SELECT [u]::VARCHAR FROM t0
+----
+Data Corruption Error: UNION tag 7 is out of range for a UNION type with 2 members
+
+# the members do not depend on the tags
+query III
+SELECT a, u.n, u.s FROM t0 WHERE a BETWEEN 5 AND 7 ORDER BY a
+----
+5	NULL	x5
+6	6	NULL
+7	NULL	x7
+
+# the other rows can be read
+query IT
+SELECT a, u::VARCHAR FROM t0 WHERE a < 3 ORDER BY a
+----
+0	0
+1	x1
+2	x2
+
+query I
+SELECT 42
+----
+42
