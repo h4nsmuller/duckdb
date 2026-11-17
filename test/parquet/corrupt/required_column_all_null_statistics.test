@@ -26,6 +26,28 @@ WHERE x IS NULL;
 ----
 0
 
+# a null count below the number of values is ignored as well
+query III
+SELECT count(*), count(x), sum(x)
+FROM read_parquet('{DATA_DIR}/parquet-testing/corrupt/required_column_some_null_statistics.parquet');
+----
+6001	6001	6001
+
+# The same for a REQUIRED column in a REQUIRED struct: the statistics of the struct are built from those of the
+# column, and a filter on it pruned the row group.
+query I
+SELECT count(*)
+FROM read_parquet('{DATA_DIR}/parquet-testing/corrupt/required_nested_column_all_null_statistics.parquet')
+WHERE s.x = 1;
+----
+6001
+
+query II
+SELECT count(s.x), sum(s.x)
+FROM read_parquet('{DATA_DIR}/parquet-testing/corrupt/required_nested_column_all_null_statistics.parquet');
+----
+6001	6001
+
 # the unchanged file
 query III
 SELECT count(*), count(x), sum(x)
