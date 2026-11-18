@@ -19,19 +19,19 @@ SELECT i AS v,
        ((i // 12) * 1000003)::BIGINT AS ticket,
        CASE WHEN i % 13 = 0 THEN NULL ELSE (i % 3000)::INTEGER END AS null_item,
        CASE WHEN i % 17 = 0 THEN NULL ELSE ((i // 12) * 1000003)::BIGINT END AS null_ticket
-FROM range(2400000) t(i);
+FROM range(480000) t(i);
 
 # The pad makes the build side exceed the partition buffers even with four threads, so that the join spills.
 statement ok
 CREATE TABLE build AS
-SELECT item, ticket, null_item, null_ticket, repeat('x', 4000) || v AS pad
+SELECT item, ticket, null_item, null_ticket, repeat('x', 12000) || v AS pad
 FROM probe
 WHERE (ticket // 1000003) % 50 = 0;
 
 # a build side above the 5% of the probe side up to which a join on several keys builds filters
 statement ok
 CREATE TABLE large_build AS
-SELECT item, ticket, repeat('x', 800) || v AS pad
+SELECT item, ticket, repeat('x', 2400) || v AS pad
 FROM probe
 WHERE (ticket // 1000003) % 10 = 0;
 
@@ -88,7 +88,7 @@ query II
 EXPLAIN ANALYZE
 SELECT count(*), max(b.pad) FROM probe p JOIN build b ON p.item = b.item AND p.ticket = b.ticket;
 ----
-analyzed_plan	<REGEX>:(?s).*item >= 0.*item <= 2411.*item IN BF\(item\).*ticket >= 0.*ticket <= 199950599850.*ticket IN BF\(ticket\).*
+analyzed_plan	<REGEX>:(?s).*item >= 0.*item <= 2411.*item IN BF\(item\).*ticket >= 0.*ticket <= 39950119850.*ticket IN BF\(ticket\).*
 
 # NULL keys on both sides
 query II
@@ -193,12 +193,12 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) FROM probe p SEMI JOIN build b ON p.item = b.item AND p.ticket = b.ticket;
 ----
-48000
+9600
 
 query I
 SELECT count(*) FROM probe p JOIN large_build b ON p.item = b.item AND p.ticket = b.ticket;
 ----
-240000
+48000
 
 endloop
 
